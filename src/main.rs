@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand};
 /// Versionen werden aus composer.json / package.json / .nvmrc erkannt,
 /// --php und --node überschreiben das. Committet wird nichts.
 #[derive(Parser)]
-#[command(version)]
+#[command(name = "luggage", version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

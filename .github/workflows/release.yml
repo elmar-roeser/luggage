@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Die erzeugten Flakes sind x86_64-linux, deshalb nur dieses Ziel (statisch per musl)
+  build-linux:
+    name: Build Linux (musl)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          tar czf luggage-${{ github.ref_name }}-x86_64-linux-musl.tar.gz -C target/x86_64-unknown-linux-musl/release luggage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luggage-x86_64-linux-musl
+          path: luggage-${{ github.ref_name }}-x86_64-linux-musl.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true

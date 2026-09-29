@@ -1,0 +1,33 @@
+[package]
+name = "luggage-env"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Per-project Nix dev environments (flake + direnv) for PHP and Node, detected from composer.json/package.json"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/elmar-roeser/luggage"
+readme = "README.md"
+keywords = ["nix", "direnv", "devshell", "php", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "luggage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+dbg_macro = "deny"
+pedantic = { level = "warn", priority = -1 }

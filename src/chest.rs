@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::sleep;
@@ -22,6 +23,8 @@ use crate::{config, find_in_path, home, info, versions, vm};
 const DEFAULT_READY_TIMEOUT: u32 = 60;
 /// The path of the runtime dir inside the chest.
 const RUN_INSIDE: &str = "/run/luggage";
+/// Closes every inherited file descriptor above 2, then runs the arguments.
+const CLOSE_FDS_AND_EXEC: &str = r#"for fd in /proc/self/fd/*; do fd=${fd##*/}; if [ "$fd" -gt 2 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; exec "$@""#;
 
 /// Contents of `chest.toml`; it adds to what was detected in the Compose file.
 #[derive(Debug, Default, Deserialize)]
@@ -595,6 +598,111 @@ impl Chest {
         vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env)
     }
 
+    /// Starts the VM unless it runs already and returns its PID. Only one start at a time:
+    /// a second caller (direnv in the background, a stand-in) waits and then finds the VM ready.
+    fn vm_up(&self, nixpkgs: &str) -> Result<u32> {
+        fs::create_dir_all(&self.run)
+            .with_context(|| format!("cannot create {}", self.run.display()))?;
+        // Rust opens files with O_CLOEXEC, so qemu and virtiofsd do not inherit the lock
+        let lock = File::create(self.run.join("up.lock"))?;
+        lock.lock()?;
+        if let Some(pid) = self.running() {
+            return Ok(pid);
+        }
+        self.print_notes();
+        self.stop_other_vms();
+        self.ensure_envrc_hook()?;
+        let dir = self.state.join("vm");
+        vm::build(&self.name, &self.project, nixpkgs, &dir)?;
+        let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
+        self.vm_sync()?;
+        Ok(pid)
+    }
+
+    /// Stops the VMs of other chests: one at a time keeps memory free, and switching projects is the moment for it.
+    fn stop_other_vms(&self) {
+        let Some(Ok(dirs)) = self.run.parent().map(fs::read_dir) else {
+            return;
+        };
+        for run in dirs.filter_map(|d| Some(d.ok()?.path())) {
+            let Some(name) = run.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let pid = fs::read_to_string(run.join("chest.pid"))
+                .ok()
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                .filter(|p| alive(*p));
+            if name == self.name || !run.join("control.socket").exists() {
+                continue;
+            }
+            if let Some(pid) = pid {
+                info(&format!("stopping chest {name}: only one VM runs at a time"));
+                vm::stop(&name, &run, Some(pid));
+                let _ = fs::remove_file(run.join("chest.pid"));
+            }
+        }
+    }
+
+    /// Adds the luggage line to the .envrc of the project if it is missing.
+    fn ensure_envrc_hook(&self) -> Result<()> {
+        let path = self.project.join(".envrc");
+        let Ok(content) = fs::read_to_string(&path) else {
+            info("note: the project has no .envrc, so direnv does not start the VM on `cd`");
+            return Ok(());
+        };
+        if content.contains("luggage hook") {
+            return Ok(());
+        }
+        let sep = if content.is_empty() || content.ends_with('\n') { "" } else { "\n" };
+        fs::write(&path, format!("{content}{sep}{}", crate::flake::ENVRC_HOOK))?;
+        info("added the luggage line to .envrc — run `direnv allow` once");
+        Ok(())
+    }
+
+    /// Shell code for direnv: in VM mode the stand-ins come first on the `PATH` and the VM starts in the background.
+    /// Must be fast, it runs on every `cd` into the project.
+    pub fn cmd_hook(&self) -> Result<()> {
+        if self.def.mode != Mode::Vm {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.run)?;
+        let shims = self.run.join("shims");
+        // `use flake` in the .envrc has just loaded the project packages into our environment,
+        // so the stand-ins are there for the very first command, even before the VM is up.
+        let from_env: Vec<String> = ["nativeBuildInputs", "buildInputs"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .collect();
+        let mut inputs = from_env.join(" ");
+        if inputs.trim().is_empty() {
+            inputs = fs::read_to_string(self.run.join("env.sh"))
+                .map(|e| vm::inputs_from_env_sh(&e))
+                .unwrap_or_default();
+        }
+        vm::write_shims(&self.run, &inputs)?;
+        println!("PATH_add {}", sh_quote(&shims.to_string_lossy()));
+        if let Some(d) = &self.def_dir {
+            println!("watch_file {}", sh_quote(&d.join("chest.toml").to_string_lossy()));
+        }
+        if self.running().is_none() {
+            // direnv reads the environment from fd 3 and waits until every holder closed it,
+            // and Rust passes such descriptors on to children, so a small shell closes them all first.
+            let log = File::create(self.run.join("up.log"))?;
+            Command::new("/bin/sh")
+                .args(["-c", CLOSE_FDS_AND_EXEC, "sh"])
+                .arg(std::env::current_exe()?)
+                .arg("up")
+                .current_dir(&self.project)
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .spawn()
+                .context("cannot start luggage up in the background")?;
+        }
+        Ok(())
+    }
+
     /// Commands that do not work with a VM yet.
     fn not_in_vm_mode(&self) -> Result<()> {
         if self.def.mode == Mode::Vm {
@@ -612,22 +720,19 @@ impl Chest {
 
     /// Starts the chest in the background and waits until all services are ready.
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
-        if let Some(pid) = self.running() {
-            info(&format!("chest {} is already running (pid {pid})", self.name));
-            return Ok(());
-        }
-        self.print_notes();
         if self.def.mode == Mode::Vm {
-            let dir = self.state.join("vm");
-            vm::build(&self.name, &self.project, nixpkgs, &dir)?;
-            let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
-            self.vm_sync()?;
+            let pid = self.vm_up(nixpkgs)?;
             info(&format!(
                 "chest {} is running (VM, pid {pid}) — `luggage status`, `luggage down`",
                 self.name
             ));
             return Ok(());
         }
+        if let Some(pid) = self.running() {
+            info(&format!("chest {} is already running (pid {pid})", self.name));
+            return Ok(());
+        }
+        self.print_notes();
         let tools = self.prepare(nixpkgs)?;
         let info_json = self.run.join("info.json");
         let _ = fs::remove_file(&info_json);
@@ -762,11 +867,10 @@ impl Chest {
     }
 
     /// Runs `cmd` in the running chest; without a command, a shell.
-    fn enter(&self, cmd: &[String]) -> Result<()> {
-        let pid = self.running().with_context(|| {
-            format!("chest {} is not running — run `luggage up` first", self.name)
-        })?;
+    fn enter(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
         if self.def.mode == Mode::Vm {
+            // starts the VM or waits for a start that is under way
+            self.vm_up(nixpkgs)?;
             self.vm_sync()?;
             // only the project is shared with the guest
             let cwd = std::env::current_dir()?;
@@ -774,6 +878,9 @@ impl Chest {
             pass_through(vm::exec(&self.name, &self.state.join("vm"), &self.run, &cwd, cmd)?);
             return Ok(());
         }
+        let pid = self.running().with_context(|| {
+            format!("chest {} is not running — run `luggage up` first", self.name)
+        })?;
         let tools = self.tools()?;
         let mut c = nsenter(pid, &tools);
         shell_args(&mut c, cmd);
@@ -782,13 +889,13 @@ impl Chest {
     }
 
     /// Runs `cmd` in the running chest.
-    pub fn cmd_exec(&self, cmd: &[String]) -> Result<()> {
-        self.enter(cmd)
+    pub fn cmd_exec(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
+        self.enter(cmd, nixpkgs)
     }
 
     /// Opens a shell in the running chest.
-    pub fn cmd_open(&self) -> Result<()> {
-        self.enter(&[])
+    pub fn cmd_open(&self, nixpkgs: &str) -> Result<()> {
+        self.enter(&[], nixpkgs)
     }
 
     /// The process-compose client on the host. The socket is in the runtime dir.

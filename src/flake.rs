@@ -133,6 +133,13 @@ const ENVRC_POETRY: &str =
     "if [[ ! -d .venv ]]; then poetry env use -q \"$(command -v python)\"; fi
 ";
 
+/// .envrc addition for a chest in VM mode; `luggage hook` prints nothing otherwise.
+/// It comes last, so the stand-ins for the VM are first on the `PATH`.
+pub const ENVRC_HOOK: &str = "
+# luggage: with mode = \"vm\" the project programs run in the chest VM (does nothing otherwise)
+if has luggage; then eval \"$(luggage hook)\"; fi
+";
+
 /// Generates the content of the .envrc.
 pub fn render_envrc(python: Option<&Python>) -> String {
     let mut envrc = String::from("use flake\n");
@@ -142,6 +149,7 @@ pub fn render_envrc(python: Option<&Python>) -> String {
             envrc.push_str(ENVRC_POETRY);
         }
     }
+    envrc.push_str(ENVRC_HOOK);
     envrc
 }
 
@@ -207,7 +215,8 @@ mod tests {
 
     #[test]
     fn envrc_activates_venv_only_for_python() {
-        assert_eq!(render_envrc(None), "use flake\n");
+        assert_eq!(render_envrc(None), format!("use flake\n{ENVRC_HOOK}"));
+        assert!(render_envrc(None).ends_with("eval \"$(luggage hook)\"; fi\n"));
         let uv = Python { version: None, source: "", tool: Some("uv") };
         assert!(render_envrc(Some(&uv)).contains("PATH_add .venv/bin"));
         assert!(!render_envrc(Some(&uv)).contains("poetry env use"));

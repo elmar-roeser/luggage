@@ -104,6 +104,8 @@ enum Cmd {
     Down,
     /// Show whether the chest is running and how its services are doing
     Status,
+    /// Print shell code for direnv; the .envrc runs it
+    Hook,
 }
 
 /// Options for the Nix environment (`new` and `init`).
@@ -438,10 +440,18 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let nixpkgs = config::load()?.nixpkgs();
             chest::Chest::find(&nixpkgs, false)?.cmd_up(&nixpkgs)
         }
-        Cmd::Exec { cmd } => chest::Chest::find(&config::load()?.nixpkgs(), false)?.cmd_exec(&cmd),
-        Cmd::Open => chest::Chest::find(&config::load()?.nixpkgs(), false)?.cmd_open(),
+        Cmd::Exec { cmd } => {
+            let nixpkgs = config::load()?.nixpkgs();
+            chest::Chest::find(&nixpkgs, false)?.cmd_exec(&cmd, &nixpkgs)
+        }
+        Cmd::Open => {
+            let nixpkgs = config::load()?.nixpkgs();
+            chest::Chest::find(&nixpkgs, false)?.cmd_open(&nixpkgs)
+        }
         Cmd::Down => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_down(),
         Cmd::Status => chest::Chest::find(&config::load()?.nixpkgs(), false)?.cmd_status(),
+        // lenient: a broken chest.toml must not break loading the .envrc
+        Cmd::Hook => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_hook(),
     }
 }
 

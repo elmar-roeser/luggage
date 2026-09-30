@@ -518,23 +518,24 @@ fn remote_command(cwd: &Path, env: &[(String, String)], cmd: &[String]) -> Strin
     r
 }
 
-/// Programs of the project packages, i.e. `nativeBuildInputs` and `buildInputs` in env.sh.
-/// Never bash or sh: scripts with `#!/usr/bin/env bash` would find the stand-in and call it forever.
-fn project_programs(env_sh: &str) -> Vec<String> {
-    let mut names: Vec<String> = ["nativeBuildInputs", "buildInputs"]
+/// The project packages in env.sh: the values of `nativeBuildInputs` and `buildInputs`, separated by spaces.
+pub fn inputs_from_env_sh(env_sh: &str) -> String {
+    let values: Vec<&str> = ["nativeBuildInputs", "buildInputs"]
         .iter()
         .filter_map(|var| {
             let line = env_sh.lines().find(|l| l.starts_with(&format!("{var}='")))?;
-            Some(
-                line.split('\'')
-                    .nth(1)?
-                    .split_whitespace()
-                    .map(|p| Path::new(p).join("bin"))
-                    .collect::<Vec<_>>(),
-            )
+            line.split('\'').nth(1)
         })
-        .flatten()
-        .filter_map(|bin| fs::read_dir(bin).ok())
+        .collect();
+    values.join(" ")
+}
+
+/// Programs in the `bin` directories of `inputs` (store paths separated by spaces).
+/// Never bash or sh: scripts with `#!/usr/bin/env bash` would find the stand-in and call it forever.
+fn project_programs(inputs: &str) -> Vec<String> {
+    let mut names: Vec<String> = inputs
+        .split_whitespace()
+        .filter_map(|p| fs::read_dir(Path::new(p).join("bin")).ok())
         .flatten()
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| n != "bash" && n != "sh")
@@ -544,14 +545,16 @@ fn project_programs(env_sh: &str) -> Vec<String> {
     names
 }
 
-/// Writes one stand-in per project program into `<run>/shims`; each runs the program in the guest.
-fn write_shims(run: &Path, env_sh: &str) -> Result<()> {
+/// Writes one stand-in per program of `inputs` into `<run>/shims`; each runs the program in the guest.
+/// The new set is built next to the old one and then swapped in.
+pub fn write_shims(run: &Path, inputs: &str) -> Result<()> {
     let shims = run.join("shims");
-    let _ = fs::remove_dir_all(&shims);
-    fs::create_dir_all(&shims)?;
+    let fresh = run.join(format!("shims.{}", std::process::id()));
+    let _ = fs::remove_dir_all(&fresh);
+    fs::create_dir_all(&fresh)?;
     let exe = std::env::current_exe().context("cannot find the luggage program")?;
-    for name in project_programs(env_sh) {
-        let file = shims.join(&name);
+    for name in project_programs(inputs) {
+        let file = fresh.join(&name);
         fs::write(
             &file,
             format!(
@@ -562,10 +565,12 @@ fn write_shims(run: &Path, env_sh: &str) -> Result<()> {
         )?;
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
     }
+    let _ = fs::remove_dir_all(&shims);
+    fs::rename(&fresh, &shims)?;
     Ok(())
 }
 
-/// Copies `env_sh` and the rc file into the guest (`~/.luggage`) and writes the stand-ins,
+/// Copies `env_sh` and the rc file into the guest (`~/.luggage`),
 /// unless that already happened for this env.sh and this VM.
 ///
 /// # Errors
@@ -576,7 +581,6 @@ pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path) -> Result<()>
     if modified(&sent).is_some_and(|s| modified(env_sh).is_some_and(|e| s >= e)) {
         return Ok(());
     }
-    let text = fs::read_to_string(env_sh)?;
     let status = ssh(name, dir, Some(run))
         .arg("-T")
         .arg(format!(
@@ -589,7 +593,6 @@ pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path) -> Result<()>
     if !status.success() {
         bail!("cannot copy the environment into the VM");
     }
-    write_shims(run, &text)?;
     fs::write(sent, "")?;
     Ok(())
 }
@@ -705,8 +708,8 @@ mod tests {
             php.display(),
             bash.display()
         );
-        assert_eq!(project_programs(&env), ["php", "php-fpm"]);
-        assert!(project_programs("PATH='/x'").is_empty());
+        assert_eq!(project_programs(&inputs_from_env_sh(&env)), ["php", "php-fpm"]);
+        assert_eq!(inputs_from_env_sh("PATH='/x'"), "");
     }
 
     #[test]

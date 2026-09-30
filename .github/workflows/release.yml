@@ -13,12 +13,12 @@ env:
 jobs:
   check:
     name: Check version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.version.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -40,9 +40,9 @@ jobs:
     name: Build Linux (musl)
     needs: check
     if: needs.check.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,7 +64,7 @@ jobs:
           tar czf luggage-v${{ needs.check.outputs.version }}-x86_64-linux-musl.tar.gz -C target/x86_64-unknown-linux-musl/release luggage
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: luggage-x86_64-linux-musl
           path: luggage-v${{ needs.check.outputs.version }}-x86_64-linux-musl.tar.gz
@@ -72,11 +72,11 @@ jobs:
   release:
     name: Tag and create release
     needs: [check, build-linux]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -89,13 +89,13 @@ jobs:
           OUTPUT: RELEASE_NOTES.md
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       # Creates the tag on this commit together with the release
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.check.outputs.version }}
           target_commitish: ${{ github.sha }}
@@ -105,11 +105,11 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: [check, release]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 

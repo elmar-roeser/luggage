@@ -3,13 +3,14 @@
 //! luggage writes a flake for the guest into `<state>/vm` and builds its runner there.
 //! `/nix/store` and the project come from the host over virtiofs, so the dev environment works unchanged in the guest.
 
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -221,10 +222,14 @@ fn socket(name: &str, tag: &str) -> String {
 }
 
 /// ssh into the guest over vsock, without the user's ssh config (it could open a password dialog).
-/// The remote command follows as further arguments.
-pub fn ssh(name: &str, dir: &Path) -> Command {
+/// With `run`, connections share one master connection in the runtime dir. The remote command follows as further arguments.
+fn ssh(name: &str, dir: &Path, run: Option<&Path>) -> Command {
     let proxy = dir.join("runner/bin/chest-ssh-proxy");
     let mut c = Command::new("ssh");
+    if let Some(run) = run {
+        c.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m", "-o"])
+            .arg(format!("ControlPath={}", run.join("cm.sock").display()));
+    }
     c.args(["-F", "/dev/null", "-q", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"])
         // the host key is the guest's own and the connection never leaves this machine
         .args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
@@ -299,7 +304,10 @@ pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path
         return Err(cid_error(name));
     }
     stop_virtiofsd(name, run);
-    let _ = fs::remove_file(run.join("control.socket"));
+    // a new guest has an empty home, so the environment must be sent again
+    for f in ["control.socket", "cm.sock", "env.sent"] {
+        let _ = fs::remove_file(run.join(f));
+    }
     let bin = dir.join("runner/bin");
     // The store never changes, so the guest may cache it for good.
     for (tag, shared, cache) in
@@ -366,7 +374,8 @@ fn wait_ready(name: &str, dir: &Path, run: &Path, vm: &mut Child) -> Result<()> 
             bail!("VM stopped ({status}) — log: {}", log.display());
         }
         // no stdin: the probe must not eat input meant for a later command
-        let probe = ssh(name, dir)
+        // no master connection: a failed first try would leave a broken one behind
+        let probe = ssh(name, dir, None)
             .args(["-o", "ConnectTimeout=2", "true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -409,7 +418,195 @@ pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
         }
     }
     stop_virtiofsd(name, run);
-    let _ = fs::remove_file(run.join("control.socket"));
+    for f in ["control.socket", "cm.sock", "env.sent"] {
+        let _ = fs::remove_file(run.join(f));
+    }
+}
+
+/// The rc file in the guest: loads the dev environment and undoes what only makes sense in a Nix build.
+fn render_rc(name: &str) -> String {
+    format!(
+        "source ~/.luggage/env.sh\n\
+         unset NIX_BUILD_TOP TEMP TMP TEMPDIR SSL_CERT_FILE NIX_SSL_CERT_FILE\n\
+         export TMPDIR=/tmp LUGGAGE_CHEST={}\n\
+         PS1='[chest:{name}] \\w\\$ '\n",
+        sh_quote(name)
+    )
+}
+
+/// Does the host variable stay on the host? These describe the host session, point to host paths
+/// or would override the dev environment in the guest.
+fn host_only(var: &str) -> bool {
+    const NAMES: [&str; 22] = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "TEMPDIR",
+        "HOSTNAME",
+        "MAIL",
+        "DISPLAY",
+        "IN_NIX_SHELL",
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ];
+    const PREFIXES: [&str; 22] = [
+        "SSH_",
+        "WAYLAND_",
+        "XDG_",
+        "DBUS_",
+        "DIRENV_",
+        "LUGGAGE_",
+        "NIX_",
+        "LC_",
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "GPG_",
+        "KRB5",
+        "DESKTOP_",
+        "GDM",
+        "GNOME",
+        "QT_",
+        "GTK_",
+        "ZSH",
+        "LESS",
+        "CLAUDE",
+        "ANTHROPIC",
+        "OTEL",
+    ];
+    NAMES.contains(&var) || PREFIXES.iter().any(|p| var.starts_with(p))
+}
+
+/// Host variables that go along into the guest. Only names that the shell can `export`.
+fn passed_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| {
+            !host_only(k)
+                && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect()
+}
+
+/// The shell command for the guest: dev environment, host variables, working directory, then the command.
+/// Without a command it opens an interactive shell.
+fn remote_command(cwd: &Path, env: &[(String, String)], cmd: &[String]) -> String {
+    let mut r = String::from("source ~/.luggage/rc >/dev/null");
+    for (k, v) in env {
+        let _ = write!(r, "; export {k}={}", sh_quote(v));
+    }
+    let _ = write!(r, "; cd {} && exec", sh_quote(&cwd.to_string_lossy()));
+    if cmd.is_empty() {
+        r.push_str(" bash --rcfile ~/.luggage/rc -i");
+    }
+    for a in cmd {
+        r.push(' ');
+        r.push_str(&sh_quote(a));
+    }
+    r
+}
+
+/// Programs of the project packages, i.e. `nativeBuildInputs` and `buildInputs` in env.sh.
+/// Never bash or sh: scripts with `#!/usr/bin/env bash` would find the stand-in and call it forever.
+fn project_programs(env_sh: &str) -> Vec<String> {
+    let mut names: Vec<String> = ["nativeBuildInputs", "buildInputs"]
+        .iter()
+        .filter_map(|var| {
+            let line = env_sh.lines().find(|l| l.starts_with(&format!("{var}='")))?;
+            Some(
+                line.split('\'')
+                    .nth(1)?
+                    .split_whitespace()
+                    .map(|p| Path::new(p).join("bin"))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .filter_map(|bin| fs::read_dir(bin).ok())
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n != "bash" && n != "sh")
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Writes one stand-in per project program into `<run>/shims`; each runs the program in the guest.
+fn write_shims(run: &Path, env_sh: &str) -> Result<()> {
+    let shims = run.join("shims");
+    let _ = fs::remove_dir_all(&shims);
+    fs::create_dir_all(&shims)?;
+    let exe = std::env::current_exe().context("cannot find the luggage program")?;
+    for name in project_programs(env_sh) {
+        let file = shims.join(&name);
+        fs::write(
+            &file,
+            format!(
+                "#!/bin/sh\nexec {} exec -- {} \"$@\"\n",
+                sh_quote(&exe.to_string_lossy()),
+                sh_quote(&name)
+            ),
+        )?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// Copies `env_sh` and the rc file into the guest (`~/.luggage`) and writes the stand-ins,
+/// unless that already happened for this env.sh and this VM.
+///
+/// # Errors
+/// If env.sh cannot be read or the copy over ssh fails.
+pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path) -> Result<()> {
+    let sent = run.join("env.sent");
+    let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    if modified(&sent).is_some_and(|s| modified(env_sh).is_some_and(|e| s >= e)) {
+        return Ok(());
+    }
+    let text = fs::read_to_string(env_sh)?;
+    let status = ssh(name, dir, Some(run))
+        .arg("-T")
+        .arg(format!(
+            "mkdir -p ~/.luggage && cat > ~/.luggage/env.sh && printf %s {} > ~/.luggage/rc",
+            sh_quote(&render_rc(name))
+        ))
+        .stdin(File::open(env_sh)?)
+        .status()
+        .context("cannot start ssh")?;
+    if !status.success() {
+        bail!("cannot copy the environment into the VM");
+    }
+    write_shims(run, &text)?;
+    fs::write(sent, "")?;
+    Ok(())
+}
+
+/// Runs `cmd` in the guest in `cwd` (a shell without a command) and returns its exit status.
+///
+/// # Errors
+/// If ssh cannot start.
+pub fn exec(name: &str, dir: &Path, run: &Path, cwd: &Path, cmd: &[String]) -> Result<ExitStatus> {
+    use std::io::IsTerminal;
+    // a terminal only for a terminal: otherwise output that goes to a pipe would get \r\n
+    let tty = cmd.is_empty() || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    ssh(name, dir, Some(run))
+        .arg(if tty { "-t" } else { "-T" })
+        .arg(remote_command(cwd, &passed_env(), cmd))
+        .status()
+        .context("cannot start ssh")
 }
 
 #[cfg(test)]
@@ -459,5 +656,66 @@ mod tests {
         for name in ["", "a", "sparencon", "x".repeat(200).as_str()] {
             assert!((3..0x7fff_0003).contains(&cid(name)));
         }
+    }
+
+    #[test]
+    fn remote_command_quotes_everything() {
+        let env = [("APP_ENV".to_owned(), "test's".to_owned())];
+        let cmd = ["php".to_owned(), "-r".to_owned(), "echo $x;".to_owned()];
+        assert_eq!(
+            remote_command(Path::new("/p/my dir"), &env, &cmd),
+            r#"source ~/.luggage/rc >/dev/null; export APP_ENV='test'"'"'s'; cd '/p/my dir' && exec 'php' '-r' 'echo $x;'"#
+        );
+        assert!(
+            remote_command(Path::new("/p"), &[], &[])
+                .ends_with("exec bash --rcfile ~/.luggage/rc -i")
+        );
+    }
+
+    #[test]
+    fn host_variables_stay_on_the_host() {
+        for v in [
+            "PATH",
+            "HOME",
+            "SSH_AUTH_SOCK",
+            "XDG_RUNTIME_DIR",
+            "NIX_PATH",
+            "SSL_CERT_FILE",
+            "TERM",
+        ] {
+            assert!(host_only(v), "{v}");
+        }
+        for v in ["APP_ENV", "DATABASE_URL", "XDEBUG_MODE", "PHP_INI_SCAN_DIR"] {
+            assert!(!host_only(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn stand_ins_come_from_project_packages_without_shells() {
+        let store = tempfile::tempdir().unwrap();
+        let (php, bash) = (store.path().join("php"), store.path().join("bash"));
+        for (pkg, progs) in [(&php, ["php", "php-fpm"]), (&bash, ["bash", "sh"])] {
+            fs::create_dir_all(pkg.join("bin")).unwrap();
+            for prog in progs {
+                fs::write(pkg.join("bin").join(prog), "").unwrap();
+            }
+        }
+        let env = format!(
+            "buildInputs=''\nnativeBuildInputs='{} {}'\nexport nativeBuildInputs\n",
+            php.display(),
+            bash.display()
+        );
+        assert_eq!(project_programs(&env), ["php", "php-fpm"]);
+        assert!(project_programs("PATH='/x'").is_empty());
+    }
+
+    #[test]
+    fn rc_resets_build_only_variables() {
+        let rc = render_rc("demo");
+        assert!(rc.starts_with("source ~/.luggage/env.sh\n"));
+        assert!(
+            rc.contains("unset NIX_BUILD_TOP TEMP TMP TEMPDIR SSL_CERT_FILE NIX_SSL_CERT_FILE\n")
+        );
+        assert!(rc.contains("PS1='[chest:demo] \\w\\$ '"));
     }
 }

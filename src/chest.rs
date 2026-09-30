@@ -533,20 +533,21 @@ impl Chest {
         Ok(a)
     }
 
-    /// Creates the directories and writes env.sh, rc, hosts and process-compose.yaml.
-    fn prepare(&self, nixpkgs: &str) -> Result<Tools> {
-        for d in [self.state.join("home"), self.state.join("data"), self.run.clone()] {
-            fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
-        }
-        fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
-        let tools = Tools::fetch(nixpkgs, &self.def.packages)?;
+    /// Writes `env.sh` in the runtime dir with the dev environment of the project, if the flake changed since.
+    /// With `profile`, nix also keeps the environment there so garbage collection does not remove it.
+    fn dev_env(&self, profile: Option<&Path>) -> Result<PathBuf> {
         let env = self.run.join("env.sh");
         let flake_changed =
             ["flake.nix", "flake.lock"].iter().filter_map(|f| mtime(&self.project.join(f))).max();
-        if mtime(&env).is_none_or(|t| flake_changed.is_some_and(|f| f > t)) {
+        let stale = mtime(&env).is_none_or(|t| flake_changed.is_some_and(|f| f > t));
+        if stale || profile.is_some_and(|p| !p.exists()) {
             info("building the environment (nix print-dev-env)");
-            let out = Command::new("nix")
-                .arg("print-dev-env")
+            let mut c = Command::new("nix");
+            c.arg("print-dev-env");
+            if let Some(p) = profile {
+                c.arg("--profile").arg(p);
+            }
+            let out = c
                 .current_dir(&self.project)
                 .stderr(Stdio::inherit())
                 .output()
@@ -556,6 +557,17 @@ impl Chest {
             }
             fs::write(&env, out.stdout)?;
         }
+        Ok(env)
+    }
+
+    /// Creates the directories and writes env.sh, rc, hosts and process-compose.yaml.
+    fn prepare(&self, nixpkgs: &str) -> Result<Tools> {
+        for d in [self.state.join("home"), self.state.join("data"), self.run.clone()] {
+            fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
+        }
+        fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
+        let tools = Tools::fetch(nixpkgs, &self.def.packages)?;
+        self.dev_env(None)?;
         fs::write(self.run.join("tools.json"), serde_json::to_string_pretty(&tools)?)?;
         fs::write(self.run.join("rc"), self.render_rc(&tools))?;
         fs::write(self.run.join("hosts"), self.render_hosts())?;
@@ -575,6 +587,12 @@ impl Chest {
         shell_args(&mut c, cmd);
         pass_through(c.status().context("cannot start bwrap")?);
         Ok(())
+    }
+
+    /// Brings the dev environment in the guest up to date with the project flake.
+    fn vm_sync(&self) -> Result<()> {
+        let env = self.dev_env(Some(&self.state.join("vm/dev-env")))?;
+        vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env)
     }
 
     /// Commands that do not work with a VM yet.
@@ -603,6 +621,7 @@ impl Chest {
             let dir = self.state.join("vm");
             vm::build(&self.name, &self.project, nixpkgs, &dir)?;
             let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
+            self.vm_sync()?;
             info(&format!(
                 "chest {} is running (VM, pid {pid}) — `luggage status`, `luggage down`",
                 self.name
@@ -744,10 +763,17 @@ impl Chest {
 
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String]) -> Result<()> {
-        self.not_in_vm_mode()?;
         let pid = self.running().with_context(|| {
             format!("chest {} is not running — run `luggage up` first", self.name)
         })?;
+        if self.def.mode == Mode::Vm {
+            self.vm_sync()?;
+            // only the project is shared with the guest
+            let cwd = std::env::current_dir()?;
+            let cwd = if cwd.starts_with(&self.project) { cwd } else { self.project.clone() };
+            pass_through(vm::exec(&self.name, &self.state.join("vm"), &self.run, &cwd, cmd)?);
+            return Ok(());
+        }
         let tools = self.tools()?;
         let mut c = nsenter(pid, &tools);
         shell_args(&mut c, cmd);

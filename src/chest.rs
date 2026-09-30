@@ -23,6 +23,8 @@ use crate::{config, find_in_path, home, info, versions, vm};
 const DEFAULT_READY_TIMEOUT: u32 = 60;
 /// The path of the runtime dir inside the chest.
 const RUN_INSIDE: &str = "/run/luggage";
+/// process-compose in the VM guest, from its system packages.
+const PC_GUEST: &str = "/run/current-system/sw/bin/process-compose";
 /// Closes every inherited file descriptor above 2, then runs the arguments.
 const CLOSE_FDS_AND_EXEC: &str = r#"for fd in /proc/self/fd/*; do fd=${fd##*/}; if [ "$fd" -gt 2 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; exec "$@""#;
 
@@ -595,7 +597,53 @@ impl Chest {
     /// Brings the dev environment in the guest up to date with the project flake.
     fn vm_sync(&self) -> Result<()> {
         let env = self.dev_env(Some(&self.state.join("vm/dev-env")))?;
-        vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env)
+        let compose = self.run.join("process-compose.yaml");
+        let yaml = self.render_compose();
+        // only write on change: the copy into the guest follows the modification time
+        if fs::read_to_string(&compose).ok().as_deref() != Some(yaml.as_str()) {
+            fs::write(&compose, yaml)?;
+        }
+        vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env, &compose)
+    }
+
+    /// A process-compose command in the guest, e.g. `process list -o json`.
+    fn vm_pc(&self, args: &str) -> Command {
+        vm::script(
+            &self.name,
+            &self.state.join("vm"),
+            &self.run,
+            &format!("{PC_GUEST} {args} -U -u {RUN_INSIDE}/pc.sock"),
+        )
+    }
+
+    /// Starts the services in the guest and waits until they are ready, like `up` in the bubblewrap chest.
+    fn vm_services(&self, pid: u32) -> Result<()> {
+        if self.def.services.is_empty() {
+            return Ok(());
+        }
+        let start = format!(
+            // `cd … && setsid … &` would put the whole list in a background subshell that keeps the ssh session open
+            "source ~/.luggage/rc >/dev/null; export PATH=\"$(cat /etc/luggage/path):$PATH\"; cd {} || exit 1; setsid {PC_GUEST} up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml </dev/null >{RUN_INSIDE}/services.log 2>&1 &",
+            sh_quote(&self.project.to_string_lossy())
+        );
+        if !vm::script(&self.name, &self.state.join("vm"), &self.run, &start).status()?.success() {
+            bail!("cannot start the services in the VM");
+        }
+        let log = format!("`luggage exec cat {RUN_INSIDE}/pc.log`");
+        let limit = self.ready_limit();
+        for _ in 0..limit * 4 {
+            let out = self.vm_pc("process list -o json").stderr(Stdio::null()).output()?;
+            if self.check_services(&out.stdout, &log)? {
+                return Ok(());
+            }
+            if !alive(pid) {
+                bail!("VM stopped before the services were ready");
+            }
+            sleep(Duration::from_millis(250));
+        }
+        bail!(
+            "services not ready after {limit} s (the chest keeps running) — `luggage status`, log: {log}"
+        )
     }
 
     /// Starts the VM unless it runs already and returns its PID. Only one start at a time:
@@ -613,9 +661,10 @@ impl Chest {
         self.stop_other_vms();
         self.ensure_envrc_hook()?;
         let dir = self.state.join("vm");
-        vm::build(&self.name, &self.project, nixpkgs, &dir)?;
+        vm::build(&self.name, &self.project, nixpkgs, &dir, &self.def.packages, &self.def.hosts)?;
         let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
         self.vm_sync()?;
+        self.vm_services(pid)?;
         Ok(pid)
     }
 
@@ -783,14 +832,7 @@ impl Chest {
         // Return only once the services are ready. Also, a `down` while a readiness_probe
         // is still pending hangs in process-compose.
         if !self.def.services.is_empty() {
-            let limit = self
-                .def
-                .services
-                .values()
-                .map(|s| s.ready_timeout.unwrap_or(DEFAULT_READY_TIMEOUT))
-                .max()
-                .unwrap_or(DEFAULT_READY_TIMEOUT)
-                + 5;
+            let limit = self.ready_limit();
             let mut ready = false;
             for _ in 0..limit * 4 {
                 if self.services_ready(&tools)? {
@@ -820,10 +862,26 @@ impl Chest {
     fn services_ready(&self, tools: &Tools) -> Result<bool> {
         let out =
             self.pc(tools, &["process", "list", "-o", "json"]).stderr(Stdio::null()).output()?;
-        let Ok(list) = serde_json::from_slice::<Vec<ProcState>>(&out.stdout) else {
+        self.check_services(&out.stdout, &self.run.join("chest.log").display().to_string())
+    }
+
+    /// Seconds `up` waits for the services: the longest `ready_timeout` plus a little.
+    fn ready_limit(&self) -> u32 {
+        self.def
+            .services
+            .values()
+            .map(|s| s.ready_timeout.unwrap_or(DEFAULT_READY_TIMEOUT))
+            .max()
+            .unwrap_or(DEFAULT_READY_TIMEOUT)
+            + 5
+    }
+
+    /// Reads `process-compose process list -o json` and tells whether all services are ready.
+    /// Fails if a service stopped that should keep running; `log` says where to look.
+    fn check_services(&self, json: &[u8], log: &str) -> Result<bool> {
+        let Ok(list) = serde_json::from_slice::<Vec<ProcState>>(json) else {
             return Ok(false);
         };
-        let log = self.run.join("chest.log");
         let mut ready = 0;
         for p in &list {
             let Some(svc) = self.def.services.get(&p.name) else {
@@ -831,7 +889,7 @@ impl Chest {
             };
             let finished = !p.is_running && matches!(p.status.as_str(), "Completed" | "Error");
             if finished && (!svc.once || p.exit_code != 0) {
-                bail!("service {} stopped (exit {}) — log: {}", p.name, p.exit_code, log.display());
+                bail!("service {} stopped (exit {}) — log: {log}", p.name, p.exit_code);
             }
             let ok = if svc.once {
                 finished
@@ -923,6 +981,8 @@ impl Chest {
             return Ok(());
         };
         if is_vm {
+            // stop the services in order first, so the databases shut down cleanly
+            let _ = self.vm_pc("down").stdout(Stdio::null()).stderr(Stdio::null()).status();
             vm::stop(&self.name, &self.run, Some(pid));
         } else if self.socket().exists() {
             // Stop the services in order; the SIGKILL below is only for when nothing else works.
@@ -988,7 +1048,11 @@ impl Chest {
             return Ok(());
         };
         println!("Status:      running (pid {pid})");
-        if self.socket().exists() {
+        if self.def.mode == Mode::Vm && !self.def.services.is_empty() {
+            println!();
+            // stderr is hidden: process-compose prints debug lines there about its missing config
+            self.vm_pc("process list -o wide").stderr(Stdio::null()).status()?;
+        } else if self.socket().exists() {
             println!();
             let tools = self.tools()?;
             // stderr is hidden: process-compose prints debug lines there about its missing config

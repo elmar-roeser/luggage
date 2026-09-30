@@ -194,7 +194,9 @@ starting the VM of another project stops the old one. `luggage up`, `exec`, `ope
 
 This needs `/dev/kvm` (your user in the group `kvm`) and ssh. `luggage up` adds the line
 `if has luggage; then eval "$(luggage hook)"; fi` to the `.envrc` if it is missing; then run `direnv allow` once.
-Not in the VM yet: the services from `compose.yaml` and `luggage run`.
+The services (from `compose.yaml` and `chest.toml`) run in the VM too, with their data on the VM disk.
+After changing services, packages or hosts, restart the VM with `luggage down` and `luggage up`.
+Not in the VM yet: `luggage run`.
 
 ## Development
 

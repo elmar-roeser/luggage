@@ -37,7 +37,9 @@ const FLAKE: &str = r#"{
   outputs = { self, nixpkgs, microvm }: {
     nixosConfigurations.chest = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
-      modules = [ microvm.nixosModules.microvm {
+      modules = [ microvm.nixosModules.microvm ({ pkgs, lib, ... }: let
+        servicePackages = map (p: lib.getAttrFromPath (lib.splitString "." p) pkgs) [ "process-compose" @PACKAGES@ ];
+      in {
         networking.hostName = @HOSTNAME@;
         networking.firewall.enable = false;
         documentation.enable = false;
@@ -78,7 +80,20 @@ const FLAKE: &str = r#"{
           openFirewall = false;
           hostKeys = [ { path = "/var/lib/ssh/ssh_host_ed25519_key"; type = "ed25519"; } ];
         };
-      } ];
+        # Services run with process-compose as in the bubblewrap chest: same packages and host names,
+        # /data on the VM disk (it survives a restart), sockets in /run/luggage, ports below 1024 allowed.
+        # The services get the package paths themselves: e.g. mariadb-install-db finds its files only next to
+        # its real binary, and the system profile does not link share/mysql.
+        environment.systemPackages = servicePackages;
+        environment.etc."luggage/path".text = lib.makeBinPath servicePackages;
+        networking.hosts."127.0.0.1" = [ @HOSTS@ ];
+        boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 0;
+        systemd.tmpfiles.rules = [
+          "d /var/lib/luggage/data 0700 @UID@ @GID@ -"
+          "L+ /data - - - - /var/lib/luggage/data"
+          "d /run/luggage 0700 @UID@ @GID@ -"
+        ];
+      }) ];
     };
     # Everything luggage runs on the host, so it needs neither virtiofsd nor a new systemd there.
     packages.x86_64-linux.default = let pkgs = nixpkgs.legacyPackages.x86_64-linux; in pkgs.symlinkJoin {
@@ -114,6 +129,10 @@ pub struct Guest<'a> {
     pub home: &'a Path,
     /// Public ssh key that may log in
     pub ssh_key: &'a str,
+    /// nixpkgs attributes the services need, e.g. `mariadb_1011`
+    pub packages: &'a [String],
+    /// Names that point to 127.0.0.1 in the guest
+    pub hosts: &'a [String],
 }
 
 /// A Nix string literal. `${` is escaped so nothing gets interpolated.
@@ -150,6 +169,14 @@ pub fn render(g: &Guest) -> String {
         .replace("@GID@", &g.gid.to_string())
         .replace("@HOME@", &s(g.home))
         .replace("@SSH_KEY@", &nix_str(g.ssh_key.trim()))
+        // last: these come from project files and must not be scanned for placeholders again
+        .replace("@PACKAGES@", &list(g.packages))
+        .replace("@HOSTS@", &list(g.hosts))
+}
+
+/// Nix strings separated by spaces, for a list.
+fn list(items: &[String]) -> String {
+    items.iter().map(|i| nix_str(i)).collect::<Vec<_>>().join(" ")
 }
 
 /// Creates the ssh key for the chest once and returns the public key.
@@ -174,7 +201,14 @@ fn ssh_key(dir: &Path) -> Result<String> {
 ///
 /// # Errors
 /// If the key cannot be created or `nix build` fails.
-pub fn build(name: &str, project: &Path, nixpkgs: &str, dir: &Path) -> Result<PathBuf> {
+pub fn build(
+    name: &str,
+    project: &Path,
+    nixpkgs: &str,
+    dir: &Path,
+    packages: &[String],
+    hosts: &[String],
+) -> Result<PathBuf> {
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let meta = fs::metadata("/proc/self")?;
     let user = std::env::var("USER").context("USER is not set")?;
@@ -191,6 +225,8 @@ pub fn build(name: &str, project: &Path, nixpkgs: &str, dir: &Path) -> Result<Pa
         gid: meta.gid(),
         home: &home,
         ssh_key: &ssh_key,
+        packages,
+        hosts,
     });
     // Only flake.nix and flake.lock may be in here: nix copies the whole directory into the
     // world-readable store on every build, so the key and var.img stay one level up.
@@ -570,22 +606,24 @@ pub fn write_shims(run: &Path, inputs: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copies `env_sh` and the rc file into the guest (`~/.luggage`),
-/// unless that already happened for this env.sh and this VM.
+/// Copies `env_sh` and the rc file into the guest (`~/.luggage`) and `compose` to `/run/luggage/process-compose.yaml`,
+/// unless that already happened for these files and this VM.
 ///
 /// # Errors
 /// If env.sh cannot be read or the copy over ssh fails.
-pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path) -> Result<()> {
+pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path, compose: &Path) -> Result<()> {
     let sent = run.join("env.sent");
     let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-    if modified(&sent).is_some_and(|s| modified(env_sh).is_some_and(|e| s >= e)) {
+    let newest = modified(env_sh).max(modified(compose));
+    if modified(&sent).is_some_and(|s| newest.is_some_and(|n| s >= n)) {
         return Ok(());
     }
     let status = ssh(name, dir, Some(run))
         .arg("-T")
         .arg(format!(
-            "mkdir -p ~/.luggage && cat > ~/.luggage/env.sh && printf %s {} > ~/.luggage/rc",
-            sh_quote(&render_rc(name))
+            "mkdir -p ~/.luggage && cat > ~/.luggage/env.sh && printf %s {} > ~/.luggage/rc && printf %s {} > /run/luggage/process-compose.yaml",
+            sh_quote(&render_rc(name)),
+            sh_quote(&fs::read_to_string(compose)?)
         ))
         .stdin(File::open(env_sh)?)
         .status()
@@ -595,6 +633,13 @@ pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path) -> Result<()>
     }
     fs::write(sent, "")?;
     Ok(())
+}
+
+/// A shell `script` in the guest over the shared connection, without a terminal.
+pub fn script(name: &str, dir: &Path, run: &Path, script: &str) -> Command {
+    let mut c = ssh(name, dir, Some(run));
+    c.arg("-T").arg(script);
+    c
 }
 
 /// Runs `cmd` in the guest in `cwd` (a shell without a command) and returns its exit status.
@@ -627,6 +672,8 @@ mod tests {
             gid: 1000,
             home: Path::new("/home/u"),
             ssh_key: "ssh-ed25519 AAAA luggage\n",
+            packages: &[],
+            hosts: &[],
         }
     }
 
@@ -644,6 +691,19 @@ mod tests {
         assert!(
             !f.split('@').skip(1).any(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
         );
+    }
+
+    #[test]
+    fn renders_service_packages_and_hosts() {
+        let (packages, hosts) =
+            (["mariadb_1011".to_owned()], ["database".to_owned(), "mailer".to_owned()]);
+        let f = render(&Guest { packages: &packages, hosts: &hosts, ..guest("demo", "u") });
+        assert!(f.contains("pkgs) [ \"process-compose\" \"mariadb_1011\" ];"));
+        assert!(
+            f.contains("environment.etc.\"luggage/path\".text = lib.makeBinPath servicePackages;")
+        );
+        assert!(f.contains("networking.hosts.\"127.0.0.1\" = [ \"database\" \"mailer\" ];"));
+        assert!(f.contains("\"d /run/luggage 0700 1000 1000 -\""));
     }
 
     #[test]

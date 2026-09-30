@@ -1,4 +1,4 @@
-//! Fragt den nixpkgs-Channel, welche PHP-/Node-/Python-Versionen es gibt (Cache: 1 Tag).
+//! Fragt den nixpkgs-Channel, welche PHP-/Node-/Python- und Datenbank-Versionen es gibt (Cache: 1 Tag).
 
 use std::fs;
 use std::path::PathBuf;
@@ -25,6 +25,8 @@ in {
   php = entries "php8[0-9]";
   node = entries "nodejs_[0-9]+";
   python = entries "python3[0-9]+";
+  mariadb = entries "mariadb_[0-9]+";
+  postgresql = entries "postgresql_[0-9]+";
   php_default = ver "php";
   python_default = ver "python3";
   rustc = ver "rustc";
@@ -49,6 +51,10 @@ struct Raw {
     node: Vec<Entry>,
     /// Attribute `python3N`
     python: Vec<Entry>,
+    /// Attribute `mariadb_N`
+    mariadb: Vec<Entry>,
+    /// Attribute `postgresql_N`
+    postgresql: Vec<Entry>,
     /// Version von `php`
     php_default: Option<String>,
     /// Version von `python3`
@@ -66,6 +72,10 @@ pub struct Available {
     pub node: Vec<u32>,
     /// Python als (Major, Minor)
     pub python: Vec<(u32, u32)>,
+    /// MariaDB-Versionen als (Major, Minor)
+    pub mariadb: Vec<(u32, u32)>,
+    /// PostgreSQL-Hauptversionen
+    pub postgresql: Vec<u32>,
     /// Standard-PHP des Channels
     pub php_default: Option<(u32, u32)>,
     /// Standard-Python des Channels
@@ -100,10 +110,19 @@ fn parse(json: &str) -> Result<Available> {
         .filter_map(|e| e.attr.strip_prefix("nodejs_")?.parse().ok())
         .collect();
     node.sort_unstable();
+    let mut postgresql: Vec<u32> = raw
+        .postgresql
+        .iter()
+        .filter_map(|e| major_minor(&e.version).map(|(major, _)| major))
+        .collect();
+    postgresql.sort_unstable();
+    postgresql.dedup();
     Ok(Available {
         php: stable(&raw.php),
         node,
         python: stable(&raw.python),
+        mariadb: stable(&raw.mariadb),
+        postgresql,
         php_default: raw.php_default.as_deref().and_then(major_minor),
         python_default: raw.python_default.as_deref().and_then(major_minor),
         rustc: raw.rustc.as_deref().and_then(major_minor),
@@ -163,6 +182,8 @@ pub fn fixture() -> Available {
         php: vec![(8, 2), (8, 3), (8, 4), (8, 5)],
         node: vec![20, 22, 24, 26],
         python: vec![(3, 11), (3, 12), (3, 13), (3, 14)],
+        mariadb: vec![(10, 6), (10, 11), (11, 4), (11, 8)],
+        postgresql: vec![14, 15, 16, 17, 18],
         php_default: Some((8, 4)),
         python_default: Some((3, 13)),
         rustc: Some((1, 95)),
@@ -178,11 +199,15 @@ mod tests {
         let json = r#"{"php":[{"attr":"php83","version":"8.3.35"},{"attr":"php82","version":"8.2.34"}],
             "node":[{"attr":"nodejs_22","version":"22.23.3"},{"attr":"nodejs_20","version":"20.20.2"}],
             "python":[{"attr":"python313","version":"3.13.15"},{"attr":"python315","version":"3.15.0rc2"}],
+            "mariadb":[{"attr":"mariadb_114","version":"11.4.12"},{"attr":"mariadb_1011","version":"10.11.17"}],
+            "postgresql":[{"attr":"postgresql_17","version":"17.11"},{"attr":"postgresql_16","version":"16.14"}],
             "php_default":"8.4.26","node_default":"24.21.0","python_default":"3.13.15","rustc":"1.95.0"}"#;
         let a = parse(json).unwrap();
         assert_eq!(a.php, [(8, 2), (8, 3)]);
         assert_eq!(a.node, [20, 22]);
         assert_eq!(a.python, [(3, 13)]);
+        assert_eq!(a.mariadb, [(10, 11), (11, 4)]);
+        assert_eq!(a.postgresql, [16, 17]);
         assert_eq!((a.php_default, a.rustc), (Some((8, 4)), Some((1, 95))));
     }
 }

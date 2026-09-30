@@ -21,6 +21,7 @@ Das Binary heißt `luggage`. Alternativ: statisches Linux-Binary von den
 - [Nix](https://nixos.org/download) mit aktivierten Flakes (`experimental-features = nix-command flakes`)
 - [direnv](https://direnv.net) mit Shell-Hook und [nix-direnv](https://github.com/nix-community/nix-direnv)
 - `git`; für `--gitlab` zusätzlich [`glab`](https://gitlab.com/gitlab-org/cli), für `--github` [`gh`](https://cli.github.com) (jeweils angemeldet)
+- für die Truhe: `bwrap` ([bubblewrap](https://github.com/containers/bubblewrap)), `unshare`, `nsenter`, `setsid` (util-linux) und `ip` (iproute2)
 
 ## Benutzung
 
@@ -110,6 +111,56 @@ ignoriert, eine höhere `rust-version` in `Cargo.toml` gemeldet.
 - `flake.lock` über `nix flake lock`
 
 Alle Dateien werden gestaged (Nix sieht nur Dateien, die git kennt), aber **nicht committet**.
+
+## Die Truhe
+
+Die Truhe ist das Projekt in einer abgeschotteten Umgebung: eigenes Home, eigene Dienste,
+eigenes Netz — ohne Docker und ohne root. Sie sieht nur das Projekt und den Nix-Store;
+`~/.ssh`, Zugangsdaten und andere Projekte bleiben draußen. Die IDE bleibt draußen.
+
+```bash
+luggage run --net composer install   # einmaliger Befehl, --net erlaubt Internet
+luggage up                           # Dienste im Hintergrund starten, wartet bis sie bereit sind
+luggage status                       # läuft sie? wie geht es den Diensten?
+luggage exec php bin/console about   # Befehl in der laufenden Truhe
+luggage open                         # Shell in der laufenden Truhe
+luggage down
+```
+
+Welche Dienste gebraucht werden, liest luggage aus der `compose.yaml` (bzw.
+`docker-compose.yml`) des Projekts. Übernommen werden MariaDB, PostgreSQL, Redis/Valkey
+und Mailpit/Mailhog: in der Version aus dem Image-Tag (sonst die nächsthöhere aus nixpkgs),
+mit Datenbank und Benutzer aus `environment` und dem Compose-Dienstnamen als Hostnamen.
+Eine `.env` mit `DATABASE_URL=mysql://app:app@database:3306/app` passt damit unverändert.
+Alles andere (eigene Images, nginx, PHP) meldet `luggage status` als nicht übernommen.
+
+Ergänzen lässt sich das mit einer `truhe.toml` in `.luggage/` im Projekt oder, falls das
+Team-Repo tabu ist, in `~/.config/luggage/truhen/<projekt>/`. Ein Dienst mit gleichem Namen
+ersetzt den erkannten. Das Verzeichnis der Datei ist in der Truhe unter `/truhe` lesbar
+(z.B. für eine Caddyfile).
+
+```toml
+ignore = ["mailer"]         # erkannte Compose-Dienste nicht übernehmen
+hosts = ["api.local"]       # zeigen in der Truhe auf 127.0.0.1
+packages = ["curl"]         # zusätzliche nixpkgs-Pakete, hier für die ready-Prüfung
+
+[services.web]
+command = "exec php -S 127.0.0.1:80 -t public"
+depends_on = ["database-setup"]
+ready = "curl -sf http://127.0.0.1/"
+ready_timeout = 60          # Sekunden (Standard)
+
+[services.cache-warmup]
+command = "php bin/console cache:warmup"
+once = true                 # läuft einmal durch, Abhängige warten auf Erfolg
+```
+
+In der Truhe liegen Daten unter `/data` und Sockets unter `/run/luggage`. Ports unter 1024
+sind erlaubt, gelten aber nur in der Truhe. Außerhalb liegen Home und Daten unter
+`~/.local/share/luggage/truhen/<projekt>/`, Laufzeitdateien unter `$XDG_RUNTIME_DIR/luggage/<projekt>/`.
+
+Die Truhe schützt gegen Versehen, Install-Skripte und neugierige Agenten, ist aber keine
+harte Sicherheitsgrenze (gleiche UID, kein seccomp).
 
 ## Lizenz
 

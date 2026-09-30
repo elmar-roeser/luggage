@@ -1,9 +1,11 @@
 //! luggage — Projekt anlegen/klonen und eine Nix-Dev-Umgebung (flake + direnv) einrichten.
 
+mod compose;
 mod config;
 mod detect;
 mod flake;
 mod remote;
+mod truhe;
 mod versions;
 
 use std::fs;
@@ -69,6 +71,29 @@ enum Cmd {
         #[arg(long)]
         init: bool,
     },
+    /// Befehl in einer frischen Truhe ausführen (ohne Befehl: Shell)
+    Run {
+        /// Internet in der Truhe erlauben
+        #[arg(long)]
+        net: bool,
+        /// Befehl mit Argumenten
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+    /// Truhe mit ihren Diensten im Hintergrund starten
+    Up,
+    /// Befehl in der laufenden Truhe ausführen
+    Exec {
+        /// Befehl mit Argumenten
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+    /// Shell in der laufenden Truhe öffnen
+    Open,
+    /// Laufende Truhe beenden
+    Down,
+    /// Zeigen, ob die Truhe läuft und wie es den Diensten geht
+    Status,
 }
 
 /// Optionen für die Nix-Umgebung (`new` und `init`).
@@ -388,6 +413,18 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             cmd_new(args, &env, &config::load()?)
         }
         Cmd::Init { path, env } => setup_env(&std::path::absolute(&path)?, &env, &config::load()?),
+        Cmd::Run { net, cmd } => {
+            let nixpkgs = config::load()?.nixpkgs();
+            truhe::Truhe::find(&nixpkgs, false)?.cmd_run(net, &cmd, &nixpkgs)
+        }
+        Cmd::Up => {
+            let nixpkgs = config::load()?.nixpkgs();
+            truhe::Truhe::find(&nixpkgs, false)?.cmd_up(&nixpkgs)
+        }
+        Cmd::Exec { cmd } => truhe::Truhe::find(&config::load()?.nixpkgs(), false)?.cmd_exec(&cmd),
+        Cmd::Open => truhe::Truhe::find(&config::load()?.nixpkgs(), false)?.cmd_open(),
+        Cmd::Down => truhe::Truhe::find(&config::load()?.nixpkgs(), true)?.cmd_down(),
+        Cmd::Status => truhe::Truhe::find(&config::load()?.nixpkgs(), false)?.cmd_status(),
     }
 }
 

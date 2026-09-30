@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{self, Detected};
-use crate::{config, find_in_path, home, info, versions};
+use crate::{config, find_in_path, home, info, versions, vm};
 
 /// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
@@ -37,6 +37,19 @@ pub struct Definition {
     pub services: BTreeMap<String, Service>,
     /// Detected Compose services that should be skipped
     pub ignore: Vec<String>,
+    /// How the chest isolates the project
+    pub mode: Mode,
+}
+
+/// How the chest isolates the project.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Namespaces with bubblewrap on the host kernel
+    #[default]
+    Bubblewrap,
+    /// A microVM with its own kernel
+    Vm,
 }
 
 /// A service that process-compose starts in the chest.
@@ -577,6 +590,11 @@ impl Chest {
             return Ok(());
         }
         self.print_notes();
+        if self.def.mode == Mode::Vm {
+            let runner = vm::build(&self.name, &self.project, nixpkgs, &self.state.join("vm"))?;
+            info(&format!("built {} — starting the VM is not implemented yet", runner.display()));
+            return Ok(());
+        }
         let tools = self.prepare(nixpkgs)?;
         let info_json = self.run.join("info.json");
         let _ = fs::remove_file(&info_json);
@@ -911,6 +929,9 @@ depends_on = ["db"]
         assert_eq!(def.hosts, ["database"]);
         assert_eq!(def.services.len(), 3);
         assert!(def.services["db-init"].once);
+        assert_eq!(def.mode, Mode::Bubblewrap);
+        assert_eq!(parse("mode = \"vm\"").unwrap().mode, Mode::Vm);
+        assert!(parse("mode = \"docker\"").is_err());
     }
 
     #[test]

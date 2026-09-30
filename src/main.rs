@@ -8,6 +8,7 @@ mod flake;
 mod remote;
 mod setup;
 mod versions;
+mod vm;
 
 use std::fs;
 use std::path::{Path, PathBuf};

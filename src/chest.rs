@@ -264,12 +264,12 @@ fn yaml_str(s: &str) -> String {
 }
 
 /// Is the process `pid` still alive?
-fn alive(pid: u32) -> bool {
+pub fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Waits up to `tenths` tenths of a second for `pid` to go away.
-fn wait_dead(pid: u32, tenths: u32) -> bool {
+pub fn wait_dead(pid: u32, tenths: u32) -> bool {
     for _ in 0..tenths {
         if !alive(pid) {
             return true;
@@ -565,6 +565,7 @@ impl Chest {
 
     /// Runs a one-off command in a fresh chest; without a command, a shell.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
+        self.not_in_vm_mode()?;
         let tools = self.prepare(nixpkgs)?;
         let mut c = Command::new(&tools.bwrap);
         c.args(self.bwrap_args(&tools, if net { Net::Share } else { Net::Off })?)
@@ -573,6 +574,14 @@ impl Chest {
             .arg("--noprofile");
         shell_args(&mut c, cmd);
         pass_through(c.status().context("cannot start bwrap")?);
+        Ok(())
+    }
+
+    /// Commands that do not work with a VM yet.
+    fn not_in_vm_mode(&self) -> Result<()> {
+        if self.def.mode == Mode::Vm {
+            bail!("this command does not work with mode = \"vm\" yet");
+        }
         Ok(())
     }
 
@@ -591,8 +600,13 @@ impl Chest {
         }
         self.print_notes();
         if self.def.mode == Mode::Vm {
-            let runner = vm::build(&self.name, &self.project, nixpkgs, &self.state.join("vm"))?;
-            info(&format!("built {} — starting the VM is not implemented yet", runner.display()));
+            let dir = self.state.join("vm");
+            vm::build(&self.name, &self.project, nixpkgs, &dir)?;
+            let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
+            info(&format!(
+                "chest {} is running (VM, pid {pid}) — `luggage status`, `luggage down`",
+                self.name
+            ));
             return Ok(());
         }
         let tools = self.prepare(nixpkgs)?;
@@ -730,6 +744,7 @@ impl Chest {
 
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String]) -> Result<()> {
+        self.not_in_vm_mode()?;
         let pid = self.running().with_context(|| {
             format!("chest {} is not running — run `luggage up` first", self.name)
         })?;
@@ -764,12 +779,19 @@ impl Chest {
 
     /// Stops the chest: first the services in order, SIGKILL as a last resort.
     pub fn cmd_down(&self) -> Result<()> {
+        // control.socket also finds a VM whose chest.toml is broken right now
+        let is_vm = self.def.mode == Mode::Vm || self.run.join("control.socket").exists();
         let Some(pid) = self.running() else {
+            if is_vm {
+                vm::stop(&self.name, &self.run, None);
+            }
             let _ = fs::remove_file(self.pid_file());
             info(&format!("chest {} is not running", self.name));
             return Ok(());
         };
-        if self.socket().exists() {
+        if is_vm {
+            vm::stop(&self.name, &self.run, Some(pid));
+        } else if self.socket().exists() {
             // Stop the services in order; the SIGKILL below is only for when nothing else works.
             let tools = self.tools()?;
             let client =
@@ -803,6 +825,7 @@ impl Chest {
     pub fn cmd_status(&self) -> Result<()> {
         println!("Chest:       {}", self.name);
         println!("Project:     {}", self.project.display());
+        println!("Mode:        {}", if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" });
         println!(
             "Definition:  {}",
             self.def_dir

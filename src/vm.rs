@@ -3,14 +3,25 @@
 //! luggage writes a flake for the guest into `<state>/vm` and builds its runner there.
 //! `/nix/store` and the project come from the host over virtiofs, so the dev environment works unchanged in the guest.
 
-use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::chest::{alive, sh_quote, wait_dead};
 use crate::info;
+
+/// Longest wait until the guest answers on ssh.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Tags of the virtiofs shares, as in the guest flake.
+const TAGS: [&str; 2] = ["ro-store", "project"];
 
 /// Template for the guest flake; `render` fills in the `@...@` placeholders.
 const FLAKE: &str = r#"{
@@ -68,7 +79,15 @@ const FLAKE: &str = r#"{
         };
       } ];
     };
-    packages.x86_64-linux.default = self.nixosConfigurations.chest.config.microvm.declaredRunner;
+    # Everything luggage runs on the host, so it needs neither virtiofsd nor a new systemd there.
+    packages.x86_64-linux.default = let pkgs = nixpkgs.legacyPackages.x86_64-linux; in pkgs.symlinkJoin {
+      name = "chest-@NAME@";
+      paths = [
+        self.nixosConfigurations.chest.config.microvm.declaredRunner
+        pkgs.virtiofsd
+        (pkgs.writeShellScriptBin "chest-ssh-proxy" ''exec ${pkgs.systemd}/lib/systemd/systemd-ssh-proxy "$@"'')
+      ];
+    };
   };
 }
 "#;
@@ -196,6 +215,203 @@ pub fn build(name: &str, project: &Path, nixpkgs: &str, dir: &Path) -> Result<Pa
     Ok(runner)
 }
 
+/// Socket of a virtiofs share, relative to the runtime dir. microvm.nix picks this name for qemu.
+fn socket(name: &str, tag: &str) -> String {
+    format!("{}-virtiofs-{tag}.sock", hostname(name))
+}
+
+/// ssh into the guest over vsock, without the user's ssh config (it could open a password dialog).
+/// The remote command follows as further arguments.
+pub fn ssh(name: &str, dir: &Path) -> Command {
+    let proxy = dir.join("runner/bin/chest-ssh-proxy");
+    let mut c = Command::new("ssh");
+    c.args(["-F", "/dev/null", "-q", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"])
+        // the host key is the guest's own and the connection never leaves this machine
+        .args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+        .args(["-o", "LogLevel=ERROR", "-o", "ProxyUseFdpass=yes", "-i"])
+        .arg(dir.join("id_ed25519"))
+        .arg("-o")
+        .arg(format!("ProxyCommand={} vsock/{} 22", sh_quote(&proxy.to_string_lossy()), cid(name)))
+        .args(["-l", &std::env::var("USER").unwrap_or_default(), "vsock"]);
+    c
+}
+
+/// Error for a vsock address that another VM already uses.
+fn cid_error(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "vsock address {} is taken by another VM — give the chest another name (`name` in chest.toml)",
+        cid(name)
+    )
+}
+
+/// Does some VM already use the vsock address of this chest? A free address fails at once with "No such device".
+fn cid_taken(name: &str, dir: &Path) -> Result<bool> {
+    let mut probe = Command::new(dir.join("runner/bin/chest-ssh-proxy"))
+        .arg(format!("vsock/{}", cid(name)))
+        .arg("22")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("cannot start chest-ssh-proxy")?;
+    for _ in 0..50 {
+        if probe.try_wait()?.is_some() {
+            let out = probe.wait_with_output()?;
+            return Ok(!String::from_utf8_lossy(&out.stderr).contains("No such device"));
+        }
+        sleep(Duration::from_millis(10));
+    }
+    // still connected: something answers there
+    let _ = probe.kill();
+    let _ = probe.wait();
+    Ok(true)
+}
+
+/// Stops leftover virtiofsd processes and removes their sockets.
+/// A virtiofsd that outlived its VM keeps its socket locked, so the next start would fail.
+fn stop_virtiofsd(name: &str, run: &Path) {
+    for tag in TAGS {
+        let pid_file = run.join(format!("virtiofsd-{tag}.pid"));
+        if let Some(pid) =
+            fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
+            && alive(pid)
+        {
+            let _ = Command::new("kill").arg(pid.to_string()).stderr(Stdio::null()).status();
+            wait_dead(pid, 20);
+        }
+        let sock = run.join(socket(name, tag));
+        for f in [pid_file, sock.with_extension("sock.pid"), sock] {
+            let _ = fs::remove_file(f);
+        }
+    }
+}
+
+/// Starts virtiofsd for both shares and then the VM, all in the runtime dir `run`.
+/// Writes the qemu PID to `pid_file` and returns once the guest answers on ssh.
+///
+/// # Errors
+/// If a process cannot start or the guest does not become ready; the VM is stopped again then.
+pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path) -> Result<u32> {
+    fs::create_dir_all(run).with_context(|| format!("cannot create {}", run.display()))?;
+    fs::set_permissions(run, fs::Permissions::from_mode(0o700))?;
+    // the readiness probe would otherwise reach the other VM and report success
+    if cid_taken(name, dir)? {
+        return Err(cid_error(name));
+    }
+    stop_virtiofsd(name, run);
+    let _ = fs::remove_file(run.join("control.socket"));
+    let bin = dir.join("runner/bin");
+    // The store never changes, so the guest may cache it for good.
+    for (tag, shared, cache) in
+        [("ro-store", Path::new("/nix/store"), "always"), ("project", project, "auto")]
+    {
+        let log = File::create(run.join(format!("virtiofsd-{tag}.log")))?;
+        let child = Command::new(bin.join("virtiofsd"))
+            .arg(format!("--socket-path={}", socket(name, tag)))
+            .arg("--shared-dir")
+            .arg(shared)
+            .args(["--sandbox=namespace", &format!("--cache={cache}")])
+            .current_dir(run)
+            // own process group: Ctrl-C in the terminal must not stop the VM
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .context("cannot start virtiofsd")?;
+        fs::write(run.join(format!("virtiofsd-{tag}.pid")), child.id().to_string())?;
+    }
+    for _ in 0..250 {
+        if TAGS.iter().all(|t| run.join(socket(name, t)).exists()) {
+            break;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    if let Some(t) = TAGS.iter().find(|t| !run.join(socket(name, t)).exists()) {
+        stop_virtiofsd(name, run);
+        bail!(
+            "virtiofsd for {t} does not start — log: {}",
+            run.join(format!("virtiofsd-{t}.log")).display()
+        );
+    }
+    let log = File::create(run.join("vm.log"))?;
+    let mut vm = Command::new(bin.join("microvm-run"))
+        .current_dir(run)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("cannot start the VM")?;
+    let pid = vm.id();
+    fs::write(pid_file, pid.to_string())?;
+    if let Err(e) = wait_ready(name, dir, run, &mut vm) {
+        stop(name, run, Some(pid));
+        let _ = fs::remove_file(pid_file);
+        return Err(e);
+    }
+    Ok(pid)
+}
+
+/// Waits until ssh into the guest works. Fails early if qemu stops.
+fn wait_ready(name: &str, dir: &Path, run: &Path, vm: &mut Child) -> Result<()> {
+    let log = run.join("vm.log");
+    let end = Instant::now() + READY_TIMEOUT;
+    while Instant::now() < end {
+        if let Some(status) = vm.try_wait()? {
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("guest cid") {
+                return Err(cid_error(name));
+            }
+            bail!("VM stopped ({status}) — log: {}", log.display());
+        }
+        // no stdin: the probe must not eat input meant for a later command
+        let probe = ssh(name, dir)
+            .args(["-o", "ConnectTimeout=2", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if probe.is_ok_and(|s| s.success()) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50));
+    }
+    bail!("VM does not answer on ssh after {} s — log: {}", READY_TIMEOUT.as_secs(), log.display())
+}
+
+/// Asks the guest to power off through the QMP socket of qemu.
+fn powerdown(control: &Path) -> std::io::Result<()> {
+    let mut s = UnixStream::connect(control)?;
+    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut reply = BufReader::new(s.try_clone()?);
+    let mut line = String::new();
+    // greeting, then one answer per command
+    reply.read_line(&mut line)?;
+    for cmd in ["qmp_capabilities", "system_powerdown"] {
+        writeln!(s, "{{\"execute\":\"{cmd}\"}}")?;
+        reply.read_line(&mut line)?;
+    }
+    Ok(())
+}
+
+/// Shuts the VM down cleanly, kills it as a last resort and stops virtiofsd.
+pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let clean = powerdown(&run.join("control.socket")).is_ok() && wait_dead(pid, 200);
+        if !clean {
+            for signal in ["-TERM", "-KILL"] {
+                let _ = Command::new("kill").args([signal, &pid.to_string()]).status();
+                if wait_dead(pid, 50) {
+                    break;
+                }
+            }
+        }
+    }
+    stop_virtiofsd(name, run);
+    let _ = fs::remove_file(run.join("control.socket"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +440,10 @@ mod tests {
         ));
         assert!(f.contains("users.groups.\"u\".gid = 1000;"));
         assert!(f.contains("openssh.authorizedKeys.keys = [ \"ssh-ed25519 AAAA luggage\" ];"));
-        assert!(!f.contains('@'));
+        // no placeholder left; "$@" in the proxy script is shell
+        assert!(
+            !f.split('@').skip(1).any(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+        );
     }
 
     #[test]

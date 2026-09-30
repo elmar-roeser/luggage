@@ -52,8 +52,7 @@ pub fn render(name: &str, php: Option<&Php>, node: Option<&Node>) -> String {
     }
     if let Some(node) = node {
         packages.push(
-            node.version
-                .map_or_else(|| "pkgs.nodejs".into(), |v| format!("pkgs.nodejs_{v}")),
+            node.version.map_or_else(|| "pkgs.nodejs".into(), |v| format!("pkgs.nodejs_{v}")),
         );
         if let Some(tool) = node.tool {
             packages.push(format!("pkgs.{tool}"));
@@ -74,16 +73,8 @@ mod tests {
 
     #[test]
     fn php_and_node() {
-        let php = Php {
-            version: (8, 3),
-            source: "",
-            exts: vec!["redis".into()],
-        };
-        let node = Node {
-            version: Some(22),
-            source: "",
-            tool: Some("pnpm"),
-        };
+        let php = Php { version: (8, 3), source: "", exts: vec!["redis".into()] };
+        let node = Node { version: Some(22), source: "", tool: Some("pnpm") };
         let flake = render("demo", Some(&php), Some(&node));
         assert!(flake.contains("pkgs.php83.buildEnv"));
         assert!(flake.contains(r#"phpExtensions = [ "redis" ];"#));

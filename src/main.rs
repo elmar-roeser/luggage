@@ -81,9 +81,7 @@ fn run(
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let status = cmd
-        .status()
-        .with_context(|| format!("{program} nicht startbar"))?;
+    let status = cmd.status().with_context(|| format!("{program} nicht startbar"))?;
     Ok(status.success())
 }
 
@@ -99,24 +97,18 @@ fn home() -> PathBuf {
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
-    p.strip_prefix("~/")
-        .map_or_else(|| PathBuf::from(p), |rest| home().join(rest))
+    p.strip_prefix("~/").map_or_else(|| PathBuf::from(p), |rest| home().join(rest))
 }
 
 fn is_remote(target: &str) -> bool {
-    let scp_like = target
-        .split_once(':')
-        .is_some_and(|(host, _)| host.contains('@') && !host.contains('/'));
+    let scp_like =
+        target.split_once(':').is_some_and(|(host, _)| host.contains('@') && !host.contains('/'));
     target.contains("://") || scp_like || expand_tilde(target).join(".git").exists()
 }
 
 /// `git@host:gruppe/name.git` → `name`
 fn repo_name(target: &str) -> &str {
-    let last = target
-        .trim_end_matches('/')
-        .rsplit(['/', ':'])
-        .next()
-        .unwrap_or(target);
+    let last = target.trim_end_matches('/').rsplit(['/', ':']).next().unwrap_or(target);
     last.strip_suffix(".git").unwrap_or(last)
 }
 
@@ -129,16 +121,9 @@ fn ensure_gitignore(root: &Path) -> Result<()> {
     {
         return Ok(());
     }
-    let sep = if content.is_empty() || content.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
+    let sep = if content.is_empty() || content.ends_with('\n') { "" } else { "\n" };
     let gap = if content.trim().is_empty() { "" } else { "\n" };
-    fs::write(
-        &path,
-        format!("{content}{sep}{gap}# nix-direnv Cache\n.direnv/\n"),
-    )?;
+    fs::write(&path, format!("{content}{sep}{gap}# nix-direnv Cache\n.direnv/\n"))?;
     Ok(())
 }
 
@@ -151,10 +136,7 @@ fn setup_env(root: &Path, opts: &EnvOpts) -> Result<()> {
     }
     let flake_path = root.join("flake.nix");
     if flake_path.exists() && !opts.force {
-        bail!(
-            "{} existiert schon (--force überschreibt)",
-            flake_path.display()
-        );
+        bail!("{} existiert schon (--force überschreibt)", flake_path.display());
     }
 
     let php = detect::detect_php(root, opts.php.as_deref())?;
@@ -165,15 +147,10 @@ fn setup_env(root: &Path, opts: &EnvOpts) -> Result<()> {
         } else {
             format!(", Extensions: {}", p.exts.join(", "))
         };
-        info(&format!(
-            "PHP {}.{} ({}){exts}",
-            p.version.0, p.version.1, p.source
-        ));
+        info(&format!("PHP {}.{} ({}){exts}", p.version.0, p.version.1, p.source));
     }
     if let Some(n) = &node {
-        let version = n
-            .version
-            .map_or_else(|| "Standard".into(), |v| v.to_string());
+        let version = n.version.map_or_else(|| "Standard".into(), |v| v.to_string());
         let tool = n.tool.map(|t| format!(" + {t}")).unwrap_or_default();
         info(&format!("Node {version} ({}){tool}", n.source));
     }
@@ -181,13 +158,8 @@ fn setup_env(root: &Path, opts: &EnvOpts) -> Result<()> {
         info("kein PHP/Node erkannt — leere Shell, Pakete in flake.nix unter packages eintragen");
     }
 
-    let name = root
-        .file_name()
-        .map_or_else(|| "projekt".into(), |n| n.to_string_lossy());
-    fs::write(
-        &flake_path,
-        flake::render(&name, php.as_ref(), node.as_ref()),
-    )?;
+    let name = root.file_name().map_or_else(|| "projekt".into(), |n| n.to_string_lossy());
+    fs::write(&flake_path, flake::render(&name, php.as_ref(), node.as_ref()))?;
     fs::write(root.join(".envrc"), "use flake\n")?;
     ensure_gitignore(root)?;
     // erst stagen: nix sieht nur Dateien, die git kennt
@@ -209,11 +181,7 @@ fn setup_env(root: &Path, opts: &EnvOpts) -> Result<()> {
         if node.is_some() {
             checks.push("echo node $(node -v)");
         }
-        let script = if checks.is_empty() {
-            "true".into()
-        } else {
-            checks.join("; ")
-        };
+        let script = if checks.is_empty() { "true".into() } else { checks.join("; ") };
         run_ok(root, "direnv", &["exec", &root_str, "sh", "-c", &script])?;
     }
 
@@ -233,10 +201,7 @@ fn cmd_new(
     let name = if remote { repo_name(target) } else { target };
     let root = dir.unwrap_or_else(|| home().join("projects")).join(name);
     if root.exists() {
-        bail!(
-            "{} existiert schon — dort luggage init benutzen",
-            root.display()
-        );
+        bail!("{} existiert schon — dort luggage init benutzen", root.display());
     }
     let root_str = root.to_string_lossy();
 
@@ -245,31 +210,17 @@ fn cmd_new(
             bail!("--gitlab nur ohne URL (legt ein neues Projekt an)");
         }
         let source = expand_tilde(target);
-        let source = if source.exists() {
-            source.to_string_lossy().into_owned()
-        } else {
-            target.to_owned()
-        };
+        let source =
+            if source.exists() { source.to_string_lossy().into_owned() } else { target.to_owned() };
         run_ok(Path::new("."), "git", &["clone", &source, &root_str])?;
     } else {
         fs::create_dir_all(&root)?;
         run_ok(&root, "git", &["init", "-q", "-b", "main"])?;
         if let Some(group) = gitlab {
-            let path = if group.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{group}/{name}")
-            };
+            let path = if group.is_empty() { name.to_owned() } else { format!("{group}/{name}") };
             let on = host.map(|h| format!(" auf {h}")).unwrap_or_default();
             info(&format!("lege privates Projekt {path}{on} an"));
-            let args = [
-                "repo",
-                "create",
-                &path,
-                "--private",
-                "--defaultBranch",
-                "main",
-            ];
+            let args = ["repo", "create", &path, "--private", "--defaultBranch", "main"];
             let env: Vec<(&str, &str)> = host.map(|h| ("GITLAB_HOST", h)).into_iter().collect();
             if !run(&root, "glab", &args, &env, false)? {
                 bail!("glab repo create fehlgeschlagen");
@@ -284,13 +235,9 @@ fn cmd_new(
 
 fn main() -> ExitCode {
     let result = match Cli::parse().cmd {
-        Cmd::New {
-            target,
-            dir,
-            gitlab,
-            host,
-            env,
-        } => cmd_new(&target, dir, gitlab.as_deref(), host.as_deref(), &env),
+        Cmd::New { target, dir, gitlab, host, env } => {
+            cmd_new(&target, dir, gitlab.as_deref(), host.as_deref(), &env)
+        }
         Cmd::Init { path, env } => std::path::absolute(&path)
             .map_err(anyhow::Error::from)
             .and_then(|p| setup_env(&p, &env)),

@@ -12,18 +12,8 @@ pub const PHP_VERSIONS: &[(u32, u32)] = &[(8, 2), (8, 3), (8, 4), (8, 5)];
 pub const NODE_VERSIONS: &[u32] = &[20, 22, 24, 26];
 const DEFAULT_PHP: (u32, u32) = (8, 4);
 /// Fest einkompiliert, kein eigenes nixpkgs-Attribut.
-const PHP_BUILTIN_EXTS: &[&str] = &[
-    "core",
-    "date",
-    "hash",
-    "json",
-    "pcre",
-    "random",
-    "reflection",
-    "spl",
-    "standard",
-    "libxml",
-];
+const PHP_BUILTIN_EXTS: &[&str] =
+    &["core", "date", "hash", "json", "pcre", "random", "reflection", "spl", "standard", "libxml"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Php {
@@ -56,10 +46,7 @@ fn versions_in(constraint: &str) -> Vec<(u32, u32)> {
 }
 
 fn first_number(s: &str) -> Option<u32> {
-    s.split(|c: char| !c.is_ascii_digit())
-        .find(|t| !t.is_empty())?
-        .parse()
-        .ok()
+    s.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty())?.parse().ok()
 }
 
 /// Kleinste verfügbare PHP-Version, die mindestens `wanted` ist.
@@ -81,11 +68,7 @@ fn pick_node(wanted: u32) -> u32 {
 }
 
 fn php_list() -> String {
-    PHP_VERSIONS
-        .iter()
-        .map(|(a, b)| format!("{a}.{b}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    PHP_VERSIONS.iter().map(|(a, b)| format!("{a}.{b}")).collect::<Vec<_>>().join(", ")
 }
 
 /// Liest composer.json; `--php` gewinnt, sonst `config.platform.php`, sonst die Untergrenze von `require.php`.
@@ -98,14 +81,8 @@ pub fn detect_php(root: &Path, override_version: Option<&str>) -> Result<Option<
         }
     } else {
         let Some(c) = &composer else { return Ok(None) };
-        let platform = c["config"]["platform"]["php"]
-            .as_str()
-            .map(versions_in)
-            .unwrap_or_default();
-        let require = c["require"]["php"]
-            .as_str()
-            .map(versions_in)
-            .unwrap_or_default();
+        let platform = c["config"]["platform"]["php"].as_str().map(versions_in).unwrap_or_default();
+        let require = c["require"]["php"].as_str().map(versions_in).unwrap_or_default();
         if let Some(min) = platform.iter().min() {
             (pick_php(*min), "config.platform.php")
         } else if let Some(min) = require.iter().min() {
@@ -125,11 +102,7 @@ pub fn detect_php(root: &Path, override_version: Option<&str>) -> Result<Option<
         .collect();
     exts.sort();
     exts.dedup();
-    Ok(Some(Php {
-        version,
-        source,
-        exts,
-    }))
+    Ok(Some(Php { version, source, exts }))
 }
 
 /// `--node` gewinnt, sonst `.nvmrc`/`.node-version`, sonst `engines.node`; ohne package.json kein Node.
@@ -161,11 +134,7 @@ pub fn detect_node(root: &Path, override_version: Option<&str>) -> Result<Option
     } else {
         None
     };
-    Ok(Some(Node {
-        version,
-        source,
-        tool,
-    }))
+    Ok(Some(Node { version, source, tool }))
 }
 
 #[cfg(test)]
@@ -212,13 +181,7 @@ mod tests {
     fn php_override_and_absence() {
         let empty = project(&[]);
         assert_eq!(detect_php(empty.path(), None).unwrap(), None);
-        assert_eq!(
-            detect_php(empty.path(), Some("8.3"))
-                .unwrap()
-                .unwrap()
-                .version,
-            (8, 3)
-        );
+        assert_eq!(detect_php(empty.path(), Some("8.3")).unwrap().unwrap().version, (8, 3));
         assert!(detect_php(empty.path(), Some("7.4")).is_err());
     }
 
@@ -230,14 +193,7 @@ mod tests {
             ("pnpm-lock.yaml", ""),
         ]);
         let node = detect_node(p.path(), None).unwrap().unwrap();
-        assert_eq!(
-            node,
-            Node {
-                version: Some(24),
-                source: ".nvmrc",
-                tool: Some("pnpm")
-            }
-        );
+        assert_eq!(node, Node { version: Some(24), source: ".nvmrc", tool: Some("pnpm") });
     }
 
     #[test]

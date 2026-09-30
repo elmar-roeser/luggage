@@ -1,2 +1,10 @@
-allow-unwrap-in-tests = true
+# .clippy.toml
+#
+# cargo clippy --all-targets --all-features
+
+# Allow `.expect()` and `.unwrap()` inside #[cfg(test)] modules/tests:
 allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+
+# Product names that may appear in doc comments without backticks ("..": keep clippy's defaults):
+doc-valid-idents = ["MariaDB", "PostgreSQL", ".."]

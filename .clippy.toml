@@ -7,4 +7,4 @@ allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 
 # Product names that may appear in doc comments without backticks ("..": keep clippy's defaults):
-doc-valid-idents = ["MariaDB", "PostgreSQL", ".."]
+doc-valid-idents = ["MariaDB", "PostgreSQL", "AppArmor", ".."]

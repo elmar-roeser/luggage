@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{self, Detected};
-use crate::{config, home, info, versions};
+use crate::{config, find_in_path, home, info, versions};
 
 /// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
@@ -110,13 +110,22 @@ fn merge(mut def: Definition, detected: Option<&Detected>) -> Result<Definition>
 
 /// Tools from nixpkgs that the chest needs, independent of the project flake.
 #[derive(Debug, Serialize, Deserialize)]
-struct Tools {
+pub struct Tools {
     /// Store path of `bashInteractive`
     bash: String,
     /// Store path of coreutils
     coreutils: String,
     /// Store path of process-compose
     process_compose: String,
+    /// Store path of util-linux (unshare, nsenter, setsid, kill)
+    util_linux: String,
+    /// Store path of iproute2 (ip)
+    iproute2: String,
+    /// Store path of cacert; the chest has no `/etc/ssl`
+    cacert: String,
+    /// The bwrap program: from the system if present, else from nixpkgs.
+    /// Ubuntu uses AppArmor to allow user namespaces only for programs with a profile, like `/usr/bin/bwrap`.
+    pub bwrap: String,
     /// Store paths of the `packages` from the definition
     packages: Vec<String>,
 }
@@ -136,10 +145,21 @@ fn nix_build(installables: &[String]) -> Result<Vec<String>> {
 }
 
 impl Tools {
-    /// Builds bash, coreutils, process-compose and the extra packages from `nixpkgs`.
-    fn fetch(nixpkgs: &str, packages: &[String]) -> Result<Self> {
-        const ATTRS: [&str; 3] = ["bashInteractive", "coreutils", "process-compose"];
-        let paths = nix_build(&ATTRS.map(|a| format!("{nixpkgs}#{a}^out")))?;
+    /// Builds the chest tools and the extra packages from `nixpkgs`.
+    pub fn fetch(nixpkgs: &str, packages: &[String]) -> Result<Self> {
+        let host_bwrap = find_in_path("bwrap");
+        let mut attrs = vec![
+            "bashInteractive^out",
+            "coreutils^out",
+            "process-compose^out",
+            "util-linux^bin",
+            "iproute2^out",
+            "cacert^out",
+        ];
+        if host_bwrap.is_none() {
+            attrs.push("bubblewrap^out");
+        }
+        let paths = nix_build(&attrs.iter().map(|a| format!("{nixpkgs}#{a}")).collect::<Vec<_>>())?;
         let find = |name: &str| {
             paths
                 .iter()
@@ -156,13 +176,25 @@ impl Tools {
             bash: find("bash-interactive")?,
             coreutils: find("coreutils")?,
             process_compose: find("process-compose")?,
+            util_linux: find("util-linux")?,
+            iproute2: find("iproute2")?,
+            cacert: find("nss-cacert")?,
+            bwrap: match host_bwrap {
+                Some(p) => p.to_string_lossy().into_owned(),
+                None => format!("{}/bin/bwrap", find("bubblewrap")?),
+            },
             packages,
         })
     }
 
     /// Path to the bash binary
-    fn bash(&self) -> String {
+    pub fn bash(&self) -> String {
         format!("{}/bin/bash", self.bash)
+    }
+
+    /// A program from util-linux, e.g. `unshare`.
+    pub fn util(&self, program: &str) -> String {
+        format!("{}/bin/{program}", self.util_linux)
     }
 }
 
@@ -346,12 +378,14 @@ impl Chest {
             "source {RUN_INSIDE}/env.sh\n\
              export HOME={home} USER={user} TMPDIR=/tmp LUGGAGE_CHEST={name}\n\
              unset NIX_BUILD_TOP TEMP TMP TEMPDIR\n\
+             export SSL_CERT_FILE={ca} NIX_SSL_CERT_FILE={ca}\n\
              export PATH={pkgs}{pc}/bin:{bash}/bin:{core}/bin:\"$PATH\"\n\
              cd {project}\n\
              PS1='[chest:{name_plain}] \\w\\$ '\n",
             home = sh_quote(&home().to_string_lossy()),
             user = sh_quote(&user),
             name = sh_quote(&self.name),
+            ca = format!("{}/etc/ssl/certs/ca-bundle.crt", tools.cacert),
             pc = tools.process_compose,
             bash = tools.bash,
             core = tools.coreutils,
@@ -519,7 +553,7 @@ impl Chest {
     /// Runs a one-off command in a fresh chest; without a command, a shell.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
         let tools = self.prepare(nixpkgs)?;
-        let mut c = Command::new("bwrap");
+        let mut c = Command::new(&tools.bwrap);
         c.args(self.bwrap_args(&tools, if net { Net::Share } else { Net::Off })?)
             .arg("--die-with-parent")
             .arg(tools.bash())
@@ -557,12 +591,17 @@ impl Chest {
         let log = File::create(self.run.join("chest.log"))?;
         // Own network namespace via unshare: we are root in it and allow ports < 1024, only for the chest.
         // bwrap reports the PID of its child (PID 1 of the chest) on fd 3.
-        Command::new("sh")
-            .args(["-c", r#"exec 3>"$1"; shift; exec setsid "$@""#, "sh"])
+        let ip = format!("{}/bin/ip", tools.iproute2);
+        Command::new(tools.bash())
+            .args(["-c", r#"exec 3>"$1"; shift; exec "$@""#, "sh"])
             .arg(&info_json)
-            .args(["unshare", "--user", "--map-root-user", "--net", "sh", "-c"])
-            .arg(r#"/usr/bin/ip link set lo up && echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start && exec "$@""#)
-            .args(["sh", "bwrap"])
+            .arg(tools.util("setsid"))
+            .args([&tools.util("unshare"), "--user", "--map-root-user", "--net"])
+            .args([&tools.bash(), "-c"])
+            .arg(format!(
+                r#"{ip} link set lo up && echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start && exec "$@""#
+            ))
+            .args(["sh", &tools.bwrap])
             .args(self.bwrap_args(&tools, Net::Own)?)
             .args(["--info-fd", "3"])
             .arg(tools.bash())
@@ -733,7 +772,8 @@ impl Chest {
         }
         // PID 1 in its own PID namespace ignores SIGTERM from outside; SIGKILL tears down the whole namespace.
         if alive(pid) {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let kill = self.tools().map_or_else(|_| "kill".into(), |t| t.util("kill"));
+            let _ = Command::new(kill).args(["-9", &pid.to_string()]).status();
         }
         let _ = fs::remove_file(self.pid_file());
         let _ = fs::remove_file(self.socket());
@@ -786,7 +826,7 @@ impl Chest {
 
 /// bash in all namespaces of the running chest (like `docker exec`).
 fn nsenter(pid: u32, tools: &Tools) -> Command {
-    let mut c = Command::new("nsenter");
+    let mut c = Command::new(tools.util("nsenter"));
     // no --wd: nsenter --root with --wd gives a broken cwd, so the rc file does the cd
     c.args([
         "-t",
@@ -857,6 +897,10 @@ depends_on = ["db"]
             bash: "/nix/store/b-bash".into(),
             coreutils: "/nix/store/c-coreutils".into(),
             process_compose: "/nix/store/p-pc".into(),
+            util_linux: "/nix/store/u-util-linux".into(),
+            iproute2: "/nix/store/i-iproute2".into(),
+            cacert: "/nix/store/c-nss-cacert".into(),
+            bwrap: "/usr/bin/bwrap".into(),
             packages: vec!["/nix/store/m-mariadb".into()],
         }
     }

@@ -6,6 +6,7 @@ mod config;
 mod detect;
 mod flake;
 mod remote;
+mod setup;
 mod versions;
 
 use std::fs;
@@ -70,6 +71,14 @@ enum Cmd {
         /// Create a commented template (never overwrites)
         #[arg(long)]
         init: bool,
+    },
+    /// Check that the system has everything luggage needs
+    Doctor,
+    /// Install what is missing: Nix, git, direnv, nix-direnv, shell hook (asks before each step)
+    Setup {
+        /// Answer yes to all questions
+        #[arg(long)]
+        yes: bool,
     },
     /// Run a command in a fresh chest (no command: a shell)
     Run {
@@ -149,6 +158,14 @@ fn run_ok(cwd: &Path, program: &str, args: &[&str]) -> Result<()> {
 /// `$HOME`, or the current directory if it is not set.
 fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+/// Finds an executable program in `PATH`.
+fn find_in_path(program: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 /// Replaces a leading `~/` with `$HOME`.
@@ -410,6 +427,8 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             cmd_new(args, &env, &config::load()?)
         }
         Cmd::Init { path, env } => setup_env(&std::path::absolute(&path)?, &env, &config::load()?),
+        Cmd::Doctor => setup::doctor(),
+        Cmd::Setup { yes } => setup::setup(yes),
         Cmd::Run { net, cmd } => {
             let nixpkgs = config::load()?.nixpkgs();
             chest::Chest::find(&nixpkgs, false)?.cmd_run(net, &cmd, &nixpkgs)

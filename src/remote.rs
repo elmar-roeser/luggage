@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::{info, run};
+use crate::{find_in_path, info, run};
 
 /// Where the remote project is created.
 pub enum Forge {
@@ -23,9 +23,27 @@ pub enum Forge {
     },
 }
 
+/// Program and leading arguments for `gh`/`glab`: from the system, else via `nix run` from nixpkgs.
+fn tool(name: &str) -> (String, Vec<String>) {
+    if find_in_path(name).is_some() {
+        (name.to_owned(), Vec::new())
+    } else {
+        ("nix".to_owned(), vec!["run".to_owned(), format!("nixpkgs#{name}"), "--".to_owned()])
+    }
+}
+
+/// Like `run`, but for `gh`/`glab` (see `tool`).
+fn run_tool(root: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> Result<bool> {
+    let (program, pre) = tool(name);
+    let all: Vec<&str> = pre.iter().map(String::as_str).chain(args.iter().copied()).collect();
+    run(root, &program, &all, env, false)
+}
+
 /// Login name of the logged-in gh account.
 fn gh_login() -> Result<String> {
-    let out = Command::new("gh")
+    let (program, pre) = tool("gh");
+    let out = Command::new(program)
+        .args(pre)
         .args(["api", "user", "--jq", ".login"])
         .output()
         .context("cannot start gh")?;
@@ -47,7 +65,7 @@ pub fn create(root: &Path, name: &str, forge: &Forge, visibility: &str) -> Resul
             let env: Vec<(&str, &str)> =
                 host.as_deref().map(|h| ("GITLAB_HOST", h)).into_iter().collect();
             let args = ["repo", "create", &path, &flag, "--defaultBranch", "main"];
-            if !run(root, "glab", &args, &env, false)? {
+            if !run_tool(root, "glab", &args, &env)? {
                 bail!("glab repo create failed");
             }
             if !run(root, "git", &["remote", "get-url", "origin"], &[], true)? {
@@ -61,7 +79,7 @@ pub fn create(root: &Path, name: &str, forge: &Forge, visibility: &str) -> Resul
             };
             let full = format!("{owner}/{name}");
             info(&format!("creating {visibility} GitHub repo {full}"));
-            if !run(root, "gh", &["repo", "create", &full, &flag], &[], false)? {
+            if !run_tool(root, "gh", &["repo", "create", &full, &flag], &[])? {
                 bail!("gh repo create failed");
             }
             // SSH instead of HTTPS: otherwise pushing workflow files needs the workflow scope in the gh token

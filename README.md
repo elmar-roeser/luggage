@@ -9,19 +9,31 @@ Like the Luggage from Discworld: it follows you everywhere and always has the ri
 
 ## Installation
 
-```bash
-cargo install luggage-env
-```
+1. **Get luggage**: download the static Linux binary from the
+   [releases](https://github.com/elmar-roeser/luggage/releases) into `~/.local/bin`
+   (no Rust needed), or with Rust: `cargo install luggage-env`. The binary is called `luggage`.
+2. **Set up**:
 
-The binary is called `luggage`. Alternatively: a static Linux binary from the
-[Releases](https://github.com/elmar-roeser/luggage/releases).
+   ```bash
+   luggage setup
+   ```
 
-### Requirements
+   `setup` checks what is missing and asks before each step:
+   - **Nix** via the official [Nix installer](https://github.com/NixOS/nix-installer)
+     with flakes (needs `curl` and `sudo` once),
+   - **git**, **direnv** and **nix-direnv** via `nix profile install`,
+   - the **direnv hook** in `~/.bashrc`, `~/.zshrc` or the fish config.
 
-- [Nix](https://nixos.org/download) with flakes enabled (`experimental-features = nix-command flakes`)
-- [direnv](https://direnv.net) with its shell hook and [nix-direnv](https://github.com/nix-community/nix-direnv)
-- `git`; for `--gitlab` also [`glab`](https://gitlab.com/gitlab-org/cli), for `--github` [`gh`](https://cli.github.com) (each logged in)
-- for the chest: `bwrap` ([bubblewrap](https://github.com/containers/bubblewrap)), `unshare`, `nsenter`, `setsid` (util-linux) and `ip` (iproute2)
+   Then open a new shell. `luggage setup --yes` answers all questions with yes.
+
+`luggage doctor` checks the same things without changing anything.
+
+After that, luggage only needs Nix, git and the direnv hook from your system. Everything else
+comes from nixpkgs: the tools of the chest (bubblewrap, util-linux, iproute2) and, when needed,
+`gh`/`glab` for `--github`/`--gitlab` (log in with `gh auth login` or `glab auth login`).
+
+**Ubuntu 24.04 and later** restricts user namespaces with AppArmor. `luggage doctor` shows
+whether the chest works there; its hint names the settings to change.
 
 ## Usage
 

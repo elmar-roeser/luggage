@@ -26,11 +26,72 @@ toml = "1.1.6"
 tempfile = "3.27.0"
 
 [lints.rust]
-unsafe_code = "forbid"
+# Groups carry `priority = -1` so individual overrides below (default priority 0) win.
+future_incompatible = { level = "deny", priority = -1 } # Disallow code using features that will change or be removed in future Rust versions.
+
+# --- Safety ---
+unsafe_code = "forbid"                      # Disallow `unsafe` blocks entirely for maximum safety assurance.
+
+# --- Dependencies ---
+unused_crate_dependencies = "warn"          # Warn if dependencies listed in Cargo.toml aren't used.
+
+# --- Coverage tooling ---
+# `cargo tarpaulin` sets `cfg(tarpaulin)` while running, and we annotate
+# unit-untestable (live-I/O) code with `#[cfg(not(tarpaulin_include))]` so it is
+# dropped from coverage. Declare both names so the `unexpected_cfgs` lint stays
+# quiet under `-D warnings`. Neither cfg is ever set for normal builds/tests, so
+# the annotated code always compiles and runs as usual.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)', 'cfg(tarpaulin_include)'] }
+
+# --- Code Hygiene ---
+dead_code = "warn"                          # Warn about unused functions, types, modules, etc.
+unused_imports = "warn"                     # Warn about `use` statements that aren't needed.
+explicit_outlives_requirements = "warn"     # Warn when lifetime bounds can be inferred by the compiler, reducing noise.
+macro_use_extern_crate = "warn"             # Encourage modern `use MyMacro;` style over `#[macro_use] extern crate`.
+
+# --- Documentation ---
+missing_docs = "warn"                       # Warn about missing documentation for public API items (functions, types, etc.).
+
+# --- Debuggability ---
+missing_debug_implementations = "warn"      # Warn if public types don't implement `Debug` for easier debugging.
 
 [lints.clippy]
-unwrap_used = "deny"
-expect_used = "deny"
-todo = "deny"
-dbg_macro = "deny"
-pedantic = { level = "warn", priority = -1 }
+# Groups carry `priority = -1` so individual overrides below (default priority 0) win.
+cargo = { level = "warn", priority = -1 }       # Enable `clippy::cargo` group: lints related to Cargo.toml practices.
+complexity = { level = "warn", priority = -1 }  # Enable `clippy::complexity` group: code that seems unnecessarily complex.
+correctness = { level = "deny", priority = -1 } # Enable `clippy::correctness` group and deny any findings: code that is likely wrong or buggy.
+pedantic = { level = "warn", priority = -1 }    # Enable `clippy::pedantic` group: extremely strict, opinionated lints.
+perf = { level = "warn", priority = -1 }        # Enable `clippy::perf` group: suggest minor performance improvements.
+style = { level = "warn", priority = -1 }       # Enable `clippy::style` group: code that works but isn't idiomatic or clean.
+
+# --- Safety & Robustness ---
+expect_used = "deny"                        # Disallow `.expect()` which can panic. Prefer proper error handling.
+large_stack_arrays = "warn"                 # Warn about creating very large arrays on the stack (risk of stack overflow).
+panic = "warn"                              # Warn about explicit `panic!("...")` calls. Use errors where possible.
+unwrap_used = "deny"                        # Disallow `.unwrap()` which can panic. Prefer proper error handling.
+
+# --- Dependencies & Imports ---
+enum_glob_use = "deny"                      # Disallow importing all variants of an enum (`use MyEnum::*`).
+multiple_crate_versions = "allow"           # Allow if different versions of the same crate are pulled in transitively.
+wildcard_imports = "deny"                   # Disallow wildcard imports (`use foo::*`) except for preludes.
+
+# --- Code Hygiene & Process ---
+dbg_macro = "deny"                          # Disallow `dbg!()` macros in the final code (usually left unintentionally).
+redundant_pub_crate = "warn"                # Warn about `pub(crate)` visibility that isn't necessary.
+todo = "deny"                               # Disallow `todo!()` macros in the final code (represents unfinished work).
+unnecessary_wraps = "deny"                  # Disallow if functions returning Option/Result could just return the inner value directly.
+
+# --- Code Layout & Complexity ---
+too_many_lines = "warn"                     # Warn if functions or items get excessively long (consider refactoring).
+
+# --- Performance ---
+box_collection = "deny"                     # Disallow `Box<Vec<T>>` or similar (usually unnecessary double heap allocation).
+missing_const_for_fn = "deny"               # Force making functions `const` if they meet the criteria.
+
+# --- Documentation ---
+missing_docs_in_private_items = "warn"      # Warn if missing docs on private items.
+missing_errors_doc = "warn"                 # Warn if functions returning `Result` don't document potential errors via `## Errors`.
+missing_panics_doc = "warn"                 # Warn if functions that might panic don't document this possibility via `## Panics`.
+
+# --- Style & Readability ---
+use_self = "warn"

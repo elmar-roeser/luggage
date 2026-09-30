@@ -1,0 +1,14 @@
+# Gitleaks config for luggage. Extends the default ruleset; add an allowlist
+# here only for known-safe matches. Auto-loaded from the repo root by CI and
+# local runs (`make gitleaks`).
+
+title = "luggage"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build output"
+paths = [
+  '''(^|/)target/''',
+]

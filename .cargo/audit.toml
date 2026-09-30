@@ -1,0 +1,6 @@
+# cargo-audit config (https://github.com/rustsec/rustsec/tree/main/cargo-audit)
+
+[advisories]
+ignore = []                               # RUSTSEC ids to accept, each with a reason comment
+informational_warnings = ["unmaintained"] # warn for categories of informational advisories
+severity_threshold = "medium"             # CVSS severity ("none", "low", "medium", "high", "critical")

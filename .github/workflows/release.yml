@@ -1,19 +1,46 @@
 name: Release
 
+# A release is a commit on main that changes the version in Cargo.toml (see `make bump`).
+# Everything runs in this one workflow: a tag pushed by a workflow does not start other workflows.
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Die erzeugten Flakes sind x86_64-linux, deshalb nur dieses Ziel (statisch per musl)
+  check:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Is there a tag for the version in Cargo.toml?
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "releasing v$version"
+          fi
+
+  # The generated flakes are x86_64-linux, so this is the only target (static via musl)
   build-linux:
     name: Build Linux (musl)
+    needs: check
+    if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -26,34 +53,70 @@ jobs:
       - name: Install musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Test
+        run: cargo test
+
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Package
         run: |
-          tar czf luggage-${{ github.ref_name }}-x86_64-linux-musl.tar.gz -C target/x86_64-unknown-linux-musl/release luggage
+          tar czf luggage-v${{ needs.check.outputs.version }}-x86_64-linux-musl.tar.gz -C target/x86_64-unknown-linux-musl/release luggage
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: luggage-x86_64-linux-musl
-          path: luggage-${{ github.ref_name }}-x86_64-linux-musl.tar.gz
+          path: luggage-v${{ needs.check.outputs.version }}-x86_64-linux-musl.tar.gz
 
   release:
-    name: Create Release
-    needs: [build-linux]
+    name: Tag and create release
+    needs: [check, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Release notes = the commits since the last tag, the same text as in CHANGELOG.md
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --unreleased --tag v${{ needs.check.outputs.version }} --strip all
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Release
+      # Creates the tag on this commit together with the release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.check.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/**/*.tar.gz
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+
+  publish:
+    name: Publish to crates.io
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo publish
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish
+
+      - name: No token
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: echo "::notice::CARGO_REGISTRY_TOKEN is not set — run cargo publish by hand"

@@ -174,6 +174,20 @@ are allowed, but only apply inside the chest. Outside, home and data live in
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
 
+## Development
+
+`make ci` runs every check locally (format, clippy, tests, `cargo audit`, gitleaks).
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org);
+[CHANGELOG.md](CHANGELOG.md) is generated from them with [git-cliff](https://git-cliff.org).
+
+Releasing a new version:
+
+1. `make bump VERSION=X.Y.Z` sets the version in `Cargo.toml`, updates the changelog and
+   commits `chore(release): vX.Y.Z`.
+2. `git push origin main`. The release workflow sees a version without a tag, runs the tests,
+   builds the Linux binary, creates the tag and the GitHub release (notes from the changelog)
+   and runs `cargo publish` when the repository secret `CARGO_REGISTRY_TOKEN` is set.
+
 ## License
 
 MIT or Apache-2.0, at your option.

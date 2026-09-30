@@ -118,7 +118,8 @@ ignored; a higher `rust-version` in `Cargo.toml` is reported.
 
 ## What luggage writes
 
-- `flake.nix` with a `devShell`, and `.envrc` (`use flake`, with `.venv` for Python)
+- `flake.nix` with a `devShell`, and `.envrc` (`use flake`, with `.venv` for Python, and a
+  `luggage hook` line that only does something for a [chest in a VM](#the-chest-in-a-vm))
 - `.direnv/` (and `.venv/` for Python) in `.gitignore`
 - `flake.lock` via `nix flake lock`
 
@@ -173,6 +174,27 @@ are allowed, but only apply inside the chest. Outside, home and data live in
 
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
+
+### The chest in a VM
+
+With `mode = "vm"` in `chest.toml`, the chest is a small virtual machine with its own kernel
+([microvm.nix](https://github.com/microvm-nix/microvm.nix) with qemu, no root needed).
+Everything runs in it: `php`, `composer` and the other programs of the project go to the VM.
+The project and the Nix store come from the host, so files belong to you and the IDE stays outside.
+
+```toml
+mode = "vm"
+```
+
+When you `cd` into the project, direnv starts the VM in the background (about 3.5 s) and puts
+a stand-in for each project program first on the `PATH`. The first command waits until the VM is up,
+later ones take a few milliseconds more than on the host. Only one VM runs at a time:
+starting the VM of another project stops the old one. `luggage up`, `exec`, `open`, `status` and
+`down` work as above; `exec` and `open` start the VM if needed.
+
+This needs `/dev/kvm` (your user in the group `kvm`) and ssh. `luggage up` adds the line
+`if has luggage; then eval "$(luggage hook)"; fi` to the `.envrc` if it is missing; then run `direnv allow` once.
+Not in the VM yet: the services from `compose.yaml` and `luggage run`.
 
 ## Development
 

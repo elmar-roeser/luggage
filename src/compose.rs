@@ -1,6 +1,6 @@
-//! Erkennt Dienste aus der Docker-Compose-Datei und übersetzt bekannte Images in Truhen-Dienste.
+//! Detects services in the Docker Compose file and turns known images into chest services.
 //!
-//! Nur Standard-Software (mariadb, postgres, redis/valkey, mailpit/mailhog); alles andere wird gemeldet, nicht geraten.
+//! Only standard software (mariadb, postgres, redis/valkey, mailpit/mailhog); everything else is reported, not guessed.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -10,53 +10,53 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 
+use crate::chest::{Service, sh_quote};
 use crate::detect::pick;
-use crate::truhe::{Service, sh_quote};
 use crate::versions::Available;
 
-/// Dateinamen, nach denen gesucht wird; die erste vorhandene gewinnt.
+/// File names to look for; the first one that exists wins.
 const FILES: [&str; 4] =
     ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
 
-/// Der Teil der Compose-Datei, der gelesen wird.
+/// The part of the Compose file that is read.
 #[derive(Deserialize)]
 struct ComposeFile {
-    /// Compose-Dienste nach Name
+    /// Compose services by name
     #[serde(default)]
     services: BTreeMap<String, ComposeService>,
 }
 
-/// Ein Dienst aus der Compose-Datei.
+/// A service from the Compose file.
 #[derive(Deserialize)]
 struct ComposeService {
-    /// Image, z.B. `mariadb:10.11`; fehlt bei eigenem Build
+    /// Image, e.g. `mariadb:10.11`; missing for a custom build
     image: Option<String>,
-    /// `environment:` als Map oder Liste, noch nicht ausgewertet
+    /// `environment:` as a map or list, not yet parsed
     #[serde(default)]
     environment: Value,
 }
 
-/// Was aus der Compose-Datei übernommen wurde.
+/// What was taken over from the Compose file.
 #[derive(Debug, Default)]
 pub struct Detected {
-    /// Gelesene Compose-Datei
+    /// Compose file that was read
     pub file: PathBuf,
-    /// Compose-Dienst → Beschreibung, z.B. `database` → `mariadb 10.11`
+    /// Compose service → description, e.g. `database` → `mariadb 10.11`
     pub found: BTreeMap<String, String>,
-    /// nicht übernommene Compose-Dienste mit Grund
+    /// Skipped Compose services with the reason
     pub skipped: Vec<String>,
-    /// Hinweise, z.B. abweichende Version
+    /// Notes, e.g. a different version
     pub notes: Vec<String>,
-    /// Truhen-Dienste, inkl. einmaliger `-init`- und `-setup`-Dienste
+    /// Chest services, including the one-shot `-init` and `-setup` services
     pub services: BTreeMap<String, Service>,
-    /// nixpkgs-Pakete für die Dienste, z.B. `mariadb_1011`
+    /// nixpkgs packages for the services, e.g. `mariadb_1011`
     pub packages: Vec<String>,
-    /// Namen der übernommenen Compose-Dienste; zeigen in der Truhe auf 127.0.0.1
+    /// Names of the taken-over Compose services; in the chest they point to 127.0.0.1
     pub hosts: Vec<String>,
 }
 
-/// Liest die Compose-Datei im Projekt; `None`, wenn es keine gibt.
-/// `available` wird nur gefragt, wenn eine Datenbank-Version gewählt werden muss.
+/// Reads the Compose file in the project; `None` if there is none.
+/// `available` is only called when a database version must be chosen.
 pub fn detect(
     project: &Path,
     available: &mut dyn FnMut() -> Result<Available>,
@@ -66,12 +66,12 @@ pub fn detect(
     };
     let text = fs::read_to_string(&file)?;
     let compose: ComposeFile =
-        serde_yaml_ng::from_str(&text).with_context(|| format!("{} fehlerhaft", file.display()))?;
+        serde_yaml_ng::from_str(&text).with_context(|| format!("{} is invalid", file.display()))?;
     let dotenv = read_dotenv(&project.join(".env"));
     let mut d = Detected { file, ..Detected::default() };
     for (name, svc) in &compose.services {
         let Some(image) = svc.image.as_deref().map(|i| interpolate(i, &dotenv)) else {
-            d.skipped.push(format!("{name} (eigenes Build)"));
+            d.skipped.push(format!("{name} (custom build)"));
             continue;
         };
         let env = environment(&svc.environment, &dotenv);
@@ -91,7 +91,7 @@ pub fn detect(
     Ok(Some(d))
 }
 
-/// Einfache `.env`-Datei: `KEY=wert`, Anführungszeichen werden entfernt.
+/// Reads a simple `.env` file: `KEY=value`, with quotes removed.
 fn read_dotenv(path: &Path) -> BTreeMap<String, String> {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -112,7 +112,7 @@ fn read_dotenv(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Ersetzt `${VAR}`, `${VAR:-standard}` und `${VAR-standard}` wie Compose (Werte aus `.env`).
+/// Replaces `${VAR}`, `${VAR:-default}` and `${VAR-default}` like Compose (values from `.env`).
 fn interpolate(s: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     let mut rest = s;
@@ -133,7 +133,7 @@ fn interpolate(s: &str, vars: &BTreeMap<String, String>) -> String {
     out + rest
 }
 
-/// `environment:` als Map oder Liste `KEY=wert`.
+/// Reads `environment:` as a map or as a list of `KEY=value`.
 fn environment(value: &Value, vars: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let scalar = |v: &Value| match v {
         Value::String(s) => Some(interpolate(s, vars)),
@@ -162,7 +162,7 @@ fn split_image(image: &str) -> (&str, &str) {
     last.split_once(':').unwrap_or((last, "latest"))
 }
 
-/// Führende Versionsnummer aus dem Tag: `10.11` → (10, Some(11)), `17-alpine` → (17, None).
+/// Leading version number of the tag: `10.11` → (10, Some(11)), `17-alpine` → (17, None).
 fn tag_version(tag: &str) -> Option<(u32, Option<u32>)> {
     let head = tag.split(['-', '_']).next()?;
     let mut parts = head.split('.');
@@ -170,27 +170,27 @@ fn tag_version(tag: &str) -> Option<(u32, Option<u32>)> {
     Some((major, parts.next().and_then(|p| p.parse().ok())))
 }
 
-/// Erster nicht-leerer Wert zu einem der `keys`.
+/// First non-empty value for one of the `keys`.
 fn first<'a>(env: &'a BTreeMap<String, String>, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| env.get(*k)).map(String::as_str).filter(|v| !v.is_empty())
 }
 
-/// SQL-String in einfachen Anführungszeichen; `'` im Text wird verdoppelt.
+/// SQL string in single quotes; a `'` in the text is doubled.
 fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// MariaDB-Bezeichner in Backticks; Backticks im Namen werden verdoppelt.
+/// MariaDB identifier in backticks; backticks in the name are doubled.
 fn sql_ident(s: &str) -> String {
     format!("`{}`", s.replace('`', "``"))
 }
 
-/// Dienst, der einmal läuft und sich dann beendet (für Init und Setup).
+/// Service that runs once and then exits (for init and setup).
 fn once(command: String, depends_on: &[String]) -> Service {
     Service { command, depends_on: depends_on.to_vec(), once: true, ..Service::default() }
 }
 
-/// Übernimmt einen MariaDB-Dienst: Datenverzeichnis anlegen, Server starten, Datenbank und Nutzer aus `environment` anlegen.
+/// Takes over a MariaDB service: creates the data directory, starts the server, creates database and user from `environment`.
 fn mariadb(
     d: &mut Detected,
     name: &str,
@@ -201,10 +201,10 @@ fn mariadb(
     let attr = if let Some((major, minor)) = tag_version(tag) {
         let wanted = (major, minor.unwrap_or(0));
         let versions = available()?.mariadb;
-        let (a, b) = pick(&versions, wanted).context("nixpkgs hat kein MariaDB")?;
+        let (a, b) = pick(&versions, wanted).context("nixpkgs has no MariaDB")?;
         if (a, b) != wanted {
             d.notes.push(format!(
-                "{name}: MariaDB {major}.{} gibt es nicht in nixpkgs, nehme {a}.{b}",
+                "{name}: MariaDB {major}.{} is not in nixpkgs, using {a}.{b}",
                 minor.unwrap_or(0)
             ));
         }
@@ -253,7 +253,7 @@ fn mariadb(
     }
     if first(env, &["MARIADB_ROOT_PASSWORD", "MYSQL_ROOT_PASSWORD"]).is_some() {
         d.notes.push(format!(
-            "{name}: root-Passwort nicht übernommen, root geht nur über den Socket ohne Passwort"
+            "{name}: root password skipped, root works only over the socket without a password"
         ));
     }
     if !sql.is_empty() {
@@ -268,7 +268,7 @@ fn mariadb(
     Ok(())
 }
 
-/// Übernimmt einen PostgreSQL-Dienst: `initdb`, Server starten, Datenbank aus `POSTGRES_DB` anlegen.
+/// Takes over a PostgreSQL service: runs `initdb`, starts the server, creates the database from `POSTGRES_DB`.
 fn postgres(
     d: &mut Detected,
     name: &str,
@@ -278,9 +278,9 @@ fn postgres(
 ) -> Result<()> {
     let attr = if let Some((major, _)) = tag_version(tag) {
         let versions = available()?.postgresql;
-        let v = pick(&versions, major).context("nixpkgs hat kein PostgreSQL")?;
+        let v = pick(&versions, major).context("nixpkgs has no PostgreSQL")?;
         if v != major {
-            d.notes.push(format!("{name}: PostgreSQL {major} gibt es nicht in nixpkgs, nehme {v}"));
+            d.notes.push(format!("{name}: PostgreSQL {major} is not in nixpkgs, using {v}"));
         }
         d.found.insert(name.into(), format!("postgres {v}"));
         format!("postgresql_{v}")
@@ -293,7 +293,7 @@ fn postgres(
     let user = first(env, &["POSTGRES_USER"]).unwrap_or("postgres");
     let db = first(env, &["POSTGRES_DB"]).unwrap_or(user);
     let init = format!("{name}-init");
-    // trust: jedes Passwort passt, die Truhe ist die Grenze
+    // trust: any password works, the chest is the boundary
     d.services.insert(
         init.clone(),
         once(
@@ -331,7 +331,7 @@ fn postgres(
     Ok(())
 }
 
-/// Übernimmt einen Redis- oder Valkey-Dienst auf Port 6379.
+/// Takes over a Redis or Valkey service on port 6379.
 fn redis(d: &mut Detected, name: &str, repo: &str) {
     let data = format!("/data/{name}");
     d.found.insert(name.into(), repo.into());
@@ -348,12 +348,11 @@ fn redis(d: &mut Detected, name: &str, repo: &str) {
     );
 }
 
-/// Übernimmt Mailpit (SMTP 1025, Web 8025); Mailhog wird durch Mailpit ersetzt.
+/// Takes over Mailpit (SMTP 1025, web 8025); Mailhog is replaced by Mailpit.
 fn mailpit(d: &mut Detected, name: &str, repo: &str) {
     let data = format!("/data/{name}");
     if repo == "mailhog" {
-        d.notes
-            .push(format!("{name}: mailhog wird durch mailpit ersetzt (gleiche Ports 1025/8025)"));
+        d.notes.push(format!("{name}: mailhog is replaced by mailpit (same ports 1025/8025)"));
     }
     d.found.insert(name.into(), "mailpit".into());
     d.packages.push("mailpit".into());
@@ -408,7 +407,7 @@ services:
         let d = run(SPARENCON, "");
         assert_eq!(d.found["database"], "mariadb 10.11");
         assert_eq!(d.found["mailer"], "mailpit");
-        assert_eq!(d.skipped, ["nginx (nginx:1.27-alpine)", "php (eigenes Build)"]);
+        assert_eq!(d.skipped, ["nginx (nginx:1.27-alpine)", "php (custom build)"]);
         assert_eq!(d.hosts, ["database", "mailer"]);
         assert_eq!(d.packages, ["mariadb_1011", "mailpit"]);
         let setup = &d.services["database-setup"];
@@ -418,7 +417,7 @@ services:
             r#"CREATE USER IF NOT EXISTS '"'"'sparrencon'"'"'@'"'"'%'"'"' IDENTIFIED BY '"'"'sparrencon'"'"'"#
         ));
         assert_eq!(d.services["database"].depends_on, ["database-init"]);
-        assert!(d.notes.iter().any(|n| n.contains("root-Passwort")));
+        assert!(d.notes.iter().any(|n| n.contains("root password")));
     }
 
     #[test]

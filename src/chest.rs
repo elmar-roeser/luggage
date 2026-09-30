@@ -1,7 +1,7 @@
-//! Die Truhe: das Projekt in einer abgeschotteten Umgebung (bubblewrap) mit eigenen Diensten (process-compose).
+//! The chest: the project in an isolated environment (bubblewrap) with its own services (process-compose).
 //!
-//! Zustand (Home, Daten) liegt unter `$XDG_DATA_HOME/luggage/truhen/<name>`, Laufzeit (Sockets,
-//! erzeugte Dateien) unter `$XDG_RUNTIME_DIR/luggage/<name>` — Unix-Socket-Pfade dürfen 108 Zeichen nicht überschreiten.
+//! State (home, data) lives in `$XDG_DATA_HOME/luggage/chests/<name>`, runtime files (sockets,
+//! generated files) in `$XDG_RUNTIME_DIR/luggage/<name>` — Unix socket paths must not exceed 108 characters.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -18,61 +18,61 @@ use serde::{Deserialize, Serialize};
 use crate::compose::{self, Detected};
 use crate::{config, home, info, versions};
 
-/// Standard-Wartezeit in Sekunden für `ready`, wenn `ready_timeout` fehlt.
+/// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
-/// So heißt das Laufzeitverzeichnis in der Truhe.
+/// The path of the runtime dir inside the chest.
 const RUN_INSIDE: &str = "/run/luggage";
 
-/// Inhalt von `truhe.toml`; ergänzt, was aus der Compose-Datei erkannt wurde.
+/// Contents of `chest.toml`; it adds to what was detected in the Compose file.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Definition {
-    /// Name der Truhe; sonst der Name des Projektverzeichnisses
+    /// Name of the chest; defaults to the name of the project directory
     pub name: Option<String>,
-    /// Namen, die in der Truhe auf 127.0.0.1 zeigen
+    /// Names that point to 127.0.0.1 inside the chest
     pub hosts: Vec<String>,
-    /// Zusätzliche nixpkgs-Pakete für die Dienste, z.B. "mariadb"
+    /// Extra nixpkgs packages for the services, e.g. "mariadb"
     pub packages: Vec<String>,
-    /// Eigene Dienste; überschreiben gleichnamige erkannte Dienste
+    /// Custom services; they replace detected services with the same name
     pub services: BTreeMap<String, Service>,
-    /// Erkannte Compose-Dienste, die nicht übernommen werden sollen
+    /// Detected Compose services that should be skipped
     pub ignore: Vec<String>,
 }
 
-/// Ein Dienst, den process-compose in der Truhe startet.
+/// A service that process-compose starts in the chest.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
-    /// Startbefehl des Dienstes
+    /// Command that starts the service
     pub command: String,
-    /// Dienste, die vorher laufen müssen
+    /// Services that must run first
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Befehl, der Erfolg meldet, sobald der Dienst bereit ist
+    /// Command that succeeds once the service is ready
     pub ready: Option<String>,
-    /// Sekunden, die `ready` Zeit hat (Standard 60)
+    /// Seconds that `ready` may take (default 60)
     pub ready_timeout: Option<u32>,
-    /// Läuft einmal durch (z.B. Datenbank anlegen); Abhängige warten auf erfolgreiches Ende.
+    /// Runs once to the end (e.g. to create a database). Dependent services wait until it succeeds.
     #[serde(default)]
     pub once: bool,
 }
 
-/// Liest `truhe.toml`; `once` und `ready` schließen sich aus.
+/// Reads `chest.toml`. `once` and `ready` cannot be used together.
 fn parse(text: &str) -> Result<Definition> {
     let def: Definition = toml::from_str(text)?;
     for (name, svc) in &def.services {
         if svc.once && svc.ready.is_some() {
-            bail!("Dienst {name}: once und ready schließen sich aus");
+            bail!("service {name}: once and ready cannot be used together");
         }
     }
     Ok(def)
 }
 
-/// Legt Erkanntes und Definition zusammen; gleichnamige Dienste aus `truhe.toml` gewinnen.
+/// Merges detected services with the definition. Services from `chest.toml` win over detected ones with the same name.
 fn merge(mut def: Definition, detected: Option<&Detected>) -> Result<Definition> {
     for i in &def.ignore {
         if !detected.is_some_and(|d| d.found.contains_key(i)) {
-            bail!("ignore: \"{i}\" wurde in keiner Compose-Datei erkannt");
+            bail!("ignore: \"{i}\" was not detected in any Compose file");
         }
     }
     if let Some(d) = detected {
@@ -101,42 +101,42 @@ fn merge(mut def: Definition, detected: Option<&Detected>) -> Result<Definition>
     for (name, svc) in &def.services {
         for dep in &svc.depends_on {
             if dep == name || !def.services.contains_key(dep) {
-                bail!("Dienst {name}: depends_on \"{dep}\" gibt es nicht");
+                bail!("service {name}: depends_on \"{dep}\" does not exist");
             }
         }
     }
     Ok(def)
 }
 
-/// Werkzeuge aus nixpkgs, die die Truhe unabhängig vom Projekt-Flake braucht.
+/// Tools from nixpkgs that the chest needs, independent of the project flake.
 #[derive(Debug, Serialize, Deserialize)]
 struct Tools {
-    /// Store-Pfad von bashInteractive
+    /// Store path of `bashInteractive`
     bash: String,
-    /// Store-Pfad von coreutils
+    /// Store path of coreutils
     coreutils: String,
-    /// Store-Pfad von process-compose
+    /// Store path of process-compose
     process_compose: String,
-    /// Store-Pfade der `packages` aus der Definition
+    /// Store paths of the `packages` from the definition
     packages: Vec<String>,
 }
 
-/// Baut die Installables mit `nix build` und gibt ihre Store-Pfade zurück.
+/// Builds the installables with `nix build` and returns their store paths.
 fn nix_build(installables: &[String]) -> Result<Vec<String>> {
     let out = Command::new("nix")
         .args(["build", "--no-link", "--print-out-paths"])
         .args(installables)
         .stderr(Stdio::inherit())
         .output()
-        .context("nix nicht startbar")?;
+        .context("cannot start nix")?;
     if !out.status.success() {
-        bail!("nix build fehlgeschlagen: {}", installables.join(" "));
+        bail!("nix build failed: {}", installables.join(" "));
     }
     Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_owned).collect())
 }
 
 impl Tools {
-    /// Baut bash, coreutils, process-compose und die Zusatzpakete aus `nixpkgs`.
+    /// Builds bash, coreutils, process-compose and the extra packages from `nixpkgs`.
     fn fetch(nixpkgs: &str, packages: &[String]) -> Result<Self> {
         const ATTRS: [&str; 3] = ["bashInteractive", "coreutils", "process-compose"];
         let paths = nix_build(&ATTRS.map(|a| format!("{nixpkgs}#{a}^out")))?;
@@ -145,7 +145,7 @@ impl Tools {
                 .iter()
                 .find(|p| p.contains(&format!("-{name}-")))
                 .cloned()
-                .with_context(|| format!("{name} nicht in der Ausgabe von nix build"))
+                .with_context(|| format!("{name} not found in the output of nix build"))
         };
         let packages = if packages.is_empty() {
             Vec::new()
@@ -160,70 +160,70 @@ impl Tools {
         })
     }
 
-    /// Pfad zur bash-Binary
+    /// Path to the bash binary
     fn bash(&self) -> String {
         format!("{}/bin/bash", self.bash)
     }
 }
 
-/// Netzwerk-Modus der Truhe.
+/// Network mode of the chest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Net {
-    /// kein Netz
+    /// no network
     Off,
-    /// Netz des Hosts (Internet)
+    /// the host network (internet)
     Share,
-    /// Netz-NS kommt von außen (unshare), bwrap legt nur noch die übrigen an
+    /// the network namespace comes from outside (unshare); bwrap creates only the other namespaces
     Own,
 }
 
-/// Eine Truhe für ein Projekt: Definition, erkannte Dienste und ihre Verzeichnisse.
-pub struct Truhe {
-    /// Name der Truhe (nur `[A-Za-z0-9_-]`)
+/// A chest for one project: definition, detected services and their directories.
+pub struct Chest {
+    /// Name of the chest (only `[A-Za-z0-9_-]`)
     name: String,
-    /// Projektverzeichnis (enthält flake.nix)
+    /// Project directory (contains flake.nix)
     project: PathBuf,
-    /// Verzeichnis mit `truhe.toml`, falls vorhanden
+    /// Directory with `chest.toml`, if there is one
     def_dir: Option<PathBuf>,
-    /// Aus Compose-Dateien Erkanntes
+    /// What was detected in Compose files
     detected: Option<Detected>,
-    /// Zusammengeführte Definition
+    /// Merged definition
     def: Definition,
-    /// Zustandsverzeichnis (Home, Daten)
+    /// State directory (home, data)
     state: PathBuf,
-    /// Laufzeitverzeichnis (Sockets, erzeugte Dateien)
+    /// Runtime dir (sockets, generated files)
     run: PathBuf,
 }
 
-/// Pfad aus der Umgebungsvariable `var`; leer oder fehlend ergibt `fallback`.
+/// Path from the environment variable `var`. If it is empty or missing, `fallback` is used.
 fn xdg(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
     std::env::var_os(var).filter(|v| !v.is_empty()).map_or_else(fallback, PathBuf::from)
 }
 
-/// Ersetzt alles außer ASCII-Buchstaben, Ziffern, `-` und `_` durch `-`.
+/// Replaces everything except ASCII letters, digits, `-` and `_` with `-`.
 fn safe_name(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect()
 }
 
-/// Für bash in einfache Anführungszeichen setzen. Ohne Backslash: process-compose verschluckt ihn.
+/// Puts `s` in single quotes for bash. It uses no backslash because process-compose drops it.
 pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'"'"'"#))
 }
 
-/// Setzt `s` als YAML-String in doppelte Anführungszeichen.
+/// Puts `s` in double quotes as a YAML string.
 fn yaml_str(s: &str) -> String {
     let escaped = s.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n");
     format!("\"{escaped}\"")
 }
 
-/// Lebt der Prozess `pid` noch?
+/// Is the process `pid` still alive?
 fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// Wartet bis zu `tenths` Zehntelsekunden, dass `pid` verschwindet.
+/// Waits up to `tenths` tenths of a second for `pid` to go away.
 fn wait_dead(pid: u32, tenths: u32) -> bool {
     for _ in 0..tenths {
         if !alive(pid) {
@@ -234,58 +234,58 @@ fn wait_dead(pid: u32, tenths: u32) -> bool {
     !alive(pid)
 }
 
-/// Eine Zeile aus `process-compose process list -o json`.
+/// One row from `process-compose process list -o json`.
 #[derive(Deserialize)]
 struct ProcState {
-    /// Name des Dienstes
+    /// Name of the service
     name: String,
-    /// Status, z.B. "Completed" oder "Error"
+    /// Status, e.g. "Completed" or "Error"
     status: String,
-    /// "Ready", sobald die `readiness_probe` erfolgreich war
+    /// "Ready" once the `readiness_probe` has succeeded
     is_ready: String,
-    /// Exit-Code des Dienstes
+    /// Exit code of the service
     exit_code: i32,
-    /// Läuft der Dienst gerade?
+    /// Is the service running right now?
     is_running: bool,
 }
 
-/// Änderungszeit der Datei, falls lesbar.
+/// Modification time of the file, if it can be read.
 fn mtime(p: &Path) -> Option<SystemTime> {
     fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Beendet luggage mit dem Exit-Code des Kindprozesses, wenn der nicht 0 war.
+/// Exits luggage with the exit code of the child process if it was not 0.
 fn pass_through(status: ExitStatus) {
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
 }
 
-impl Truhe {
-    /// Sucht vom aktuellen Verzeichnis aufwärts das Projekt (flake.nix), erkennt Dienste und liest die Definition.
-    /// Mit `lenient` wird eine fehlerhafte Definition nur gemeldet.
+impl Chest {
+    /// Searches upward from the current directory for the project (flake.nix), detects services and reads the definition.
+    /// With `lenient`, a broken definition is only reported.
     pub fn find(nixpkgs: &str, lenient: bool) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let project = cwd
             .ancestors()
             .find(|d| d.join("flake.nix").exists())
             .with_context(|| {
-                format!("keine flake.nix in {} oder darüber — erst `luggage init`", cwd.display())
+                format!("no flake.nix in {} or above — run `luggage init` first", cwd.display())
             })?
             .to_path_buf();
         let base = safe_name(
             &project.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
         );
         let def_dir =
-            [project.join(".luggage"), config::path().with_file_name("truhen").join(&base)]
+            [project.join(".luggage"), config::path().with_file_name("chests").join(&base)]
                 .into_iter()
-                .find(|d| d.join("truhe.toml").exists());
+                .find(|d| d.join("chest.toml").exists());
         let load = || -> Result<(Option<Detected>, Definition)> {
             let def = match &def_dir {
                 Some(d) => {
-                    let file = d.join("truhe.toml");
+                    let file = d.join("chest.toml");
                     let text = fs::read_to_string(&file)?;
-                    parse(&text).with_context(|| format!("{} fehlerhaft", file.display()))?
+                    parse(&text).with_context(|| format!("{} is invalid", file.display()))?
                 }
                 None => Definition::default(),
             };
@@ -295,60 +295,60 @@ impl Truhe {
         };
         let (detected, def) = match load() {
             Ok(loaded) => loaded,
-            // down braucht nur das Laufzeitverzeichnis; eine kaputte Definition darf es nicht blockieren
+            // down only needs the runtime dir, so a broken definition must not block it
             Err(e) if lenient => {
-                info(&format!("Warnung: {e:#}"));
+                info(&format!("warning: {e:#}"));
                 (None, Definition::default())
             }
             Err(e) => return Err(e),
         };
         let name = def.name.as_deref().map_or(base, safe_name);
         let state =
-            xdg("XDG_DATA_HOME", || home().join(".local/share")).join("luggage/truhen").join(&name);
+            xdg("XDG_DATA_HOME", || home().join(".local/share")).join("luggage/chests").join(&name);
         let run = xdg("XDG_RUNTIME_DIR", std::env::temp_dir).join("luggage").join(&name);
         Ok(Self { name, project, def_dir, detected, def, state, run })
     }
 
-    /// PID-Datei der laufenden Truhe
+    /// PID file of the running chest
     fn pid_file(&self) -> PathBuf {
-        self.run.join("truhe.pid")
+        self.run.join("chest.pid")
     }
 
-    /// Socket von process-compose
+    /// Socket of process-compose
     fn socket(&self) -> PathBuf {
         self.run.join("pc.sock")
     }
 
-    /// PID der laufenden Truhe, falls sie lebt.
+    /// PID of the running chest, if it is alive.
     fn running(&self) -> Option<u32> {
         let pid = fs::read_to_string(self.pid_file()).ok()?.trim().parse().ok()?;
         alive(pid).then_some(pid)
     }
 
-    /// Liest die von `prepare` gespeicherten Werkzeuge aus `tools.json`.
+    /// Reads the tools that `prepare` saved in `tools.json`.
     fn tools(&self) -> Result<Tools> {
         let text = fs::read_to_string(self.run.join("tools.json"))
-            .context("Truhe nicht vorbereitet — erst `luggage up`")?;
+            .context("chest not prepared — run `luggage up` first")?;
         Ok(serde_json::from_str(&text)?)
     }
 
-    /// Inhalt von `/etc/hosts` für die Truhe.
+    /// Contents of `/etc/hosts` for the chest.
     fn render_hosts(&self) -> String {
-        let mut names = vec![format!("truhe-{}", self.name)];
+        let mut names = vec![format!("chest-{}", self.name)];
         names.extend(self.def.hosts.iter().cloned());
         format!("127.0.0.1 localhost {}\n::1 localhost\n", names.join(" "))
     }
 
-    /// rc-Datei für bash: lädt die Dev-Umgebung, setzt PATH und wechselt ins Projekt.
+    /// The rc file for bash: loads the dev environment, sets `PATH` and changes to the project.
     fn render_rc(&self, tools: &Tools) -> String {
         let user = std::env::var("USER").unwrap_or_default();
         format!(
             "source {RUN_INSIDE}/env.sh\n\
-             export HOME={home} USER={user} TMPDIR=/tmp LUGGAGE_TRUHE={name}\n\
+             export HOME={home} USER={user} TMPDIR=/tmp LUGGAGE_CHEST={name}\n\
              unset NIX_BUILD_TOP TEMP TMP TEMPDIR\n\
              export PATH={pkgs}{pc}/bin:{bash}/bin:{core}/bin:\"$PATH\"\n\
              cd {project}\n\
-             PS1='[truhe:{name_plain}] \\w\\$ '\n",
+             PS1='[chest:{name_plain}] \\w\\$ '\n",
             home = sh_quote(&home().to_string_lossy()),
             user = sh_quote(&user),
             name = sh_quote(&self.name),
@@ -361,7 +361,7 @@ impl Truhe {
         )
     }
 
-    /// Erzeugt `process-compose.yaml` aus den Diensten.
+    /// Generates `process-compose.yaml` from the services.
     fn render_compose(&self) -> String {
         let wd = yaml_str(&self.project.to_string_lossy());
         let mut y = String::from("version: \"0.5\"\nprocesses:\n");
@@ -387,7 +387,7 @@ impl Truhe {
                 }
             }
             if let Some(ready) = &svc.ready {
-                // Standard-Timeout von process-compose ist 1 s: erste Anfragen (Cache-Aufbau) dauern länger.
+                // The process-compose default timeout is 1 s, but first requests (cache warm-up) take longer.
                 let t = svc.ready_timeout.unwrap_or(DEFAULT_READY_TIMEOUT);
                 let _ = write!(
                     y,
@@ -399,7 +399,7 @@ impl Truhe {
         y
     }
 
-    /// Argumente für bwrap. Reihenfolge zählt: spätere Mounts verdecken frühere.
+    /// Arguments for bwrap. Order matters: later mounts hide earlier ones.
     fn bwrap_args(&self, tools: &Tools, net: Net) -> Result<Vec<String>> {
         let meta = fs::metadata("/proc/self")?;
         let home = home().to_string_lossy().into_owned();
@@ -423,7 +423,7 @@ impl Truhe {
         a.extend(
             [
                 "--hostname",
-                &format!("truhe-{}", self.name),
+                &format!("chest-{}", self.name),
                 "--tmpfs",
                 "/tmp",
                 "--dev",
@@ -433,7 +433,7 @@ impl Truhe {
                 "--ro-bind",
                 "/nix/store",
                 "/nix/store",
-                // erst das Home, dann das Projekt: liegt es unter $HOME, würde das Home es sonst verdecken
+                // home first, then the project: if the project is under $HOME, the home mount would hide it otherwise
                 "--bind",
                 &s(&self.state.join("home")),
                 &home,
@@ -475,7 +475,7 @@ impl Truhe {
             .map(str::to_owned),
         );
         if let Some(d) = &self.def_dir {
-            a.extend(["--ro-bind".into(), s(d), "/truhe".into()]);
+            a.extend(["--ro-bind".into(), s(d), "/chest".into()]);
         }
         if net == Net::Share {
             a.extend(
@@ -486,10 +486,10 @@ impl Truhe {
         Ok(a)
     }
 
-    /// Legt Verzeichnisse an und schreibt env.sh, rc, hosts und process-compose.yaml.
+    /// Creates the directories and writes env.sh, rc, hosts and process-compose.yaml.
     fn prepare(&self, nixpkgs: &str) -> Result<Tools> {
         for d in [self.state.join("home"), self.state.join("data"), self.run.clone()] {
-            fs::create_dir_all(&d).with_context(|| format!("{} nicht anlegbar", d.display()))?;
+            fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
         }
         fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
         let tools = Tools::fetch(nixpkgs, &self.def.packages)?;
@@ -497,15 +497,15 @@ impl Truhe {
         let flake_changed =
             ["flake.nix", "flake.lock"].iter().filter_map(|f| mtime(&self.project.join(f))).max();
         if mtime(&env).is_none_or(|t| flake_changed.is_some_and(|f| f > t)) {
-            info("baue die Umgebung (nix print-dev-env)");
+            info("building the environment (nix print-dev-env)");
             let out = Command::new("nix")
                 .arg("print-dev-env")
                 .current_dir(&self.project)
                 .stderr(Stdio::inherit())
                 .output()
-                .context("nix nicht startbar")?;
+                .context("cannot start nix")?;
             if !out.status.success() {
-                bail!("nix print-dev-env fehlgeschlagen");
+                bail!("nix print-dev-env failed");
             }
             fs::write(&env, out.stdout)?;
         }
@@ -516,7 +516,7 @@ impl Truhe {
         Ok(tools)
     }
 
-    /// Einmaliger Befehl in einer frischen Truhe; ohne Befehl eine Shell.
+    /// Runs a one-off command in a fresh chest; without a command, a shell.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
         let tools = self.prepare(nixpkgs)?;
         let mut c = Command::new("bwrap");
@@ -525,21 +525,21 @@ impl Truhe {
             .arg(tools.bash())
             .arg("--noprofile");
         shell_args(&mut c, cmd);
-        pass_through(c.status().context("bwrap nicht startbar")?);
+        pass_through(c.status().context("cannot start bwrap")?);
         Ok(())
     }
 
-    /// Gibt die Hinweise der Dienst-Erkennung aus.
+    /// Prints the notes from service detection.
     fn print_notes(&self) {
         for n in self.detected.iter().flat_map(|d| &d.notes) {
-            info(&format!("Hinweis: {n}"));
+            info(&format!("note: {n}"));
         }
     }
 
-    /// Startet die Truhe im Hintergrund und wartet, bis alle Dienste bereit sind.
+    /// Starts the chest in the background and waits until all services are ready.
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
         if let Some(pid) = self.running() {
-            info(&format!("Truhe {} läuft schon (pid {pid})", self.name));
+            info(&format!("chest {} is already running (pid {pid})", self.name));
             return Ok(());
         }
         self.print_notes();
@@ -554,9 +554,9 @@ impl Truhe {
                 "exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml"
             )
         };
-        let log = File::create(self.run.join("truhe.log"))?;
-        // Eigener Netz-NS per unshare: darin sind wir root und geben Ports < 1024 frei — nur für die Truhe.
-        // bwrap meldet die PID seines Kindes (PID 1 der Truhe) über fd 3.
+        let log = File::create(self.run.join("chest.log"))?;
+        // Own network namespace via unshare: we are root in it and allow ports < 1024, only for the chest.
+        // bwrap reports the PID of its child (PID 1 of the chest) on fd 3.
         Command::new("sh")
             .args(["-c", r#"exec 3>"$1"; shift; exec setsid "$@""#, "sh"])
             .arg(&info_json)
@@ -571,7 +571,7 @@ impl Truhe {
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()
-            .context("Truhe nicht startbar")?;
+            .context("cannot start the chest")?;
         let pid = self.wait_for_pid(&info_json)?;
         fs::write(self.pid_file(), pid.to_string())?;
         if !self.def.services.is_empty() {
@@ -583,13 +583,10 @@ impl Truhe {
             }
         }
         if !alive(pid) {
-            bail!(
-                "Truhe hat sich sofort beendet — siehe {}/truhe.log und pc.log",
-                self.run.display()
-            );
+            bail!("chest stopped right away — see {}/chest.log and pc.log", self.run.display());
         }
-        // Erst zurückkehren, wenn die Dienste bereit sind. Nebenbei: ein `down`, während eine
-        // readiness_probe noch aussteht, bleibt in process-compose hängen.
+        // Return only once the services are ready. Also, a `down` while a readiness_probe
+        // is still pending hangs in process-compose.
         if !self.def.services.is_empty() {
             let limit = self
                 .def
@@ -606,29 +603,32 @@ impl Truhe {
                     break;
                 }
                 if !alive(pid) {
-                    bail!("Truhe wurde beendet, bevor die Dienste bereit waren");
+                    bail!("chest stopped before the services were ready");
                 }
                 sleep(Duration::from_millis(250));
             }
             if !ready {
                 bail!(
-                    "Dienste nach {limit} s nicht bereit (Truhe läuft weiter) — `luggage status`, Log: {}",
-                    self.run.join("truhe.log").display()
+                    "services not ready after {limit} s (the chest keeps running) — `luggage status`, log: {}",
+                    self.run.join("chest.log").display()
                 );
             }
         }
-        info(&format!("Truhe {} läuft (pid {pid}) — `luggage status`, `luggage open`", self.name));
+        info(&format!(
+            "chest {} is running (pid {pid}) — `luggage status`, `luggage open`",
+            self.name
+        ));
         Ok(())
     }
 
-    /// Sind alle Dienste bereit? Fehler, wenn einer sich beendet hat, der laufen sollte.
+    /// Are all services ready? Fails if a service stopped that should keep running.
     fn services_ready(&self, tools: &Tools) -> Result<bool> {
         let out =
             self.pc(tools, &["process", "list", "-o", "json"]).stderr(Stdio::null()).output()?;
         let Ok(list) = serde_json::from_slice::<Vec<ProcState>>(&out.stdout) else {
             return Ok(false);
         };
-        let log = self.run.join("truhe.log");
+        let log = self.run.join("chest.log");
         let mut ready = 0;
         for p in &list {
             let Some(svc) = self.def.services.get(&p.name) else {
@@ -636,7 +636,7 @@ impl Truhe {
             };
             let finished = !p.is_running && matches!(p.status.as_str(), "Completed" | "Error");
             if finished && (!svc.once || p.exit_code != 0) {
-                bail!("Dienst {} beendet (exit {}) — Log: {}", p.name, p.exit_code, log.display());
+                bail!("service {} stopped (exit {}) — log: {}", p.name, p.exit_code, log.display());
             }
             let ok = if svc.once {
                 finished
@@ -652,7 +652,7 @@ impl Truhe {
         Ok(ready == self.def.services.len())
     }
 
-    /// Wartet, bis bwrap die PID der Truhe in `info_json` schreibt.
+    /// Waits until bwrap writes the PID of the chest to `info_json`.
     fn wait_for_pid(&self, info_json: &Path) -> Result<u32> {
         #[derive(Deserialize)]
         struct BwrapInfo {
@@ -668,32 +668,32 @@ impl Truhe {
             }
             sleep(Duration::from_millis(100));
         }
-        bail!("Truhe startet nicht — siehe {}", self.run.join("truhe.log").display())
+        bail!("chest does not start — see {}", self.run.join("chest.log").display())
     }
 
-    /// Führt `cmd` in der laufenden Truhe aus; ohne Befehl eine Shell.
+    /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String]) -> Result<()> {
-        let pid = self
-            .running()
-            .with_context(|| format!("Truhe {} läuft nicht — erst `luggage up`", self.name))?;
+        let pid = self.running().with_context(|| {
+            format!("chest {} is not running — run `luggage up` first", self.name)
+        })?;
         let tools = self.tools()?;
         let mut c = nsenter(pid, &tools);
         shell_args(&mut c, cmd);
-        pass_through(c.status().context("nsenter nicht startbar")?);
+        pass_through(c.status().context("cannot start nsenter")?);
         Ok(())
     }
 
-    /// Führt `cmd` in der laufenden Truhe aus.
+    /// Runs `cmd` in the running chest.
     pub fn cmd_exec(&self, cmd: &[String]) -> Result<()> {
         self.enter(cmd)
     }
 
-    /// Öffnet eine Shell in der laufenden Truhe.
+    /// Opens a shell in the running chest.
     pub fn cmd_open(&self) -> Result<()> {
         self.enter(&[])
     }
 
-    /// process-compose-Client auf dem Host; der Socket liegt im Laufzeitverzeichnis.
+    /// The process-compose client on the host. The socket is in the runtime dir.
     fn pc(&self, tools: &Tools, args: &[&str]) -> Command {
         let mut c = Command::new(format!("{}/bin/process-compose", tools.process_compose));
         c.args(args)
@@ -705,21 +705,21 @@ impl Truhe {
         c
     }
 
-    /// Stoppt die Truhe: erst die Dienste geordnet, zuletzt per SIGKILL.
+    /// Stops the chest: first the services in order, SIGKILL as a last resort.
     pub fn cmd_down(&self) -> Result<()> {
         let Some(pid) = self.running() else {
             let _ = fs::remove_file(self.pid_file());
-            info(&format!("Truhe {} läuft nicht", self.name));
+            info(&format!("chest {} is not running", self.name));
             return Ok(());
         };
         if self.socket().exists() {
-            // Dienste geordnet stoppen; SIGKILL unten nur, wenn alles andere nicht reicht.
+            // Stop the services in order; the SIGKILL below is only for when nothing else works.
             let tools = self.tools()?;
             let client =
                 self.pc(&tools, &["down"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
             let stopped = wait_dead(pid, 50);
             if !stopped {
-                // process-compose hängt: alle Prozesse der Truhe bekommen SIGTERM, Datenbanken fahren sauber herunter.
+                // process-compose hangs: all processes in the chest get SIGTERM, so databases shut down cleanly.
                 let _ = nsenter(pid, &tools)
                     .args(["-c", "kill -TERM -1"])
                     .stderr(Stdio::null())
@@ -731,63 +731,63 @@ impl Truhe {
                 let _ = c.wait();
             }
         }
-        // PID 1 im eigenen PID-NS ignoriert SIGTERM von außen; SIGKILL räumt den ganzen NS ab.
+        // PID 1 in its own PID namespace ignores SIGTERM from outside; SIGKILL tears down the whole namespace.
         if alive(pid) {
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
         }
         let _ = fs::remove_file(self.pid_file());
         let _ = fs::remove_file(self.socket());
-        info(&format!("Truhe {} beendet", self.name));
+        info(&format!("chest {} stopped", self.name));
         Ok(())
     }
 
-    /// Zeigt Definition, Dienste und Zustand der Truhe.
+    /// Shows the definition, services and state of the chest.
     pub fn cmd_status(&self) -> Result<()> {
-        println!("Truhe:       {}", self.name);
-        println!("Projekt:     {}", self.project.display());
+        println!("Chest:       {}", self.name);
+        println!("Project:     {}", self.project.display());
         println!(
             "Definition:  {}",
             self.def_dir
                 .as_ref()
-                .map_or_else(|| "keine".into(), |d| d.join("truhe.toml").display().to_string())
+                .map_or_else(|| "none".into(), |d| d.join("chest.toml").display().to_string())
         );
         if let Some(d) = &self.detected {
             let found: Vec<_> = d.found.iter().map(|(n, what)| format!("{n} ({what})")).collect();
             let file = d.file.file_name().unwrap_or_default().to_string_lossy();
             println!(
-                "Erkannt:     {file}: {}",
-                if found.is_empty() { "nichts".into() } else { found.join(", ") }
+                "Detected:    {file}: {}",
+                if found.is_empty() { "nothing".into() } else { found.join(", ") }
             );
             if !d.skipped.is_empty() {
-                println!("Nicht übern.: {}", d.skipped.join(", "));
+                println!("Skipped:     {}", d.skipped.join(", "));
             }
         }
         let services: Vec<_> = self.def.services.keys().map(String::as_str).collect();
         println!(
-            "Dienste:     {}",
-            if services.is_empty() { "keine".into() } else { services.join(", ") }
+            "Services:    {}",
+            if services.is_empty() { "none".into() } else { services.join(", ") }
         );
         self.print_notes();
-        println!("Zustand:     {}", self.state.display());
+        println!("State:       {}", self.state.display());
         let Some(pid) = self.running() else {
-            println!("Status:      läuft nicht");
+            println!("Status:      not running");
             return Ok(());
         };
-        println!("Status:      läuft (pid {pid})");
+        println!("Status:      running (pid {pid})");
         if self.socket().exists() {
             println!();
             let tools = self.tools()?;
-            // stderr: process-compose meldet dort Debug-Zeilen zu seiner fehlenden Config
+            // stderr is hidden: process-compose prints debug lines there about its missing config
             self.pc(&tools, &["process", "list", "-o", "wide"]).stderr(Stdio::null()).status()?;
         }
         Ok(())
     }
 }
 
-/// bash in allen Namespaces der laufenden Truhe (wie `docker exec`).
+/// bash in all namespaces of the running chest (like `docker exec`).
 fn nsenter(pid: u32, tools: &Tools) -> Command {
     let mut c = Command::new("nsenter");
-    // ohne --wd: nsenter --root mit --wd liefert ein kaputtes cwd, die rc-Datei macht das cd
+    // no --wd: nsenter --root with --wd gives a broken cwd, so the rc file does the cd
     c.args([
         "-t",
         &pid.to_string(),
@@ -809,7 +809,7 @@ fn nsenter(pid: u32, tools: &Tools) -> Command {
     c
 }
 
-/// `-c 'source rc; exec "$@"' bash CMD…` oder interaktive Shell mit rc.
+/// `-c 'source rc; exec "$@"' bash CMD…` or an interactive shell with rc.
 fn shell_args(c: &mut Command, cmd: &[String]) {
     if cmd.is_empty() {
         c.args(["--rcfile", &format!("{RUN_INSIDE}/rc"), "-i"]);
@@ -840,14 +840,14 @@ command = "php -S 127.0.0.1:8000 -t public"
 depends_on = ["db"]
 "#;
 
-    fn truhe(def: Definition) -> Truhe {
-        Truhe {
+    fn chest(def: Definition) -> Chest {
+        Chest {
             name: "demo".into(),
             project: "/home/u/projects/demo".into(),
             def_dir: None,
             detected: None,
             def,
-            state: "/home/u/.local/share/luggage/truhen/demo".into(),
+            state: "/home/u/.local/share/luggage/chests/demo".into(),
             run: "/run/user/1000/luggage/demo".into(),
         }
     }
@@ -871,7 +871,7 @@ depends_on = ["db"]
 
     #[test]
     fn rejects_bad_definitions() {
-        assert!(parse("netz = true").is_err());
+        assert!(parse("net = true").is_err());
         let merged = |t: &str| merge(parse(t).unwrap(), None);
         assert!(merged("[services.a]\ncommand = \"x\"\ndepends_on = [\"b\"]").is_err());
         assert!(merged("[services.a]\ncommand = \"x\"\ndepends_on = [\"a\"]").is_err());
@@ -906,16 +906,16 @@ depends_on = ["db"]
             hosts: vec!["db".into(), "mail".into()],
             ..Detected::default()
         };
-        let def = parse("ignore = [\"mail\"]\nhosts = [\"extra\"]\n[services.db]\ncommand = \"eigenes\"\n[services.web]\ncommand = \"php -S 0:80\"\ndepends_on = [\"db\"]").unwrap();
+        let def = parse("ignore = [\"mail\"]\nhosts = [\"extra\"]\n[services.db]\ncommand = \"custom\"\n[services.web]\ncommand = \"php -S 0:80\"\ndepends_on = [\"db\"]").unwrap();
         let m = merge(def, Some(&detected)).unwrap();
         assert_eq!(m.services.keys().collect::<Vec<_>>(), ["db", "db-init", "web"]);
-        assert_eq!(m.services["db"].command, "eigenes");
+        assert_eq!(m.services["db"].command, "custom");
         assert_eq!(m.hosts, ["db", "extra"]);
     }
 
     #[test]
     fn compose_uses_matching_conditions() {
-        let y = truhe(parse(SPARENCON).unwrap()).render_compose();
+        let y = chest(parse(SPARENCON).unwrap()).render_compose();
         assert!(y.contains("  \"db\":\n    command: \"mariadbd --no-defaults --datadir=/data/mariadb\"\n    working_dir: \"/home/u/projects/demo\"\n    disable_env_expansion: true\n"));
         assert!(
             y.contains("      \"db-init\":\n        condition: process_completed_successfully\n")
@@ -931,7 +931,7 @@ depends_on = ["db"]
 
     #[test]
     fn rc_puts_packages_first_on_path() {
-        let rc = truhe(Definition::default()).render_rc(&tools());
+        let rc = chest(Definition::default()).render_rc(&tools());
         assert!(rc.contains(
             "export PATH=/nix/store/m-mariadb/bin:/nix/store/p-pc/bin:/nix/store/b-bash/bin:/nix/store/c-coreutils/bin:\"$PATH\"\n"
         ));
@@ -940,8 +940,8 @@ depends_on = ["db"]
 
     #[test]
     fn hosts_point_to_loopback() {
-        let h = truhe(parse(SPARENCON).unwrap()).render_hosts();
-        assert_eq!(h, "127.0.0.1 localhost truhe-demo database\n::1 localhost\n");
+        let h = chest(parse(SPARENCON).unwrap()).render_hosts();
+        assert_eq!(h, "127.0.0.1 localhost chest-demo database\n::1 localhost\n");
     }
 
     #[test]
@@ -951,13 +951,13 @@ depends_on = ["db"]
 
     #[test]
     fn bwrap_mount_order() {
-        let t = truhe(Definition::default());
+        let t = chest(Definition::default());
         let a = t.bwrap_args(&tools(), Net::Off).unwrap();
         let pos = |s: &str| a.iter().position(|x| x == s).unwrap();
-        // tmpfs /tmp vor allen Binds, Home vor dem Projekt (Projekt liegt unter $HOME)
+        // tmpfs /tmp before all binds, home before the project (the project is under $HOME)
         assert!(pos("/tmp") < pos("--bind"));
         assert!(
-            pos("/home/u/.local/share/luggage/truhen/demo/home") < pos("/home/u/projects/demo")
+            pos("/home/u/.local/share/luggage/chests/demo/home") < pos("/home/u/projects/demo")
         );
         assert_eq!(a[0], "--unshare-all");
         assert!(!a.contains(&"--share-net".to_owned()));

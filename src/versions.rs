@@ -1,4 +1,4 @@
-//! Fragt den nixpkgs-Channel, welche PHP-/Node-/Python- und Datenbank-Versionen es gibt (Cache: 1 Tag).
+//! Asks the nixpkgs channel which PHP, Node, Python and database versions it has (cached for 1 day).
 
 use std::fs;
 use std::path::PathBuf;
@@ -10,11 +10,11 @@ use serde::Deserialize;
 
 use crate::home;
 
-/// Wie lange eine zwischengespeicherte Antwort gilt.
+/// How long a cached answer stays valid.
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Nix-Ausdruck, der die Versionen als JSON liefert.
-/// `@NIXPKGS@` wird vor dem Aufruf durch den Channel ersetzt.
+/// Nix expression that returns the versions as JSON.
+/// `@NIXPKGS@` is replaced with the channel before the call.
 const QUERY: &str = r#"
 let
   p = (builtins.getFlake "@NIXPKGS@").legacyPackages.x86_64-linux;
@@ -33,58 +33,58 @@ in {
 }
 "#;
 
-/// Ein nixpkgs-Attribut mit seiner Version.
+/// A nixpkgs attribute with its version.
 #[derive(Debug, Deserialize)]
 struct Entry {
-    /// Attributname, z.B. `nodejs_22`
+    /// Attribute name, e.g. `nodejs_22`
     attr: String,
-    /// Version, wie nix sie meldet
+    /// Version as nix reports it
     version: String,
 }
 
-/// Rohe JSON-Antwort von `nix eval` auf [`QUERY`].
+/// Raw JSON answer of `nix eval` for [`QUERY`].
 #[derive(Debug, Deserialize)]
 struct Raw {
-    /// Attribute `php8x`
+    /// Attributes `php8x`
     php: Vec<Entry>,
-    /// Attribute `nodejs_N`
+    /// Attributes `nodejs_N`
     node: Vec<Entry>,
-    /// Attribute `python3N`
+    /// Attributes `python3N`
     python: Vec<Entry>,
-    /// Attribute `mariadb_N`
+    /// Attributes `mariadb_N`
     mariadb: Vec<Entry>,
-    /// Attribute `postgresql_N`
+    /// Attributes `postgresql_N`
     postgresql: Vec<Entry>,
-    /// Version von `php`
+    /// Version of `php`
     php_default: Option<String>,
-    /// Version von `python3`
+    /// Version of `python3`
     python_default: Option<String>,
-    /// Version von `rustc`
+    /// Version of `rustc`
     rustc: Option<String>,
 }
 
-/// Verfügbare Versionen eines Channels, jeweils aufsteigend.
+/// Available versions of a channel, each in ascending order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Available {
-    /// PHP als (Major, Minor)
+    /// PHP as (major, minor)
     pub php: Vec<(u32, u32)>,
-    /// Node-Hauptversionen
+    /// Node major versions
     pub node: Vec<u32>,
-    /// Python als (Major, Minor)
+    /// Python as (major, minor)
     pub python: Vec<(u32, u32)>,
-    /// MariaDB-Versionen als (Major, Minor)
+    /// MariaDB versions as (major, minor)
     pub mariadb: Vec<(u32, u32)>,
-    /// PostgreSQL-Hauptversionen
+    /// PostgreSQL major versions
     pub postgresql: Vec<u32>,
-    /// Standard-PHP des Channels
+    /// Default PHP of the channel
     pub php_default: Option<(u32, u32)>,
-    /// Standard-Python des Channels
+    /// Default Python of the channel
     pub python_default: Option<(u32, u32)>,
-    /// Rust-Version des Channels
+    /// Rust version of the channel
     pub rustc: Option<(u32, u32)>,
 }
 
-/// `"8.3.35"` → `(8, 3)`; Vorabversionen wie `"3.15.0rc2"` → `None`.
+/// `"8.3.35"` → `(8, 3)`; pre-releases like `"3.15.0rc2"` → `None`.
 pub fn major_minor(version: &str) -> Option<(u32, u32)> {
     if !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return None;
@@ -93,7 +93,7 @@ pub fn major_minor(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-/// Wandelt die Antwort von `nix eval` in [`Available`]; Vorabversionen fallen weg.
+/// Turns the answer of `nix eval` into [`Available`]; pre-releases are dropped.
 fn parse(json: &str) -> Result<Available> {
     let raw: Raw = serde_json::from_str(json)?;
     let stable = |entries: &[Entry]| {
@@ -129,7 +129,7 @@ fn parse(json: &str) -> Result<Available> {
     })
 }
 
-/// Cache-Datei für den Channel unter `XDG_CACHE_HOME`.
+/// Cache file for the channel under `XDG_CACHE_HOME`.
 fn cache_file(nixpkgs: &str) -> PathBuf {
     let name: String =
         nixpkgs.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
@@ -140,7 +140,7 @@ fn cache_file(nixpkgs: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-/// Ob die Datei jünger als [`CACHE_TTL`] ist.
+/// Whether the file is younger than [`CACHE_TTL`].
 fn fresh(path: &PathBuf) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
@@ -149,7 +149,7 @@ fn fresh(path: &PathBuf) -> bool {
         .is_some_and(|age| age < CACHE_TTL)
 }
 
-/// Verfügbare Versionen von `nixpkgs`, aus dem Cache oder per `nix eval`.
+/// Available versions of `nixpkgs`, from the cache or via `nix eval`.
 pub fn query(nixpkgs: &str) -> Result<Available> {
     let cache = cache_file(nixpkgs);
     if fresh(&cache)
@@ -160,17 +160,17 @@ pub fn query(nixpkgs: &str) -> Result<Available> {
     let out = Command::new("nix")
         .args(["eval", "--json", "--impure", "--expr", &QUERY.replace("@NIXPKGS@", nixpkgs)])
         .output()
-        .context("nix nicht startbar")?;
+        .context("cannot start nix")?;
     if !out.status.success() {
         bail!(
-            "Versionen von {nixpkgs} nicht abfragbar:\n{}",
+            "cannot query versions of {nixpkgs}:\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let json = String::from_utf8(out.stdout)?;
-    let available = parse(&json).context("unerwartete Antwort von nix eval")?;
+    let available = parse(&json).context("unexpected answer from nix eval")?;
     if let Some(dir) = cache.parent() {
-        // Cache ist nur Beschleunigung, Schreibfehler sind egal
+        // The cache only speeds things up, so write errors do not matter
         let _ = fs::create_dir_all(dir).and_then(|()| fs::write(&cache, &json));
     }
     Ok(available)

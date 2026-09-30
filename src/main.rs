@@ -1,11 +1,11 @@
-//! luggage — Projekt anlegen/klonen und eine Nix-Dev-Umgebung (flake + direnv) einrichten.
+//! luggage — create or clone a project and set up a Nix dev environment (flake + direnv).
 
+mod chest;
 mod compose;
 mod config;
 mod detect;
 mod flake;
 mod remote;
-mod truhe;
 mod versions;
 
 use std::fs;
@@ -18,110 +18,110 @@ use clap::{Args, Parser, Subcommand};
 use config::Config;
 use remote::Forge;
 
-/// Projekt anlegen/klonen und eine Nix-Dev-Umgebung (flake + direnv) einrichten.
+/// Create or clone a project and set up a Nix dev environment (flake + direnv).
 ///
-/// Erkennt PHP, Node, Python und Rust aus den Projektdateien. Standards stehen in
-/// ~/.config/luggage/config.toml (siehe `luggage config`). Committet wird nichts.
+/// Detects PHP, Node, Python and Rust from the project files. Defaults live in
+/// ~/.config/luggage/config.toml (see `luggage config`). Nothing is committed.
 #[derive(Parser)]
 #[command(name = "luggage", version)]
 struct Cli {
-    /// Unterbefehl
+    /// Subcommand
     #[command(subcommand)]
     cmd: Cmd,
 }
 
-/// Unterbefehle von luggage.
+/// Subcommands of luggage.
 #[derive(Subcommand)]
 enum Cmd {
-    /// Repo klonen (URL oder lokaler Pfad) oder neues Projekt anlegen
+    /// Clone a repo (URL or local path) or create a new project
     New {
-        /// git-URL, lokaler Repo-Pfad oder Projektname
+        /// Git URL, local repo path or project name
         target: String,
-        /// Zielverzeichnis [Standard: Projektordner aus der Config]
+        /// Target directory [default: projects directory from the config]
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// GitLab-Projekt anlegen, optional in GRUPPE
-        #[arg(long, value_name = "GRUPPE", num_args = 0..=1, default_missing_value = "", conflicts_with = "github")]
+        /// Create a GitLab project, optionally in GROUP
+        #[arg(long, value_name = "GROUP", num_args = 0..=1, default_missing_value = "", conflicts_with = "github")]
         gitlab: Option<String>,
-        /// GitHub-Repo anlegen, optional unter OWNER (Organisation)
+        /// Create a GitHub repo, optionally under OWNER (organization)
         #[arg(long, value_name = "OWNER", num_args = 0..=1, default_missing_value = "")]
         github: Option<String>,
-        /// GitLab-Host [Standard: Config, sonst glab]
+        /// GitLab host [default: config, else glab]
         #[arg(long, requires = "gitlab")]
         host: Option<String>,
-        /// Sichtbarkeit des neuen Remote-Projekts [Standard: Config, sonst private]
+        /// Visibility of the new remote project [default: config, else private]
         #[arg(long, value_parser = ["private", "internal", "public"])]
         visibility: Option<String>,
-        /// Optionen für die Nix-Umgebung
+        /// Options for the Nix environment
         #[command(flatten)]
         env: EnvOpts,
     },
-    /// Umgebung in einem bestehenden Repo einrichten
+    /// Set up the environment in an existing repo
     Init {
-        /// Verzeichnis des Repos
+        /// Directory of the repo
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Optionen für die Nix-Umgebung
+        /// Options for the Nix environment
         #[command(flatten)]
         env: EnvOpts,
     },
-    /// Wirksame Config anzeigen
+    /// Show the effective config
     Config {
-        /// Kommentierte Vorlage anlegen (überschreibt nie)
+        /// Create a commented template (never overwrites)
         #[arg(long)]
         init: bool,
     },
-    /// Befehl in einer frischen Truhe ausführen (ohne Befehl: Shell)
+    /// Run a command in a fresh chest (no command: a shell)
     Run {
-        /// Internet in der Truhe erlauben
+        /// Allow internet access in the chest
         #[arg(long)]
         net: bool,
-        /// Befehl mit Argumenten
+        /// Command with arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Truhe mit ihren Diensten im Hintergrund starten
+    /// Start the chest and its services in the background
     Up,
-    /// Befehl in der laufenden Truhe ausführen
+    /// Run a command in the running chest
     Exec {
-        /// Befehl mit Argumenten
+        /// Command with arguments
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Shell in der laufenden Truhe öffnen
+    /// Open a shell in the running chest
     Open,
-    /// Laufende Truhe beenden
+    /// Stop the running chest
     Down,
-    /// Zeigen, ob die Truhe läuft und wie es den Diensten geht
+    /// Show whether the chest is running and how its services are doing
     Status,
 }
 
-/// Optionen für die Nix-Umgebung (`new` und `init`).
+/// Options for the Nix environment (`new` and `init`).
 #[derive(Args)]
 struct EnvOpts {
-    /// PHP-Version, z.B. 8.3
+    /// PHP version, e.g. 8.3
     #[arg(long)]
     php: Option<String>,
-    /// Node-Major, z.B. 22
+    /// Node major version, e.g. 22
     #[arg(long)]
     node: Option<String>,
-    /// Python-Version, z.B. 3.12
+    /// Python version, e.g. 3.12
     #[arg(long)]
     python: Option<String>,
-    /// Bestehende flake.nix überschreiben
+    /// Overwrite an existing flake.nix
     #[arg(long)]
     force: bool,
-    /// Umgebung nicht vorab bauen
+    /// Do not build the environment up front
     #[arg(long)]
     no_build: bool,
 }
 
-/// Gibt eine Meldung mit `luggage:` davor aus.
+/// Prints a message prefixed with `luggage:`.
 fn info(msg: &str) {
     println!("luggage: {msg}");
 }
 
-/// Führt ein Kommando aus; `quiet` verschluckt die Ausgabe. Liefert, ob es erfolgreich war.
+/// Runs a command and returns whether it succeeded. `quiet` hides its output.
 fn run(
     cwd: &Path,
     program: &str,
@@ -134,42 +134,42 @@ fn run(
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let status = cmd.status().with_context(|| format!("{program} nicht startbar"))?;
+    let status = cmd.status().with_context(|| format!("cannot start {program}"))?;
     Ok(status.success())
 }
 
-/// Wie `run`, aber Fehler, wenn das Kommando scheitert.
+/// Like `run`, but returns an error if the command fails.
 fn run_ok(cwd: &Path, program: &str, args: &[&str]) -> Result<()> {
     if !run(cwd, program, args, &[], false)? {
-        bail!("fehlgeschlagen: {program} {}", args.join(" "));
+        bail!("failed: {program} {}", args.join(" "));
     }
     Ok(())
 }
 
-/// `$HOME`, sonst das aktuelle Verzeichnis.
+/// `$HOME`, or the current directory if it is not set.
 fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-/// Ersetzt ein führendes `~/` durch `$HOME`.
+/// Replaces a leading `~/` with `$HOME`.
 fn expand_tilde(p: &str) -> PathBuf {
     p.strip_prefix("~/").map_or_else(|| PathBuf::from(p), |rest| home().join(rest))
 }
 
-/// Ob `target` geklont wird: URL, scp-artig (`git@host:pfad`) oder lokales Repo.
+/// Whether `target` gets cloned: a URL, scp-like (`git@host:path`) or a local repo.
 fn is_remote(target: &str) -> bool {
     let scp_like =
         target.split_once(':').is_some_and(|(host, _)| host.contains('@') && !host.contains('/'));
     target.contains("://") || scp_like || expand_tilde(target).join(".git").exists()
 }
 
-/// `git@host:gruppe/name.git` → `name`
+/// `git@host:group/name.git` → `name`
 fn repo_name(target: &str) -> &str {
     let last = target.trim_end_matches('/').rsplit(['/', ':']).next().unwrap_or(target);
     last.strip_suffix(".git").unwrap_or(last)
 }
 
-/// Hängt `entry` (z.B. `.direnv/`) an .gitignore, falls es in keiner Schreibweise drinsteht.
+/// Appends `entry` (e.g. `.direnv/`) to .gitignore. Skips it if any spelling of it is already there.
 fn ensure_ignored(root: &Path, entry: &str, comment: &str) -> Result<()> {
     let path = root.join(".gitignore");
     let content = fs::read_to_string(&path).unwrap_or_default();
@@ -183,55 +183,55 @@ fn ensure_ignored(root: &Path, entry: &str, comment: &str) -> Result<()> {
     Ok(())
 }
 
-/// Was im Projekt erkannt wurde.
+/// What was detected in the project.
 struct Detected {
-    /// PHP, falls erkannt
+    /// PHP, if detected
     php: Option<detect::Php>,
-    /// Node, falls erkannt
+    /// Node, if detected
     node: Option<detect::Node>,
-    /// Python, falls erkannt
+    /// Python, if detected
     python: Option<detect::Python>,
-    /// Rust, falls erkannt
+    /// Rust, if detected
     rust: Option<detect::Rust>,
 }
 
 impl Detected {
-    /// Meldet, was erkannt wurde, samt Warnungen und Zusatzpaketen.
+    /// Reports what was detected, with warnings and extra packages.
     fn report(&self, rustc: Option<(u32, u32)>, extra: &[String]) {
         let with_tool = |tool: Option<&str>| tool.map(|t| format!(" + {t}")).unwrap_or_default();
         if let Some(p) = &self.php {
             let exts = if p.exts.is_empty() {
                 String::new()
             } else {
-                format!(", Extensions: {}", p.exts.join(", "))
+                format!(", extensions: {}", p.exts.join(", "))
             };
             info(&format!("PHP {}.{} ({}){exts}", p.version.0, p.version.1, p.source));
         }
         if let Some(n) = &self.node {
-            let version = n.version.map_or_else(|| "Standard".into(), |v| v.to_string());
+            let version = n.version.map_or_else(|| "default".into(), |v| v.to_string());
             info(&format!("Node {version} ({}){}", n.source, with_tool(n.tool)));
         }
         if let Some(p) = &self.python {
-            let version = p.version.map_or_else(|| "Standard".into(), |(a, b)| format!("{a}.{b}"));
+            let version = p.version.map_or_else(|| "default".into(), |(a, b)| format!("{a}.{b}"));
             info(&format!("Python {version} ({}){}", p.source, with_tool(p.tool)));
         }
         if let Some(r) = &self.rust {
             let have = rustc.map(|(a, b)| format!(" {a}.{b}")).unwrap_or_default();
             info(&format!("Rust{have} (nixpkgs)"));
             for w in &r.warnings {
-                info(&format!("WARNUNG: {w}"));
+                info(&format!("warning: {w}"));
             }
         }
         if !extra.is_empty() {
-            info(&format!("zusätzliche Pakete (Config): {}", extra.join(", ")));
+            info(&format!("extra packages (config): {}", extra.join(", ")));
         }
         if self.php.is_none() && self.node.is_none() && self.python.is_none() && self.rust.is_none()
         {
-            info("keine Sprache erkannt — Pakete in flake.nix unter packages eintragen");
+            info("no language detected — add packages to flake.nix under packages");
         }
     }
 
-    /// Shell-Befehle, die nach dem Bauen die Versionen ausgeben.
+    /// Shell commands that print the versions after the build.
     fn checks(&self) -> String {
         let mut checks: Vec<String> = Vec::new();
         if self.php.is_some() {
@@ -254,17 +254,17 @@ impl Detected {
     }
 }
 
-/// Schreibt flake.nix und .envrc, ergänzt .gitignore, stagt alles und baut die Umgebung.
+/// Writes flake.nix and .envrc, updates .gitignore, stages it all and builds the environment.
 fn setup_env(root: &Path, opts: &EnvOpts, config: &Config) -> Result<()> {
     if !run(root, "git", &["rev-parse", "--git-dir"], &[], true)? {
         bail!(
-            "{} ist kein git-Repo (nix sieht nur getrackte Dateien) — erst git init oder luggage new",
+            "{} is not a git repo (nix only sees tracked files) — run git init or luggage new first",
             root.display()
         );
     }
     let flake_path = root.join("flake.nix");
     if flake_path.exists() && !opts.force {
-        bail!("{} existiert schon (--force überschreibt)", flake_path.display());
+        bail!("{} already exists (--force overwrites it)", flake_path.display());
     }
 
     let nixpkgs = config.nixpkgs();
@@ -279,7 +279,7 @@ fn setup_env(root: &Path, opts: &EnvOpts, config: &Config) -> Result<()> {
     let extra = config.nix.packages.clone().unwrap_or_default();
     found.report(available.rustc, &extra);
 
-    let name = root.file_name().map_or_else(|| "projekt".into(), |n| n.to_string_lossy());
+    let name = root.file_name().map_or_else(|| "project".into(), |n| n.to_string_lossy());
     let memory_limit = config.memory_limit();
     let plan = flake::Plan {
         name: &name,
@@ -293,11 +293,11 @@ fn setup_env(root: &Path, opts: &EnvOpts, config: &Config) -> Result<()> {
     };
     fs::write(&flake_path, flake::render(&plan))?;
     fs::write(root.join(".envrc"), flake::render_envrc(found.python.as_ref()))?;
-    ensure_ignored(root, ".direnv/", "nix-direnv Cache")?;
+    ensure_ignored(root, ".direnv/", "nix-direnv cache")?;
     if found.python.is_some() {
         ensure_ignored(root, ".venv/", "Python venv")?;
     }
-    // erst stagen: nix sieht nur Dateien, die git kennt
+    // stage first: nix only sees files that git knows
     run_ok(root, "git", &["add", "flake.nix", ".envrc", ".gitignore"])?;
     run_ok(root, "nix", &["flake", "lock"])?;
     run_ok(root, "git", &["add", "flake.lock"])?;
@@ -305,37 +305,37 @@ fn setup_env(root: &Path, opts: &EnvOpts, config: &Config) -> Result<()> {
     run_ok(root, "direnv", &["allow", &root_str])?;
 
     if !opts.no_build {
-        info("baue Umgebung (beim ersten Mal kann das dauern) ...");
+        info("building the environment (the first time can take a while) ...");
         run_ok(root, "direnv", &["exec", &root_str, "sh", "-c", &found.checks()])?;
     }
 
-    info(&format!("fertig: {}", root.display()));
-    info("gestaged: flake.nix flake.lock .envrc .gitignore — Commit liegt bei dir");
+    info(&format!("done: {}", root.display()));
+    info("staged: flake.nix flake.lock .envrc .gitignore — committing is up to you");
     Ok(())
 }
 
-/// Argumente von `luggage new` ohne die Umgebungs-Optionen.
+/// Arguments of `luggage new` without the environment options.
 struct NewArgs {
-    /// git-URL, lokaler Repo-Pfad oder Projektname
+    /// Git URL, local repo path or project name
     target: String,
-    /// Zielverzeichnis; `None` heißt Projektordner aus der Config
+    /// Target directory; `None` means the projects directory from the config
     dir: Option<PathBuf>,
-    /// GitLab-Gruppe; `Some` legt ein Projekt an, leer heißt Gruppe aus der Config
+    /// GitLab group; `Some` creates a project, empty means the group from the config
     gitlab: Option<String>,
-    /// GitHub-Owner; `Some` legt ein Repo an, leer heißt Owner aus der Config
+    /// GitHub owner; `Some` creates a repo, empty means the owner from the config
     github: Option<String>,
-    /// GitLab-Host
+    /// GitLab host
     host: Option<String>,
-    /// Sichtbarkeit des neuen Remote-Projekts
+    /// Visibility of the new remote project
     visibility: Option<String>,
 }
 
-/// `None` statt leerem String.
+/// `None` instead of an empty string.
 fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.is_empty())
 }
 
-/// `luggage new`: klont das Repo oder legt ein neues an (optional mit Remote) und richtet die Umgebung ein.
+/// `luggage new`: clones the repo or creates a new one (optionally with a remote). Then sets up the environment.
 fn cmd_new(args: NewArgs, opts: &EnvOpts, config: &Config) -> Result<()> {
     let target = args.target.as_str();
     let remote = is_remote(target);
@@ -343,7 +343,7 @@ fn cmd_new(args: NewArgs, opts: &EnvOpts, config: &Config) -> Result<()> {
     let dir = args.dir.unwrap_or_else(|| expand_tilde(&config.projects_dir()));
     let root = dir.join(name);
     if root.exists() {
-        bail!("{} existiert schon — dort luggage init benutzen", root.display());
+        bail!("{} already exists — use luggage init there", root.display());
     }
 
     let forge = match (args.gitlab, args.github) {
@@ -365,7 +365,7 @@ fn cmd_new(args: NewArgs, opts: &EnvOpts, config: &Config) -> Result<()> {
 
     if remote {
         if forge.is_some() {
-            bail!("--gitlab/--github nur ohne URL (legt ein neues Projekt an)");
+            bail!("--gitlab/--github only work without a URL (they create a new project)");
         }
         let source = expand_tilde(target);
         let source =
@@ -382,19 +382,16 @@ fn cmd_new(args: NewArgs, opts: &EnvOpts, config: &Config) -> Result<()> {
     setup_env(&root, opts, config)
 }
 
-/// `luggage config`: zeigt die wirksame Config oder legt mit `init` die Vorlage an.
+/// `luggage config`: shows the effective config, or creates the template with `init`.
 fn cmd_config(init: bool) -> Result<()> {
     if init {
         let path = config::init()?;
-        info(&format!("Vorlage geschrieben: {}", path.display()));
+        info(&format!("template written: {}", path.display()));
         return Ok(());
     }
     let path = config::path();
-    let state = if path.exists() {
-        ""
-    } else {
-        " (nicht vorhanden — `luggage config --init` legt sie an)"
-    };
+    let state =
+        if path.exists() { "" } else { " (missing — `luggage config --init` creates it)" };
     println!("# {}{state}", path.display());
     let rows = config::load()?.describe();
     let width = rows.iter().map(|(k, _, _)| k.len()).max().unwrap_or(0);
@@ -404,7 +401,7 @@ fn cmd_config(init: bool) -> Result<()> {
     Ok(())
 }
 
-/// Führt den Unterbefehl aus.
+/// Runs the subcommand.
 fn dispatch(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Config { init } => cmd_config(init),
@@ -415,16 +412,16 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::Init { path, env } => setup_env(&std::path::absolute(&path)?, &env, &config::load()?),
         Cmd::Run { net, cmd } => {
             let nixpkgs = config::load()?.nixpkgs();
-            truhe::Truhe::find(&nixpkgs, false)?.cmd_run(net, &cmd, &nixpkgs)
+            chest::Chest::find(&nixpkgs, false)?.cmd_run(net, &cmd, &nixpkgs)
         }
         Cmd::Up => {
             let nixpkgs = config::load()?.nixpkgs();
-            truhe::Truhe::find(&nixpkgs, false)?.cmd_up(&nixpkgs)
+            chest::Chest::find(&nixpkgs, false)?.cmd_up(&nixpkgs)
         }
-        Cmd::Exec { cmd } => truhe::Truhe::find(&config::load()?.nixpkgs(), false)?.cmd_exec(&cmd),
-        Cmd::Open => truhe::Truhe::find(&config::load()?.nixpkgs(), false)?.cmd_open(),
-        Cmd::Down => truhe::Truhe::find(&config::load()?.nixpkgs(), true)?.cmd_down(),
-        Cmd::Status => truhe::Truhe::find(&config::load()?.nixpkgs(), false)?.cmd_status(),
+        Cmd::Exec { cmd } => chest::Chest::find(&config::load()?.nixpkgs(), false)?.cmd_exec(&cmd),
+        Cmd::Open => chest::Chest::find(&config::load()?.nixpkgs(), false)?.cmd_open(),
+        Cmd::Down => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_down(),
+        Cmd::Status => chest::Chest::find(&config::load()?.nixpkgs(), false)?.cmd_status(),
     }
 }
 
@@ -446,7 +443,7 @@ mod tests {
     fn detects_remote_targets() {
         assert!(is_remote("https://gitlab.example.com/team/nyx.git"));
         assert!(is_remote("git@gitlab.example.com:team/nyx.git"));
-        assert!(!is_remote("mein-projekt"));
+        assert!(!is_remote("my-project"));
     }
 
     #[test]
@@ -461,10 +458,10 @@ mod tests {
     fn gitignore_entries_added_once() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".gitignore"), "/vendor\n/.venv").unwrap();
-        ensure_ignored(dir.path(), ".direnv/", "nix-direnv Cache").unwrap();
-        ensure_ignored(dir.path(), ".direnv/", "nix-direnv Cache").unwrap();
+        ensure_ignored(dir.path(), ".direnv/", "nix-direnv cache").unwrap();
+        ensure_ignored(dir.path(), ".direnv/", "nix-direnv cache").unwrap();
         ensure_ignored(dir.path(), ".venv/", "Python venv").unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content, "/vendor\n/.venv\n\n# nix-direnv Cache\n.direnv/\n");
+        assert_eq!(content, "/vendor\n/.venv\n\n# nix-direnv cache\n.direnv/\n");
     }
 }

@@ -1,11 +1,11 @@
 # luggage
 
-Projekt klonen oder anlegen und dabei gleich die passende Entwicklungsumgebung einrichten:
-PHP, Node, Python und Rust samt Composer, pnpm/yarn und uv/poetry in genau der Version,
-die das Projekt braucht — per [Nix](https://nixos.org) und [direnv](https://direnv.net), auf jeder Linux-Distribution.
+Clone or create a project and set up the right development environment right away:
+PHP, Node, Python and Rust with Composer, pnpm/yarn and uv/poetry in exactly the version
+the project needs — via [Nix](https://nixos.org) and [direnv](https://direnv.net), on any Linux distribution.
 
-Wie die Truhe aus der Scheibenwelt: Sie folgt dir überallhin und hat immer das Richtige dabei.
-`cd` ins Projekt lädt die Umgebung, `cd` hinaus entlädt sie.
+Like the Luggage from Discworld: it follows you everywhere and always has the right things with it.
+`cd` into the project loads the environment, `cd` out unloads it.
 
 ## Installation
 
@@ -13,58 +13,58 @@ Wie die Truhe aus der Scheibenwelt: Sie folgt dir überallhin und hat immer das 
 cargo install luggage-env
 ```
 
-Das Binary heißt `luggage`. Alternativ: statisches Linux-Binary von den
+The binary is called `luggage`. Alternatively: a static Linux binary from the
 [Releases](https://github.com/elmar-roeser/luggage/releases).
 
-### Voraussetzungen
+### Requirements
 
-- [Nix](https://nixos.org/download) mit aktivierten Flakes (`experimental-features = nix-command flakes`)
-- [direnv](https://direnv.net) mit Shell-Hook und [nix-direnv](https://github.com/nix-community/nix-direnv)
-- `git`; für `--gitlab` zusätzlich [`glab`](https://gitlab.com/gitlab-org/cli), für `--github` [`gh`](https://cli.github.com) (jeweils angemeldet)
-- für die Truhe: `bwrap` ([bubblewrap](https://github.com/containers/bubblewrap)), `unshare`, `nsenter`, `setsid` (util-linux) und `ip` (iproute2)
+- [Nix](https://nixos.org/download) with flakes enabled (`experimental-features = nix-command flakes`)
+- [direnv](https://direnv.net) with its shell hook and [nix-direnv](https://github.com/nix-community/nix-direnv)
+- `git`; for `--gitlab` also [`glab`](https://gitlab.com/gitlab-org/cli), for `--github` [`gh`](https://cli.github.com) (each logged in)
+- for the chest: `bwrap` ([bubblewrap](https://github.com/containers/bubblewrap)), `unshare`, `nsenter`, `setsid` (util-linux) and `ip` (iproute2)
 
-## Benutzung
+## Usage
 
 ```bash
-# Bestehendes Repo klonen (Standard: ~/projects/<name>)
+# Clone an existing repo (default: ~/projects/<name>)
 luggage new git@github.com:user/app.git
 
-# Neues Projekt anlegen, optional mit Remote-Projekt (Standard: privat)
-luggage new meine-app
-luggage new meine-app --gitlab meine-gruppe [--host gitlab.example.com]
-luggage new meine-app --github [meine-org] [--visibility public]
+# Create a new project, optionally with a remote project (default: private)
+luggage new my-app
+luggage new my-app --gitlab my-group [--host gitlab.example.com]
+luggage new my-app --github [my-org] [--visibility public]
 
-# Umgebung in einem vorhandenen Repo einrichten
+# Set up the environment in an existing repo
 luggage init
 ```
 
-Gemeinsame Optionen: `--php 8.3`, `--node 22`, `--python 3.12`, `--force` (vorhandene
-`flake.nix` überschreiben), `--no-build` (Umgebung nicht vorab bauen), bei `new` außerdem
+Shared options: `--php 8.3`, `--node 22`, `--python 3.12`, `--force` (overwrite an existing
+`flake.nix`), `--no-build` (do not build the environment in advance), and for `new` also
 `--dir DIR`.
 
-GitHub-Repos bekommen ein SSH-Remote (`git@github.com:…`). Ohne `--host` und ohne
-`gitlab.host` in der Config benutzt `--gitlab` den Standard-Host von glab.
+GitHub repos get an SSH remote (`git@github.com:…`). Without `--host` and without
+`gitlab.host` in the config, `--gitlab` uses the default host of glab.
 
 ## Config
 
-`luggage config` zeigt die wirksamen Einstellungen und woher sie kommen,
-`luggage config --init` legt eine kommentierte Vorlage unter
-`~/.config/luggage/config.toml` an. Reihenfolge: Kommandozeile vor Config vor Standard.
+`luggage config` shows the effective settings and where they come from.
+`luggage config --init` creates a commented template at
+`~/.config/luggage/config.toml`. Order: command line beats config, config beats default.
 
 ```toml
 projects_dir = "~/projects"
 
 [nix]
 nixpkgs = "github:NixOS/nixpkgs/nixos-26.05"
-packages = ["just"]            # in jede Umgebung
+packages = ["just"]            # in every environment
 
 [gitlab]
 host = "gitlab.example.com"
-group = "meine-gruppe"
+group = "my-group"
 visibility = "private"         # private | internal | public
 
 [github]
-owner = "meine-org"
+owner = "my-org"
 visibility = "private"
 
 [php]
@@ -79,89 +79,89 @@ default = 24
 default = "3.13"
 ```
 
-Unbekannte Schlüssel sind ein Fehler, damit Tippfehler nicht still wirkungslos bleiben.
+Unknown keys are an error, so typos do not silently have no effect.
 
-## Was erkannt wird
+## What is detected
 
-| | Quelle, in dieser Reihenfolge |
+| | Source, in this order |
 |---|---|
-| PHP-Version | `--php`, `config.platform.php`, Untergrenze von `require.php`, Config, sonst nixpkgs-Standard |
-| PHP-Extensions | alle `ext-*` aus `require` und `require-dev`, dazu `php.extensions` aus der Config |
-| Node-Version | `--node`, `.nvmrc` / `.node-version`, `engines.node`, Config, sonst nixpkgs-Standard |
-| Paketmanager | `pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn |
-| Python-Version | `--python`, `.python-version`, Untergrenze von `requires-python` bzw. `tool.poetry.dependencies.python`, Config, sonst nixpkgs-Standard |
-| Python-Werkzeug | `uv.lock` → uv, `poetry.lock` oder `[tool.poetry]` → poetry, sonst bei `pyproject.toml` uv |
-| Rust | `Cargo.toml` → rustc, cargo, clippy, rustfmt, rust-analyzer aus nixpkgs |
+| PHP version | `--php`, `config.platform.php`, lower bound of `require.php`, config, else the nixpkgs default |
+| PHP extensions | all `ext-*` from `require` and `require-dev`, plus `php.extensions` from the config |
+| Node version | `--node`, `.nvmrc` / `.node-version`, `engines.node`, config, else the nixpkgs default |
+| Package manager | `pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn |
+| Python version | `--python`, `.python-version`, lower bound of `requires-python` or `tool.poetry.dependencies.python`, config, else the nixpkgs default |
+| Python tool | `uv.lock` → uv, `poetry.lock` or `[tool.poetry]` → poetry, else uv if there is a `pyproject.toml` |
+| Rust | `Cargo.toml` → rustc, cargo, clippy, rustfmt, rust-analyzer from nixpkgs |
 
-Welche Versionen es gibt, fragt luggage beim Channel ab (einen Tag zwischengespeichert
-unter `~/.cache/luggage/`). Gewählt wird jeweils die kleinste verfügbare Version, die die
-Anforderung erfüllt. Extensions, die nixpkgs nicht kennt, werden beim Bauen gemeldet statt
-still ignoriert.
+luggage asks the channel which versions exist (cached for one day
+in `~/.cache/luggage/`). It always picks the lowest available version that meets the
+requirement. Extensions that nixpkgs does not know are reported during the build instead of
+being silently ignored.
 
-**Python:** Pakete landen wie gewohnt per uv/poetry in `.venv` im Projekt; direnv aktiviert
-sie. uv und poetry werden auf das Nix-Python festgelegt.
+**Python:** Packages go into `.venv` in the project via uv/poetry, as usual; direnv activates
+them. uv and poetry are pinned to the Nix Python.
 
-**Rust:** Es gibt nur die Rust-Version des Channels. Eine `rust-toolchain.toml` wird
-ignoriert, eine höhere `rust-version` in `Cargo.toml` gemeldet.
+**Rust:** Only the Rust version of the channel is available. A `rust-toolchain.toml` is
+ignored; a higher `rust-version` in `Cargo.toml` is reported.
 
-## Was luggage schreibt
+## What luggage writes
 
-- `flake.nix` mit einer `devShell` und `.envrc` (`use flake`, bei Python mit `.venv`)
-- `.direnv/` (und bei Python `.venv/`) in `.gitignore`
-- `flake.lock` über `nix flake lock`
+- `flake.nix` with a `devShell`, and `.envrc` (`use flake`, with `.venv` for Python)
+- `.direnv/` (and `.venv/` for Python) in `.gitignore`
+- `flake.lock` via `nix flake lock`
 
-Alle Dateien werden gestaged (Nix sieht nur Dateien, die git kennt), aber **nicht committet**.
+All files are staged (Nix only sees files that git knows), but **not committed**.
 
-## Die Truhe
+## The chest
 
-Die Truhe ist das Projekt in einer abgeschotteten Umgebung: eigenes Home, eigene Dienste,
-eigenes Netz — ohne Docker und ohne root. Sie sieht nur das Projekt und den Nix-Store;
-`~/.ssh`, Zugangsdaten und andere Projekte bleiben draußen. Die IDE bleibt draußen.
+The chest is the project in an isolated environment: its own home, its own services,
+its own network — without Docker and without root. It only sees the project and the Nix store;
+`~/.ssh`, credentials and other projects stay outside. The IDE stays outside too.
 
 ```bash
-luggage run --net composer install   # einmaliger Befehl, --net erlaubt Internet
-luggage up                           # Dienste im Hintergrund starten, wartet bis sie bereit sind
-luggage status                       # läuft sie? wie geht es den Diensten?
-luggage exec php bin/console about   # Befehl in der laufenden Truhe
-luggage open                         # Shell in der laufenden Truhe
+luggage run --net composer install   # one-off command, --net allows internet access
+luggage up                           # start services in the background, waits until they are ready
+luggage status                       # is it running? how are the services doing?
+luggage exec php bin/console about   # command in the running chest
+luggage open                         # shell in the running chest
 luggage down
 ```
 
-Welche Dienste gebraucht werden, liest luggage aus der `compose.yaml` (bzw.
-`docker-compose.yml`) des Projekts. Übernommen werden MariaDB, PostgreSQL, Redis/Valkey
-und Mailpit/Mailhog: in der Version aus dem Image-Tag (sonst die nächsthöhere aus nixpkgs),
-mit Datenbank und Benutzer aus `environment` und dem Compose-Dienstnamen als Hostnamen.
-Eine `.env` mit `DATABASE_URL=mysql://app:app@database:3306/app` passt damit unverändert.
-Alles andere (eigene Images, nginx, PHP) meldet `luggage status` als nicht übernommen.
+luggage reads which services are needed from the project's `compose.yaml` (or
+`docker-compose.yml`). It takes over MariaDB, PostgreSQL, Redis/Valkey
+and Mailpit/Mailhog: in the version from the image tag (else the next higher one from nixpkgs),
+with the database and user from `environment`, and the Compose service name as host name.
+So a `.env` with `DATABASE_URL=mysql://app:app@database:3306/app` works unchanged.
+`luggage status` lists everything else (custom images, nginx, PHP) as skipped.
 
-Ergänzen lässt sich das mit einer `truhe.toml` in `.luggage/` im Projekt oder, falls das
-Team-Repo tabu ist, in `~/.config/luggage/truhen/<projekt>/`. Ein Dienst mit gleichem Namen
-ersetzt den erkannten. Das Verzeichnis der Datei ist in der Truhe unter `/truhe` lesbar
-(z.B. für eine Caddyfile).
+You can extend this with a `chest.toml` in `.luggage/` in the project or, if the
+team repo is off limits, in `~/.config/luggage/chests/<project>/`. A service with the same name
+replaces the detected one. The directory of the file is readable in the chest at `/chest`
+(e.g. for a Caddyfile).
 
 ```toml
-ignore = ["mailer"]         # erkannte Compose-Dienste nicht übernehmen
-hosts = ["api.local"]       # zeigen in der Truhe auf 127.0.0.1
-packages = ["curl"]         # zusätzliche nixpkgs-Pakete, hier für die ready-Prüfung
+ignore = ["mailer"]         # skip these detected Compose services
+hosts = ["api.local"]       # point to 127.0.0.1 in the chest
+packages = ["curl"]         # extra nixpkgs packages, here for the ready check
 
 [services.web]
 command = "exec php -S 127.0.0.1:80 -t public"
 depends_on = ["database-setup"]
 ready = "curl -sf http://127.0.0.1/"
-ready_timeout = 60          # Sekunden (Standard)
+ready_timeout = 60          # seconds (default)
 
 [services.cache-warmup]
 command = "php bin/console cache:warmup"
-once = true                 # läuft einmal durch, Abhängige warten auf Erfolg
+once = true                 # runs once to the end, dependents wait for success
 ```
 
-In der Truhe liegen Daten unter `/data` und Sockets unter `/run/luggage`. Ports unter 1024
-sind erlaubt, gelten aber nur in der Truhe. Außerhalb liegen Home und Daten unter
-`~/.local/share/luggage/truhen/<projekt>/`, Laufzeitdateien unter `$XDG_RUNTIME_DIR/luggage/<projekt>/`.
+In the chest, data lives in `/data` and sockets in `/run/luggage`. Ports below 1024
+are allowed, but only apply inside the chest. Outside, home and data live in
+`~/.local/share/luggage/chests/<project>/`, runtime files in `$XDG_RUNTIME_DIR/luggage/<project>/`.
 
-Die Truhe schützt gegen Versehen, Install-Skripte und neugierige Agenten, ist aber keine
-harte Sicherheitsgrenze (gleiche UID, kein seccomp).
+The chest protects against mistakes, install scripts and curious agents, but it is not a
+hard security boundary (same UID, no seccomp).
 
-## Lizenz
+## License
 
-MIT oder Apache-2.0, nach Wahl.
+MIT or Apache-2.0, at your option.

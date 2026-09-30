@@ -1,4 +1,4 @@
-//! Benutzer-Config (`~/.config/luggage/config.toml`) mit eingebauten Standardwerten.
+//! User config (`~/.config/luggage/config.toml`) with built-in defaults.
 
 use std::fs;
 use std::path::PathBuf;
@@ -8,96 +8,96 @@ use serde::Deserialize;
 
 use crate::home;
 
-/// nixpkgs-Channel, wenn nichts anderes gesetzt ist.
+/// The nixpkgs channel when nothing else is set.
 pub const DEFAULT_NIXPKGS: &str = "github:NixOS/nixpkgs/nixos-26.05";
-/// Wohin `luggage new` klont bzw. anlegt, wenn nichts gesetzt ist.
+/// Where `luggage new` clones or creates projects when nothing is set.
 const DEFAULT_PROJECTS_DIR: &str = "~/projects";
-/// PHP-`memory_limit`, wenn nichts gesetzt ist.
+/// The PHP `memory_limit` when nothing is set.
 const DEFAULT_MEMORY_LIMIT: &str = "512M";
-/// Sichtbarkeit neuer Remote-Projekte, wenn nichts gesetzt ist.
+/// The visibility of new remote projects when nothing is set.
 const DEFAULT_VISIBILITY: &str = "private";
 
-/// Rohform der Datei; `None` heißt: nicht gesetzt, Standard gilt.
+/// The raw form of the file; `None` means not set, so the default applies.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Wohin `luggage new` klont bzw. anlegt
+    /// Where `luggage new` clones or creates projects
     pub projects_dir: Option<String>,
-    /// Abschnitt `[nix]`
+    /// Section `[nix]`
     pub nix: NixConfig,
-    /// Abschnitt `[gitlab]`
+    /// Section `[gitlab]`
     pub gitlab: GitlabConfig,
-    /// Abschnitt `[github]`
+    /// Section `[github]`
     pub github: GithubConfig,
-    /// Abschnitt `[php]`
+    /// Section `[php]`
     pub php: PhpConfig,
-    /// Abschnitt `[node]`
+    /// Section `[node]`
     pub node: NodeConfig,
-    /// Abschnitt `[python]`
+    /// Section `[python]`
     pub python: PythonConfig,
 }
 
-/// Abschnitt `[nix]` der Config.
+/// Section `[nix]` of the config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NixConfig {
-    /// Channel für neue Flakes
+    /// Channel for new flakes
     pub nixpkgs: Option<String>,
-    /// Pakete, die in jede Umgebung kommen
+    /// Packages that go into every environment
     pub packages: Option<Vec<String>>,
 }
 
-/// Abschnitt `[gitlab]` der Config.
+/// Section `[gitlab]` of the config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GitlabConfig {
-    /// GitLab-Host; ohne Angabe der Standard-Host von glab
+    /// GitLab host; if unset, the default host of glab
     pub host: Option<String>,
-    /// Gruppe für `--gitlab` ohne Gruppe
+    /// Group for `--gitlab` without a group
     pub group: Option<String>,
-    /// Sichtbarkeit neuer GitLab-Projekte
+    /// Visibility of new GitLab projects
     pub visibility: Option<String>,
 }
 
-/// Abschnitt `[github]` der Config.
+/// Section `[github]` of the config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GithubConfig {
-    /// Besitzer neuer Repos; ohne Angabe der angemeldete gh-Account
+    /// Owner of new repos; if unset, the logged-in gh account
     pub owner: Option<String>,
-    /// Sichtbarkeit neuer GitHub-Repos
+    /// Visibility of new GitHub repos
     pub visibility: Option<String>,
 }
 
-/// Abschnitt `[php]` der Config.
+/// Section `[php]` of the config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PhpConfig {
-    /// PHP-Version, wenn composer.json nichts vorgibt
+    /// PHP version if `composer.json` does not set one
     pub default: Option<String>,
-    /// PHP-`memory_limit`
+    /// PHP `memory_limit`
     pub memory_limit: Option<String>,
-    /// Extensions zusätzlich zu den `ext-*` aus composer.json
+    /// Extensions in addition to the `ext-*` from `composer.json`
     pub extensions: Option<Vec<String>>,
 }
 
-/// Abschnitt `[node]` der Config.
+/// Section `[node]` of the config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
-    /// Node-Hauptversion, wenn package.json/.nvmrc nichts vorgeben
+    /// Node major version if `package.json`/`.nvmrc` do not set one
     pub default: Option<u32>,
 }
 
-/// Abschnitt `[python]` der Config.
+/// Section `[python]` of the config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PythonConfig {
-    /// Python-Version, wenn .python-version/pyproject.toml nichts vorgeben
+    /// Python version if `.python-version`/`pyproject.toml` do not set one
     pub default: Option<String>,
 }
 
-/// Pfad der Config-Datei; beachtet `XDG_CONFIG_HOME`.
+/// Path of the config file; respects `XDG_CONFIG_HOME`.
 pub fn path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
@@ -105,17 +105,17 @@ pub fn path() -> PathBuf {
         .join("luggage/config.toml")
 }
 
-/// Liest die Config; eine fehlende Datei ist kein Fehler.
+/// Reads the config; a missing file is not an error.
 pub fn load() -> Result<Config> {
     let path = path();
     match fs::read_to_string(&path) {
-        Ok(text) => parse(&text).with_context(|| format!("Config {} fehlerhaft", path.display())),
+        Ok(text) => parse(&text).with_context(|| format!("config {} is invalid", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(e).with_context(|| format!("Config {} nicht lesbar", path.display())),
+        Err(e) => Err(e).with_context(|| format!("config {} is not readable", path.display())),
     }
 }
 
-/// Parst den TOML-Text und prüft die Sichtbarkeiten.
+/// Parses the TOML text and checks the visibilities.
 fn parse(text: &str) -> Result<Config> {
     let config: Config = toml::from_str(text)?;
     for v in [&config.gitlab.visibility, &config.github.visibility].into_iter().flatten() {
@@ -124,41 +124,41 @@ fn parse(text: &str) -> Result<Config> {
     Ok(config)
 }
 
-/// Prüft, dass `v` private, internal oder public ist.
+/// Checks that `v` is private, internal or public.
 pub fn check_visibility(v: &str) -> Result<()> {
     if !matches!(v, "private" | "internal" | "public") {
-        bail!("visibility \"{v}\" ungültig (private | internal | public)");
+        bail!("visibility \"{v}\" is invalid (private | internal | public)");
     }
     Ok(())
 }
 
 impl Config {
-    /// Projektverzeichnis aus der Config, sonst Standard.
+    /// Projects directory from the config, else the default.
     pub fn projects_dir(&self) -> String {
         self.projects_dir.clone().unwrap_or_else(|| DEFAULT_PROJECTS_DIR.into())
     }
 
-    /// nixpkgs-Channel aus der Config, sonst Standard.
+    /// The nixpkgs channel from the config, else the default.
     pub fn nixpkgs(&self) -> String {
         self.nix.nixpkgs.clone().unwrap_or_else(|| DEFAULT_NIXPKGS.into())
     }
 
-    /// PHP-`memory_limit` aus der Config, sonst Standard.
+    /// The PHP `memory_limit` from the config, else the default.
     pub fn memory_limit(&self) -> String {
         self.php.memory_limit.clone().unwrap_or_else(|| DEFAULT_MEMORY_LIMIT.into())
     }
 
-    /// GitLab-Sichtbarkeit aus der Config, sonst Standard.
+    /// GitLab visibility from the config, else the default.
     pub fn gitlab_visibility(&self) -> String {
         self.gitlab.visibility.clone().unwrap_or_else(|| DEFAULT_VISIBILITY.into())
     }
 
-    /// GitHub-Sichtbarkeit aus der Config, sonst Standard.
+    /// GitHub visibility from the config, else the default.
     pub fn github_visibility(&self) -> String {
         self.github.visibility.clone().unwrap_or_else(|| DEFAULT_VISIBILITY.into())
     }
 
-    /// Wirksame Werte mit Herkunft, für `luggage config`.
+    /// Effective values with their source, for `luggage config`.
     pub fn describe(&self) -> Vec<(&'static str, String, &'static str)> {
         fn row<T: std::fmt::Debug>(
             key: &'static str,
@@ -166,80 +166,80 @@ impl Config {
             fallback: &str,
         ) -> (&'static str, String, &'static str) {
             match set {
-                Some(v) => (key, format!("{v:?}"), "Config"),
-                None => (key, fallback.into(), "Standard"),
+                Some(v) => (key, format!("{v:?}"), "config"),
+                None => (key, fallback.into(), "default"),
             }
         }
         vec![
             row("projects_dir", self.projects_dir.as_ref(), &format!("{DEFAULT_PROJECTS_DIR:?}")),
             row("nix.nixpkgs", self.nix.nixpkgs.as_ref(), &format!("{DEFAULT_NIXPKGS:?}")),
             row("nix.packages", self.nix.packages.as_ref(), "[]"),
-            row("gitlab.host", self.gitlab.host.as_ref(), "(Standard-Host von glab)"),
-            row("gitlab.group", self.gitlab.group.as_ref(), "(eigener Namespace)"),
+            row("gitlab.host", self.gitlab.host.as_ref(), "(default host of glab)"),
+            row("gitlab.group", self.gitlab.group.as_ref(), "(own namespace)"),
             row(
                 "gitlab.visibility",
                 self.gitlab.visibility.as_ref(),
                 &format!("{DEFAULT_VISIBILITY:?}"),
             ),
-            row("github.owner", self.github.owner.as_ref(), "(angemeldeter gh-Account)"),
+            row("github.owner", self.github.owner.as_ref(), "(logged-in gh account)"),
             row(
                 "github.visibility",
                 self.github.visibility.as_ref(),
                 &format!("{DEFAULT_VISIBILITY:?}"),
             ),
-            row("php.default", self.php.default.as_ref(), "(Standard-PHP des Channels)"),
+            row("php.default", self.php.default.as_ref(), "(default PHP of the channel)"),
             row(
                 "php.memory_limit",
                 self.php.memory_limit.as_ref(),
                 &format!("{DEFAULT_MEMORY_LIMIT:?}"),
             ),
             row("php.extensions", self.php.extensions.as_ref(), "[]"),
-            row("node.default", self.node.default.as_ref(), "(Standard-Node des Channels)"),
-            row("python.default", self.python.default.as_ref(), "(Standard-Python des Channels)"),
+            row("node.default", self.node.default.as_ref(), "(default Node of the channel)"),
+            row("python.default", self.python.default.as_ref(), "(default Python of the channel)"),
         ]
     }
 }
 
-/// Vorlage, die [`init`] schreibt.
-/// Muss gültig parsen; ein Test prüft das.
-pub const TEMPLATE: &str = r#"# luggage — Benutzer-Config. Auskommentierte Zeilen zeigen den eingebauten Standard.
-# Reihenfolge: Kommandozeile vor dieser Datei vor Standard.
+/// Template that [`init`] writes.
+/// It must parse; a test checks this.
+pub const TEMPLATE: &str = r#"# luggage — user config. Commented-out lines show the built-in default.
+# Order: command line beats this file, this file beats the default.
 
-# Wohin `luggage new` klont bzw. anlegt
+# Where `luggage new` clones or creates projects
 # projects_dir = "~/projects"
 
 [nix]
-# Channel für neue Flakes; bestimmt auch, welche Versionen verfügbar sind
+# Channel for new flakes; also decides which versions are available
 # nixpkgs = "github:NixOS/nixpkgs/nixos-26.05"
-# Pakete, die in jede Umgebung kommen, z.B. ["just", "jq"]
+# Packages that go into every environment, e.g. ["just", "jq"]
 # packages = []
 
 [gitlab]
-# host = "gitlab.example.com"   # ohne Angabe: Standard-Host von glab
-# group = "meine-gruppe"        # Standard für --gitlab ohne Gruppe
+# host = "gitlab.example.com"   # if unset: default host of glab
+# group = "my-group"            # default for --gitlab without a group
 # visibility = "private"        # private | internal | public
 
 [github]
-# owner = "meine-org"           # ohne Angabe: angemeldeter gh-Account
+# owner = "my-org"              # if unset: logged-in gh account
 # visibility = "private"        # private | internal | public
 
 [php]
-# default = "8.4"               # wenn composer.json nichts vorgibt
+# default = "8.4"               # if composer.json does not set one
 # memory_limit = "512M"
-# extensions = ["xdebug"]       # zusätzlich zu den ext-* aus composer.json
+# extensions = ["xdebug"]       # in addition to the ext-* from composer.json
 
 [node]
-# default = 24                  # wenn package.json/.nvmrc nichts vorgeben
+# default = 24                  # if package.json/.nvmrc do not set one
 
 [python]
-# default = "3.13"              # wenn .python-version/pyproject.toml nichts vorgeben
+# default = "3.13"              # if .python-version/pyproject.toml do not set one
 "#;
 
-/// Schreibt die Vorlage; eine vorhandene Datei bleibt unangetastet.
+/// Writes the template; an existing file stays untouched.
 pub fn init() -> Result<PathBuf> {
     let path = path();
     if path.exists() {
-        bail!("{} existiert schon", path.display());
+        bail!("{} already exists", path.display());
     }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;

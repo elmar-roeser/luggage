@@ -1,4 +1,4 @@
-//! Erkennt PHP, Node, Python und Rust aus den Projektdateien.
+//! Detects PHP, Node, Python and Rust from the project files.
 
 use std::fs;
 use std::path::Path;
@@ -9,71 +9,71 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::versions::Available;
 
-/// Fest einkompiliert, kein eigenes nixpkgs-Attribut.
+/// PHP extensions that are compiled in and have no nixpkgs attribute of their own.
 const PHP_BUILTIN_EXTS: &[&str] =
     &["core", "date", "hash", "json", "pcre", "random", "reflection", "spl", "standard", "libxml"];
 
-/// Erkannte PHP-Umgebung.
+/// Detected PHP environment.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Php {
-    /// `(major, minor)`, z.B. `(8, 3)`
+    /// `(major, minor)`, e.g. `(8, 3)`
     pub version: (u32, u32),
-    /// Woher die Version kommt, z.B. `config.platform.php`
+    /// Where the version comes from, e.g. `config.platform.php`
     pub source: &'static str,
-    /// Extensions ohne `ext-`, sortiert; fest einkompilierte fehlen
+    /// Extensions without `ext-`, sorted; compiled-in ones are left out
     pub exts: Vec<String>,
 }
 
-/// Erkannte Node-Umgebung.
+/// Detected Node environment.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Node {
-    /// `None` heißt: Standard-Node des Channels.
+    /// `None` means the channel's default Node.
     pub version: Option<u32>,
-    /// Woher die Version kommt, z.B. `.nvmrc`
+    /// Where the version comes from, e.g. `.nvmrc`
     pub source: &'static str,
-    /// `pnpm` oder `yarn`, erkannt an der Lock-Datei
+    /// `pnpm` or `yarn`, detected from the lock file
     pub tool: Option<&'static str>,
 }
 
-/// Erkannte Python-Umgebung.
+/// Detected Python environment.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Python {
-    /// `None` heißt: Standard-Python des Channels.
+    /// `None` means the channel's default Python.
     pub version: Option<(u32, u32)>,
-    /// Woher die Version kommt, z.B. `.python-version`
+    /// Where the version comes from, e.g. `.python-version`
     pub source: &'static str,
-    /// `uv` oder `poetry`; mit pyproject.toml, aber ohne Lock-Datei: `uv`
+    /// `uv` or `poetry`; with pyproject.toml but no lock file: `uv`
     pub tool: Option<&'static str>,
 }
 
-/// Erkanntes Rust-Projekt (Cargo.toml vorhanden).
+/// Detected Rust project (Cargo.toml exists).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rust {
-    /// Hinweise, z.B. ignorierte rust-toolchain.toml
+    /// Notes, e.g. an ignored rust-toolchain.toml
     pub warnings: Vec<String>,
 }
 
-/// Alles, was die Erkennung braucht.
+/// Everything the detection needs.
 pub struct Ctx<'a> {
-    /// Projektverzeichnis
+    /// Project directory
     pub root: &'a Path,
-    /// Versionen, die der Channel anbietet
+    /// Versions the channel offers
     pub available: &'a Available,
-    /// Geladene Config
+    /// Loaded config
     pub config: &'a Config,
 }
 
-/// Liest eine JSON-Datei; `None`, wenn sie fehlt oder kaputt ist.
+/// Reads a JSON file; `None` if it is missing or broken.
 fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-/// Liest eine TOML-Datei; `None`, wenn sie fehlt oder kaputt ist.
+/// Reads a TOML file; `None` if it is missing or broken.
 fn read_toml(path: &Path) -> Option<toml::Table> {
     fs::read_to_string(path).ok()?.parse().ok()
 }
 
-/// Alle `major.minor`-Paare, z.B. `"^8.4 || ^9.0"` → `[(8, 4), (9, 0)]`.
+/// All `major.minor` pairs, e.g. `"^8.4 || ^9.0"` → `[(8, 4), (9, 0)]`.
 fn versions_in(constraint: &str) -> Vec<(u32, u32)> {
     constraint
         .split(|c: char| !c.is_ascii_digit() && c != '.')
@@ -84,30 +84,30 @@ fn versions_in(constraint: &str) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Erste Zahl im Text, z.B. `v22.1` → 22.
+/// First number in the text, e.g. `v22.1` → 22.
 fn first_number(s: &str) -> Option<u32> {
     s.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty())?.parse().ok()
 }
 
-/// Kleinste verfügbare Version, die mindestens `wanted` ist; sonst die größte.
+/// Smallest available version that is at least `wanted`; else the largest.
 pub fn pick<T: Ord + Copy>(available: &[T], wanted: T) -> Option<T> {
     available.iter().copied().find(|v| *v >= wanted).or_else(|| available.last().copied())
 }
 
-/// Versionen für Meldungen, z.B. `8.3, 8.4`.
+/// Versions for messages, e.g. `8.3, 8.4`.
 fn list(versions: &[(u32, u32)]) -> String {
     versions.iter().map(|(a, b)| format!("{a}.{b}")).collect::<Vec<_>>().join(", ")
 }
 
-/// Genau die verlangte Version (für `--php` usw.); Fehler, wenn der Channel sie nicht hat.
+/// Exactly the requested version (for `--php` etc.). Fails if the channel does not have it.
 fn exact(available: &[(u32, u32)], wanted: &str, what: &str) -> Result<(u32, u32)> {
     match versions_in(wanted).first() {
         Some(v) if available.contains(v) => Ok(*v),
-        _ => bail!("{what} {wanted} nicht verfügbar ({})", list(available)),
+        _ => bail!("{what} {wanted} not available ({})", list(available)),
     }
 }
 
-/// `--php` gewinnt, dann `config.platform.php`, Untergrenze von `require.php`, Config, Channel-Standard.
+/// Picks the PHP version: `--php` wins, then `config.platform.php`, the lower bound of `require.php`, config, channel default.
 pub fn php(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Php>> {
     let available = &ctx.available.php;
     let composer = read_json(&ctx.root.join("composer.json"));
@@ -120,15 +120,15 @@ pub fn php(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Php>> {
         let config = ctx.config.php.default.as_deref().map(versions_in).unwrap_or_default();
         let found = [
             (platform.iter().min().copied(), "config.platform.php"),
-            (require.iter().min().copied(), "require.php (Untergrenze)"),
-            (config.first().copied(), "Config php.default"),
-            (ctx.available.php_default, "Standard des Channels"),
+            (require.iter().min().copied(), "require.php (lower bound)"),
+            (config.first().copied(), "config php.default"),
+            (ctx.available.php_default, "channel default"),
         ]
         .into_iter()
         .find_map(|(v, s)| Some((pick(available, v?)?, s)));
         match found {
             Some(f) => f,
-            None => bail!("der Channel bietet kein PHP an"),
+            None => bail!("the channel offers no PHP"),
         }
     };
 
@@ -148,14 +148,14 @@ pub fn php(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Php>> {
     Ok(Some(Php { version, source, exts }))
 }
 
-/// `--node` gewinnt, dann `.nvmrc`/`.node-version`, `engines.node`, Config; ohne Node-Dateien kein Node.
+/// Picks the Node version: `--node` wins, then `.nvmrc`/`.node-version`, `engines.node`, config. Without Node files there is no Node.
 pub fn node(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Node>> {
     let available = &ctx.available.node;
     let package = read_json(&ctx.root.join("package.json"));
     let (version, source) = if let Some(o) = override_version {
         match first_number(o) {
             Some(v) if available.contains(&v) => (Some(v), "--node"),
-            _ => bail!("Node {o} nicht verfügbar ({available:?})"),
+            _ => bail!("Node {o} not available ({available:?})"),
         }
     } else if let Some((v, f)) = [".nvmrc", ".node-version"]
         .into_iter()
@@ -166,9 +166,9 @@ pub fn node(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Node>> {
         if let Some(v) = p["engines"]["node"].as_str().and_then(first_number) {
             (pick(available, v), "engines.node")
         } else if let Some(v) = ctx.config.node.default {
-            (pick(available, v), "Config node.default")
+            (pick(available, v), "config node.default")
         } else {
-            (None, "Standard des Channels")
+            (None, "channel default")
         }
     } else {
         return Ok(None);
@@ -184,7 +184,7 @@ pub fn node(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Node>> {
     Ok(Some(Node { version, source, tool }))
 }
 
-/// `--python` gewinnt, dann `.python-version`, Untergrenze von `requires-python`, Config, Channel-Standard.
+/// Picks the Python version: `--python` wins, then `.python-version`, the lower bound of `requires-python`, config, channel default.
 pub fn python(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Python>> {
     let root = ctx.root;
     let available = &ctx.available.python;
@@ -215,12 +215,12 @@ pub fn python(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Python
         let config = ctx.config.python.default.as_deref().map(versions_in).unwrap_or_default();
         [
             (pinned.first().copied(), ".python-version"),
-            (requires.iter().min().copied(), "requires-python (Untergrenze)"),
-            (config.first().copied(), "Config python.default"),
+            (requires.iter().min().copied(), "requires-python (lower bound)"),
+            (config.first().copied(), "config python.default"),
         ]
         .into_iter()
         .find_map(|(v, s)| Some((Some(pick(available, v?)?), s)))
-        .unwrap_or((None, "Standard des Channels"))
+        .unwrap_or((None, "channel default"))
     };
 
     let poetry_project = pyproject.as_ref().and_then(|t| t.get("tool")?.get("poetry")).is_some();
@@ -236,13 +236,13 @@ pub fn python(ctx: &Ctx, override_version: Option<&str>) -> Result<Option<Python
     Ok(Some(Python { version, source, tool }))
 }
 
-/// Rust kommt aus nixpkgs; Toolchain-Dateien und zu neue `rust-version` werden nur gemeldet.
+/// Detects Rust, which always comes from nixpkgs. Toolchain files and a too new `rust-version` are only reported.
 pub fn rust(ctx: &Ctx) -> Option<Rust> {
     let cargo = read_toml(&ctx.root.join("Cargo.toml"))?;
     let mut warnings = Vec::new();
     for f in ["rust-toolchain.toml", "rust-toolchain"] {
         if ctx.root.join(f).exists() {
-            warnings.push(format!("{f} wird ignoriert — Rust kommt aus nixpkgs"));
+            warnings.push(format!("{f} is ignored — Rust comes from nixpkgs"));
         }
     }
     let wanted = cargo
@@ -255,7 +255,7 @@ pub fn rust(ctx: &Ctx) -> Option<Rust> {
         && w > have
     {
         warnings.push(format!(
-            "rust-version {}.{} verlangt, nixpkgs hat {}.{}",
+            "rust-version {}.{} required, nixpkgs has {}.{}",
             w.0, w.1, have.0, have.1
         ));
     }
@@ -323,9 +323,9 @@ mod tests {
         let cfg = with(&[("composer.json", "{}")], "[php]\ndefault = \"8.3\"\n", |c| {
             php(c, None).unwrap().unwrap()
         });
-        assert_eq!((cfg.version, cfg.source), ((8, 3), "Config php.default"));
+        assert_eq!((cfg.version, cfg.source), ((8, 3), "config php.default"));
         let chan = with(&[("composer.json", "{}")], "", |c| php(c, None).unwrap().unwrap());
-        assert_eq!((chan.version, chan.source), ((8, 4), "Standard des Channels"));
+        assert_eq!((chan.version, chan.source), ((8, 4), "channel default"));
         assert!(with(&[], "", |c| php(c, None).unwrap()).is_none());
         assert!(with(&[], "", |c| php(c, Some("7.4"))).is_err());
     }
@@ -349,7 +349,7 @@ mod tests {
         let n = with(&[("package.json", "{}")], "[node]\ndefault = 22\n", |c| {
             node(c, None).unwrap().unwrap()
         });
-        assert_eq!((n.version, n.source), (Some(22), "Config node.default"));
+        assert_eq!((n.version, n.source), (Some(22), "config node.default"));
         let std = with(&[("package.json", "{}")], "", |c| node(c, None).unwrap().unwrap());
         assert_eq!(std.version, None);
         assert!(with(&[], "", |c| node(c, None).unwrap()).is_none());
@@ -367,7 +367,7 @@ mod tests {
             uv,
             Python {
                 version: Some((3, 11)),
-                source: "requires-python (Untergrenze)",
+                source: "requires-python (lower bound)",
                 tool: Some("uv")
             }
         );
@@ -387,7 +387,7 @@ mod tests {
 
         let plain =
             with(&[("requirements.txt", "requests\n")], "", |c| python(c, None).unwrap().unwrap());
-        assert_eq!(plain, Python { version: None, source: "Standard des Channels", tool: None });
+        assert_eq!(plain, Python { version: None, source: "channel default", tool: None });
         assert!(with(&[], "", |c| python(c, None).unwrap()).is_none());
     }
 

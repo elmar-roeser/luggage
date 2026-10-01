@@ -29,7 +29,7 @@ Like the Luggage from Discworld: it follows you everywhere and always has the ri
 `luggage doctor` checks the same things without changing anything.
 
 After that, luggage only needs Nix, git and the direnv hook from your system. Everything else
-comes from nixpkgs: the tools of the chest (bubblewrap, util-linux, iproute2) and, when needed,
+comes from nixpkgs: the tools of the chest (bubblewrap, util-linux, iproute2, socat) and, when needed,
 `gh`/`glab` for `--github`/`--gitlab` (log in with `gh auth login` or `glab auth login`).
 
 **Ubuntu 24.04 and later** restricts user namespaces with AppArmor. `luggage doctor` shows
@@ -172,6 +172,29 @@ In the chest, data lives in `/data` and sockets in `/run/luggage`. Ports below 1
 are allowed, but only apply inside the chest. Outside, home and data live in
 `~/.local/share/luggage/chests/<project>/`, runtime files in `$XDG_RUNTIME_DIR/luggage/<project>/`.
 
+The `ports` of the taken-over Compose services are reachable from the host browser, but only on 127.0.0.1,
+never from the network (`"8026:8025"` in `compose.yaml` → `127.0.0.1:8026`). Mailpit without `ports`
+gets its web UI on `127.0.0.1:8025`. Your own services list theirs in `chest.toml`, as `"host:guest"` or `"port"`:
+
+```toml
+[services.web]
+command = "exec php -S 127.0.0.1:80 -t public"
+ports = ["8000:80"]         # http://127.0.0.1:8000 on the host
+```
+
+If a host port is taken, `up` moves it to the next free one (at most 100 higher) and says so;
+`luggage status` shows the real addresses. To choose the host ports of a service yourself, e.g. of a detected
+one, without redefining it, use the `[ports]` table. Its ports replace those of the service and stay fixed:
+if one is taken, `up` only warns and the chest starts without it.
+
+```toml
+[ports]
+database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
+```
+
+In the bubblewrap chest, socat bridges each port from 127.0.0.1 on the host to a socket in the runtime dir,
+where a socat in the chest passes it on; the bridges end with the chest. In a VM, qemu forwards the ports.
+
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
 
@@ -213,28 +236,6 @@ marks each changed file in the VM with a `chmod` to its own mode, which the watc
 `node_modules`. Changes made in the VM reach the watchers anyway; a bare `chmod` on the host is not passed on.
 If a watcher still misses changes, e.g. in a left-out directory, switch it to polling: `CHOKIDAR_USEPOLLING=1`
 (Vite, chokidar), `WATCHPACK_POLLING=true` (webpack), or the `usePolling`/`poll` option of the tool.
-
-The `ports` of the taken-over Compose services are reachable from the host browser, but only on 127.0.0.1,
-never from the network (`"8026:8025"` in `compose.yaml` → `127.0.0.1:8026`). Mailpit without `ports`
-gets its web UI on `127.0.0.1:8025`. Your own services list theirs in `chest.toml`, as `"host:guest"` or `"port"`:
-
-```toml
-[services.web]
-command = "exec php -S 127.0.0.1:80 -t public"
-ports = ["8000:80"]         # http://127.0.0.1:8000 on the host
-```
-
-If a host port is taken, `up` moves it to the next free one (at most 100 higher) and says so;
-`luggage status` shows the real addresses. To choose the host ports of a service yourself, e.g. of a detected
-one, without redefining it, use the `[ports]` table. Its ports replace those of the service and stay fixed:
-if one is taken, `up` only warns and the VM starts without it.
-
-```toml
-[ports]
-database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
-```
-
-In the bubblewrap chest, `ports` has no effect yet.
 
 Commands in the VM get the project's dev environment from the flake, not your shell. Of your shell's
 variables only harmless ones go along: `TERM`, `COLORTERM`, `TZ`, `EDITOR`, `VISUAL`, `PAGER`, `NO_COLOR`,

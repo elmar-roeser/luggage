@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ const RUN_INSIDE: &str = "/run/luggage";
 const PC_GUEST: &str = "/run/current-system/sw/bin/process-compose";
 /// How many ports after a taken host port luggage tries before it gives up.
 const PORT_TRIES: u16 = 100;
+/// Name of the guard process that ends the port bridges of a bubblewrap chest together with the chest.
+const BRIDGES: &str = "luggage-bridges";
 /// Closes every inherited file descriptor above 2, then runs the arguments.
 const CLOSE_FDS_AND_EXEC: &str = r#"for fd in /proc/self/fd/*; do fd=${fd##*/}; if [ "$fd" -gt 2 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; exec "$@""#;
 
@@ -81,7 +84,7 @@ pub struct Service {
     /// Runs once to the end (e.g. to create a database). Dependent services wait until it succeeds.
     #[serde(default)]
     pub once: bool,
-    /// Ports that the VM makes reachable on 127.0.0.1 of the host: `"8026:8025"` (host:guest) or `"8025"`
+    /// Ports that the chest makes reachable on 127.0.0.1 of the host: `"8026:8025"` (host:guest) or `"8025"`
     #[serde(default)]
     pub ports: Vec<String>,
 }
@@ -202,6 +205,9 @@ pub struct Tools {
     iproute2: String,
     /// Store path of cacert; the chest has no `/etc/ssl`
     cacert: String,
+    /// Store path of socat, which bridges the service ports to the host
+    #[serde(default)]
+    socat: String,
     /// The bwrap program: from the system if present, else from nixpkgs.
     /// Ubuntu uses AppArmor to allow user namespaces only for programs with a profile, like `/usr/bin/bwrap`.
     pub bwrap: String,
@@ -234,6 +240,7 @@ impl Tools {
             "util-linux^bin",
             "iproute2^out",
             "cacert^out",
+            "socat^out",
         ];
         if host_bwrap.is_none() {
             attrs.push("bubblewrap^out");
@@ -258,6 +265,7 @@ impl Tools {
             util_linux: find("util-linux")?,
             iproute2: find("iproute2")?,
             cacert: find("nss-cacert")?,
+            socat: find("socat")?,
             bwrap: match host_bwrap {
                 Some(p) => p.to_string_lossy().into_owned(),
                 None => format!("{}/bin/bwrap", find("bubblewrap")?),
@@ -742,7 +750,7 @@ impl Chest {
             &self.pid_file(),
             self.def.network.as_deref(),
         )?;
-        self.vm_forward_ports()?;
+        self.forward_ports(|host, guest| vm::forward_port(&self.run, host, guest))?;
         self.vm_sync()?;
         fs::write(self.run.join("started"), self.vm_fingerprint(nixpkgs)?)?;
         self.vm_services(pid)?;
@@ -796,9 +804,9 @@ impl Chest {
         }
     }
 
-    /// Forwards the ports of the services from 127.0.0.1 on the host into the guest and lists them in `<run>/ports`.
+    /// Makes the service ports reachable on 127.0.0.1 of the host with `forward(host, guest)` and lists them in `<run>/ports`.
     /// A taken host port moves to the next free one, except a fixed one from `[ports]`, which is only reported.
-    fn vm_forward_ports(&self) -> Result<()> {
+    fn forward_ports(&self, mut forward: impl FnMut(u16, u16) -> Result<()>) -> Result<()> {
         let mut wanted = Vec::new();
         for (name, svc) in &self.def.services {
             let fixed = self.def.ports.contains_key(name);
@@ -812,11 +820,11 @@ impl Chest {
         let reserved: BTreeSet<u16> = wanted.iter().map(|w| w.2).collect();
         let mut forwarded = String::new();
         for (movable, name, host, guest) in wanted {
-            let mut result = vm::forward_port(&self.run, host, guest).map(|()| host);
+            let mut result = forward(host, guest).map(|()| host);
             if let (Err(e), true) = (&result, movable) {
                 let free = |p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok();
                 result = match next_free_port(host, &reserved, free) {
-                    Some(p) => vm::forward_port(&self.run, p, guest).map(|()| {
+                    Some(p) => forward(p, guest).map(|()| {
                         info(&format!("{name}:{guest} is on 127.0.0.1:{p} — {e:#}"));
                         p
                     }),
@@ -957,7 +965,8 @@ impl Chest {
             "exec sleep infinity".to_owned()
         } else {
             format!(
-                "exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml"
+                "{}exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml",
+                self.inside_bridges(&tools)
             )
         };
         let log = File::create(self.run.join("chest.log"))?;
@@ -996,6 +1005,7 @@ impl Chest {
         if !alive(pid) {
             bail!("chest stopped right away — see {}/chest.log and pc.log", self.run.display());
         }
+        self.bridge_ports(&tools, pid)?;
         // Return only once the services are ready. Also, a `down` while a readiness_probe
         // is still pending hangs in process-compose.
         if !self.def.services.is_empty() {
@@ -1023,6 +1033,63 @@ impl Chest {
             self.name
         ));
         Ok(())
+    }
+
+    /// Shell code for the chest that starts one socat per service port, from `/run/luggage/port-<port>.sock` to the port.
+    fn inside_bridges(&self, tools: &Tools) -> String {
+        let guests: BTreeSet<u16> = self
+            .def
+            .services
+            .values()
+            .flat_map(|s| s.ports.iter().filter_map(|p| port_pair(p).ok().map(|(_, g)| g)))
+            .collect();
+        guests.iter().fold(String::new(), |acc, g| {
+            acc + &format!(
+                "{}/bin/socat UNIX-LISTEN:{RUN_INSIDE}/port-{g}.sock,unlink-early,fork TCP:127.0.0.1:{g} & ",
+                tools.socat
+            )
+        })
+    }
+
+    /// Bridges the service ports from 127.0.0.1 on the host to the sockets of `inside_bridges`, one socat per port.
+    /// They share a process group with a guard that ends the group once the chest `pid` is gone.
+    fn bridge_ports(&self, tools: &Tools, pid: u32) -> Result<()> {
+        stop_bridges(&self.run);
+        if self.def.services.values().all(|s| s.ports.is_empty()) {
+            return Ok(());
+        }
+        let log = File::create(self.run.join("bridges.log"))?;
+        let guard = Command::new(tools.bash())
+            .args(["-c", r#""$2" --pid="$1" -f /dev/null; kill -TERM 0"#, BRIDGES])
+            .arg(pid.to_string())
+            .arg(format!("{}/bin/tail", tools.coreutils))
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log.try_clone()?)
+            .spawn()
+            .context("cannot start the port bridges")?;
+        let group = guard.id();
+        fs::write(self.run.join("bridges.pid"), group.to_string())?;
+        let socat = format!("{}/bin/socat", tools.socat);
+        self.forward_ports(|host, guest| {
+            // luggage binds the port itself, so a taken one fails here and not later in socat
+            let listener = std::net::TcpListener::bind(("127.0.0.1", host))
+                .map_err(|e| anyhow::anyhow!("127.0.0.1:{host}: {e}"))?;
+            Command::new(&socat)
+                .arg("ACCEPT-FD:0,fork")
+                .arg(format!(
+                    "UNIX-CONNECT:{}",
+                    self.run.join(format!("port-{guest}.sock")).display()
+                ))
+                .process_group(i32::try_from(group)?)
+                .stdin(OwnedFd::from(listener))
+                .stdout(Stdio::null())
+                .stderr(log.try_clone()?)
+                .spawn()
+                .context("cannot start socat")?;
+            Ok(())
+        })
     }
 
     /// Are all services ready? Fails if a service stopped that should keep running.
@@ -1150,6 +1217,7 @@ impl Chest {
             if is_vm {
                 vm::stop(&self.name, &self.run, None);
             }
+            stop_bridges(&self.run);
             let _ = fs::remove_file(self.pid_file());
             info(&format!("chest {} is not running", self.name));
             return Ok(());
@@ -1184,6 +1252,7 @@ impl Chest {
             // the kernel still tears down the namespace; report "stopped" only once it is gone
             wait_dead(pid, 50);
         }
+        stop_bridges(&self.run);
         let _ = fs::remove_file(self.pid_file());
         let _ = fs::remove_file(self.socket());
         info(&format!("chest {} stopped", self.name));
@@ -1224,13 +1293,13 @@ impl Chest {
             return Ok(());
         };
         println!("Status:      running (pid {pid})");
+        let ports = fs::read_to_string(self.run.join("ports")).unwrap_or_default();
+        let ports: Vec<_> = ports.lines().collect();
+        println!(
+            "Ports:       {}",
+            if ports.is_empty() { "none".into() } else { ports.join(", ") }
+        );
         if self.def.mode == Mode::Vm {
-            let ports = fs::read_to_string(self.run.join("ports")).unwrap_or_default();
-            let ports: Vec<_> = ports.lines().collect();
-            println!(
-                "Ports:       {}",
-                if ports.is_empty() { "none".into() } else { ports.join(", ") }
-            );
             let network = match fs::read_to_string(self.run.join("network")) {
                 Err(_) => "open".into(),
                 Ok(n) if n.trim().is_empty() => "closed".into(),
@@ -1251,6 +1320,22 @@ impl Chest {
         }
         Ok(())
     }
+}
+
+/// Stops the port bridges of a bubblewrap chest, if they still run, and forgets their ports.
+fn stop_bridges(run: &Path) {
+    let pid_file = run.join("bridges.pid");
+    if let Some(pid) = fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
+        // the id may belong to another process by now
+        && fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|c| c.windows(BRIDGES.len()).any(|w| w == BRIDGES.as_bytes()))
+    {
+        let _ =
+            Command::new("kill").args(["--", &format!("-{pid}")]).stderr(Stdio::null()).status();
+        wait_dead(pid, 20);
+    }
+    let _ = fs::remove_file(pid_file);
+    let _ = fs::remove_file(run.join("ports"));
 }
 
 /// bash in all namespaces of the running chest (like `docker exec`).
@@ -1329,6 +1414,7 @@ depends_on = ["db"]
             util_linux: "/nix/store/u-util-linux".into(),
             iproute2: "/nix/store/i-iproute2".into(),
             cacert: "/nix/store/c-nss-cacert".into(),
+            socat: "/nix/store/s-socat".into(),
             bwrap: "/usr/bin/bwrap".into(),
             packages: vec!["/nix/store/m-mariadb".into()],
         }
@@ -1503,6 +1589,21 @@ depends_on = ["db"]
         );
         assert!(y.contains("      \"db\":\n        condition: process_healthy\n"));
         assert!(y.contains("timeout_seconds: 60\n      failure_threshold: 60\n"));
+    }
+
+    #[test]
+    fn one_inside_bridge_per_guest_port() {
+        let mut def = parse(SPARENCON).unwrap();
+        def.services.get_mut("web").unwrap().ports = vec!["8000:80".into(), "443".into()];
+        def.services.get_mut("db").unwrap().ports = vec!["3307:3306".into()];
+        def.ports.insert("web".into(), vec!["8001:80".into()]);
+        let def = merge(def, None).unwrap();
+        assert_eq!(
+            chest(def).inside_bridges(&tools()),
+            "/nix/store/s-socat/bin/socat UNIX-LISTEN:/run/luggage/port-80.sock,unlink-early,fork TCP:127.0.0.1:80 & \
+             /nix/store/s-socat/bin/socat UNIX-LISTEN:/run/luggage/port-3306.sock,unlink-early,fork TCP:127.0.0.1:3306 & "
+        );
+        assert_eq!(chest(parse(SPARENCON).unwrap()).inside_bridges(&tools()), "");
     }
 
     #[test]

@@ -189,14 +189,14 @@ mode = "vm"
 When you `cd` into the project, direnv starts the VM in the background (about 3.5 s) and puts
 a stand-in for each project program first on the `PATH`. The first command waits until the VM is up,
 later ones take a few milliseconds more than on the host. Only one VM runs at a time:
-starting the VM of another project stops the old one. `luggage up`, `exec`, `open`, `status` and
-`down` work as above; `exec` and `open` start the VM if needed.
+starting the VM of another project stops the old one. `luggage run`, `up`, `exec`, `open`, `status` and
+`down` work as above; `run`, `exec` and `open` start the VM if needed. `run` uses the running VM, and without
+`--net` its command has no network, not even to the services.
 
 This needs `/dev/kvm` (your user in the group `kvm`) and ssh. `luggage up` adds the line
 `if has luggage; then eval "$(luggage hook)"; fi` to the `.envrc` if it is missing; then run `direnv allow` once.
 The services (from `compose.yaml` and `chest.toml`) run in the VM too, with their data on the VM disk.
 After changing services, packages or hosts, restart the VM with `luggage down` and `luggage up`.
-Not in the VM yet: `luggage run`.
 
 ## Development
 

@@ -536,14 +536,21 @@ fn passed_env() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Runs the rest of the line without network: its own network namespace with only `lo`, as root to bring `lo` up,
+/// then a second user namespace maps the user back to its own uid.
+const OFFLINE: &str = r#" unshare --user --map-root-user --net sh -c 'ip link set lo up && u=$1 g=$2 && shift 2 && exec unshare --user --map-user="$u" --map-group="$g" -- "$@"' sh "$(id -u)" "$(id -g)""#;
+
 /// The shell command for the guest: dev environment, host variables, working directory, then the command.
 /// Without a command it opens an interactive shell.
-fn remote_command(cwd: &Path, env: &[(String, String)], cmd: &[String]) -> String {
+fn remote_command(cwd: &Path, env: &[(String, String)], net: bool, cmd: &[String]) -> String {
     let mut r = String::from("source ~/.luggage/rc >/dev/null");
     for (k, v) in env {
         let _ = write!(r, "; export {k}={}", sh_quote(v));
     }
     let _ = write!(r, "; cd {} && exec", sh_quote(&cwd.to_string_lossy()));
+    if !net {
+        r.push_str(OFFLINE);
+    }
     if cmd.is_empty() {
         r.push_str(" bash --rcfile ~/.luggage/rc -i");
     }
@@ -643,16 +650,24 @@ pub fn script(name: &str, dir: &Path, run: &Path, script: &str) -> Command {
 }
 
 /// Runs `cmd` in the guest in `cwd` (a shell without a command) and returns its exit status.
+/// Without `net` the command gets no network, not even to the services in the guest.
 ///
 /// # Errors
 /// If ssh cannot start.
-pub fn exec(name: &str, dir: &Path, run: &Path, cwd: &Path, cmd: &[String]) -> Result<ExitStatus> {
+pub fn exec(
+    name: &str,
+    dir: &Path,
+    run: &Path,
+    cwd: &Path,
+    net: bool,
+    cmd: &[String],
+) -> Result<ExitStatus> {
     use std::io::IsTerminal;
     // a terminal only for a terminal: otherwise output that goes to a pipe would get \r\n
     let tty = cmd.is_empty() || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     ssh(name, dir, Some(run))
         .arg(if tty { "-t" } else { "-T" })
-        .arg(remote_command(cwd, &passed_env(), cmd))
+        .arg(remote_command(cwd, &passed_env(), net, cmd))
         .status()
         .context("cannot start ssh")
 }
@@ -726,12 +741,24 @@ mod tests {
         let env = [("APP_ENV".to_owned(), "test's".to_owned())];
         let cmd = ["php".to_owned(), "-r".to_owned(), "echo $x;".to_owned()];
         assert_eq!(
-            remote_command(Path::new("/p/my dir"), &env, &cmd),
+            remote_command(Path::new("/p/my dir"), &env, true, &cmd),
             r#"source ~/.luggage/rc >/dev/null; export APP_ENV='test'"'"'s'; cd '/p/my dir' && exec 'php' '-r' 'echo $x;'"#
         );
         assert!(
-            remote_command(Path::new("/p"), &[], &[])
+            remote_command(Path::new("/p"), &[], true, &[])
                 .ends_with("exec bash --rcfile ~/.luggage/rc -i")
+        );
+    }
+
+    #[test]
+    fn remote_command_without_network() {
+        let cmd = ["composer".to_owned(), "install".to_owned()];
+        let r = remote_command(Path::new("/p"), &[], false, &cmd);
+        assert!(r.starts_with("source ~/.luggage/rc >/dev/null; cd '/p' && exec unshare --user --map-root-user --net sh -c "));
+        assert!(r.ends_with(r#" sh "$(id -u)" "$(id -g)" 'composer' 'install'"#));
+        assert!(
+            remote_command(Path::new("/p"), &[], false, &[])
+                .ends_with(r#""$(id -g)" bash --rcfile ~/.luggage/rc -i"#)
         );
     }
 

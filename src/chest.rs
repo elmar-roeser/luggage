@@ -581,8 +581,11 @@ impl Chest {
     }
 
     /// Runs a one-off command in a fresh chest; without a command, a shell.
+    /// In VM mode it runs in the VM, without network unless `net`.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
-        self.not_in_vm_mode()?;
+        if self.def.mode == Mode::Vm {
+            return self.vm_enter(net, cmd, nixpkgs);
+        }
         let tools = self.prepare(nixpkgs)?;
         let mut c = Command::new(&tools.bwrap);
         c.args(self.bwrap_args(&tools, if net { Net::Share } else { Net::Off })?)
@@ -752,14 +755,6 @@ impl Chest {
         Ok(())
     }
 
-    /// Commands that do not work with a VM yet.
-    fn not_in_vm_mode(&self) -> Result<()> {
-        if self.def.mode == Mode::Vm {
-            bail!("this command does not work with mode = \"vm\" yet");
-        }
-        Ok(())
-    }
-
     /// Prints the notes from service detection.
     fn print_notes(&self) {
         for n in self.detected.iter().flat_map(|d| &d.notes) {
@@ -924,17 +919,22 @@ impl Chest {
         bail!("chest does not start — see {}", self.run.join("chest.log").display())
     }
 
+    /// Runs `cmd` in the VM, which starts if needed; without a command, a shell.
+    fn vm_enter(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
+        // starts the VM or waits for a start that is under way
+        self.vm_up(nixpkgs)?;
+        self.vm_sync()?;
+        // only the project is shared with the guest
+        let cwd = std::env::current_dir()?;
+        let cwd = if cwd.starts_with(&self.project) { cwd } else { self.project.clone() };
+        pass_through(vm::exec(&self.name, &self.state.join("vm"), &self.run, &cwd, net, cmd)?);
+        Ok(())
+    }
+
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
         if self.def.mode == Mode::Vm {
-            // starts the VM or waits for a start that is under way
-            self.vm_up(nixpkgs)?;
-            self.vm_sync()?;
-            // only the project is shared with the guest
-            let cwd = std::env::current_dir()?;
-            let cwd = if cwd.starts_with(&self.project) { cwd } else { self.project.clone() };
-            pass_through(vm::exec(&self.name, &self.state.join("vm"), &self.run, &cwd, cmd)?);
-            return Ok(());
+            return self.vm_enter(true, cmd, nixpkgs);
         }
         let pid = self.running().with_context(|| {
             format!("chest {} is not running — run `luggage up` first", self.name)

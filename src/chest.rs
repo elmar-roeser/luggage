@@ -708,6 +708,8 @@ impl Chest {
         kill_group(group.id());
         let _ = group.wait();
         let _ = fs::remove_file(&sock);
+        // bwrap left an empty file in the chest's part to mount the socket on
+        let _ = fs::remove_file(self.inside().join(run_proxy_sock()));
         pass_through(status?);
         Ok(())
     }

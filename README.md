@@ -197,7 +197,9 @@ This needs `/dev/kvm` and `/dev/vhost-vsock` (your user in the group `kvm`) and 
 checks them in its optional VM section. `luggage up` adds the line
 `if has luggage; then eval "$(luggage hook)"; fi` to the `.envrc` if it is missing; then run `direnv allow` once.
 The services (from `compose.yaml` and `chest.toml`) run in the VM too, with their data on the VM disk.
-After changing services, packages or hosts, restart the VM with `luggage down` and `luggage up`.
+The running VM keeps the definition it was started with. After changing services, packages, hosts, `ports`
+or (with services) the project flake, `up`, `exec`, `status` and the stand-ins warn until you restart it
+with `luggage down && luggage up`.
 
 The `ports` of the taken-over Compose services are reachable from the host browser, but only on 127.0.0.1,
 never from the network (`"8026:8025"` in `compose.yaml` → `127.0.0.1:8026`). Mailpit without `ports`

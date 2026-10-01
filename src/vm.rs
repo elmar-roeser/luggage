@@ -164,6 +164,15 @@ pub fn cid(name: &str) -> u32 {
     3 + hash % 0x7fff_0000
 }
 
+/// A short hash of `parts` that stays the same between Rust versions (FNV-1a, 64 bit).
+pub fn fingerprint(parts: &[&str]) -> String {
+    let hash = parts.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, part| {
+        // the separator keeps ["ab", "c"] apart from ["a", "bc"]
+        part.bytes().chain([0xff]).fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    });
+    format!("{hash:016x}")
+}
+
 /// Host name of the guest; host names do not allow `_`.
 fn hostname(name: &str) -> String {
     format!("chest-{}", name.replace('_', "-"))
@@ -211,6 +220,38 @@ fn ssh_key(dir: &Path) -> Result<String> {
     Ok(fs::read_to_string(key.with_extension("pub"))?)
 }
 
+/// The guest flake for this user, with the ssh key in `dir` (created once).
+///
+/// # Errors
+/// If `USER` is not set or the key cannot be created.
+pub fn guest_flake(
+    name: &str,
+    project: &Path,
+    nixpkgs: &str,
+    dir: &Path,
+    packages: &[String],
+    hosts: &[String],
+) -> Result<String> {
+    let meta = fs::metadata("/proc/self")?;
+    let user = std::env::var("USER").context("USER is not set")?;
+    let home = crate::home();
+    let ssh_key = ssh_key(dir)?;
+    let var_img = dir.join("var.img");
+    Ok(render(&Guest {
+        name,
+        project,
+        nixpkgs,
+        var_img: &var_img,
+        user: &user,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        home: &home,
+        ssh_key: &ssh_key,
+        packages,
+        hosts,
+    }))
+}
+
 /// Writes the guest flake into `dir/flake` and builds its runner as `dir/runner`.
 /// Returns the path of the runner.
 ///
@@ -225,24 +266,7 @@ pub fn build(
     hosts: &[String],
 ) -> Result<PathBuf> {
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let meta = fs::metadata("/proc/self")?;
-    let user = std::env::var("USER").context("USER is not set")?;
-    let home = crate::home();
-    let ssh_key = ssh_key(dir)?;
-    let var_img = dir.join("var.img");
-    let flake = render(&Guest {
-        name,
-        project,
-        nixpkgs,
-        var_img: &var_img,
-        user: &user,
-        uid: meta.uid(),
-        gid: meta.gid(),
-        home: &home,
-        ssh_key: &ssh_key,
-        packages,
-        hosts,
-    });
+    let flake = guest_flake(name, project, nixpkgs, dir, packages, hosts)?;
     // Only flake.nix and flake.lock may be in here: nix copies the whole directory into the
     // world-readable store on every build, so the key and var.img stay one level up.
     let flake_dir = dir.join("flake");
@@ -356,7 +380,7 @@ pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path
     }
     stop_virtiofsd(name, run);
     // a new guest has an empty home, so the environment must be sent again
-    for f in ["control.socket", "cm.sock", "env.sent", "ports"] {
+    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started"] {
         let _ = fs::remove_file(run.join(f));
     }
     let bin = dir.join("runner/bin");
@@ -517,7 +541,7 @@ pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
         }
     }
     stop_virtiofsd(name, run);
-    for f in ["control.socket", "cm.sock", "env.sent", "ports"] {
+    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started"] {
         let _ = fs::remove_file(run.join(f));
     }
 }
@@ -796,6 +820,14 @@ mod tests {
         let f = render(&guest("demo", "u"));
         assert!(f.contains("iifname != \"lo\" meta l4proto tcp dnat to 127.0.0.1"));
         assert!(f.contains("\"net.ipv4.conf.all.route_localnet\" = 1;"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_separates_parts() {
+        assert_eq!(fingerprint(&[]), "cbf29ce484222325");
+        assert_eq!(fingerprint(&["a", "b"]), fingerprint(&["a", "b"]));
+        assert_ne!(fingerprint(&["ab", "c"]), fingerprint(&["a", "bc"]));
+        assert_ne!(fingerprint(&["a"]), fingerprint(&["b"]));
     }
 
     #[test]

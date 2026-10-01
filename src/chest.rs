@@ -686,8 +686,50 @@ impl Chest {
         let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
         self.vm_forward_ports()?;
         self.vm_sync()?;
+        fs::write(self.run.join("started"), self.vm_fingerprint(nixpkgs)?)?;
         self.vm_services(pid)?;
         Ok(pid)
+    }
+
+    /// Hash of what a VM start depends on: guest flake, services, ports and, for the services, env.sh.
+    /// Only renders and reads files, so it is cheap enough for every stand-in call.
+    fn vm_fingerprint(&self, nixpkgs: &str) -> Result<String> {
+        let flake = vm::guest_flake(
+            &self.name,
+            &self.project,
+            nixpkgs,
+            &self.state.join("vm"),
+            &self.def.packages,
+            &self.def.hosts,
+        )?;
+        let ports: Vec<String> = self
+            .def
+            .services
+            .iter()
+            .flat_map(|(name, svc)| svc.ports.iter().map(move |p| format!("{name}={p}")))
+            .collect();
+        // commands get a fresh env.sh anyway, only the running services keep the old one
+        let env = if self.def.services.is_empty() {
+            String::new()
+        } else {
+            fs::read_to_string(self.run.join("env.sh")).unwrap_or_default()
+        };
+        Ok(vm::fingerprint(&[&flake, &self.render_compose(), &ports.join(" "), &env]))
+    }
+
+    /// Warns if the running VM was started with another definition than the current one; never restarts it.
+    fn vm_warn_outdated(&self, nixpkgs: &str) {
+        // no record: the VM was started by an older luggage
+        let Ok(started) = fs::read_to_string(self.run.join("started")) else {
+            return;
+        };
+        // stderr: stdout belongs to the command of a stand-in, and direnv runs the hook's stdout as shell code
+        if self.vm_fingerprint(nixpkgs).is_ok_and(|now| now != started) {
+            eprintln!(
+                "luggage: warning: chest {} runs with an outdated definition — run `luggage down && luggage up`",
+                self.name
+            );
+        }
     }
 
     /// Forwards the ports of the services from 127.0.0.1 on the host into the guest and lists them in `<run>/ports`.
@@ -753,7 +795,7 @@ impl Chest {
 
     /// Shell code for direnv: in VM mode the stand-ins come first on the `PATH` and the VM starts in the background.
     /// Must be fast, it runs on every `cd` into the project.
-    pub fn cmd_hook(&self) -> Result<()> {
+    pub fn cmd_hook(&self, nixpkgs: &str) -> Result<()> {
         if self.def.mode != Mode::Vm {
             return Ok(());
         }
@@ -776,7 +818,9 @@ impl Chest {
         if let Some(d) = &self.def_dir {
             println!("watch_file {}", sh_quote(&d.join("chest.toml").to_string_lossy()));
         }
-        if self.running().is_none() {
+        if self.running().is_some() {
+            self.vm_warn_outdated(nixpkgs);
+        } else {
             // direnv reads the environment from fd 3 and waits until every holder closed it,
             // and Rust passes such descriptors on to children, so a small shell closes them all first.
             let log = File::create(self.run.join("up.log"))?;
@@ -806,6 +850,7 @@ impl Chest {
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
         if self.def.mode == Mode::Vm {
             let pid = self.vm_up(nixpkgs)?;
+            self.vm_warn_outdated(nixpkgs);
             info(&format!(
                 "chest {} is running (VM, pid {pid}) — `luggage status`, `luggage down`",
                 self.name
@@ -964,6 +1009,7 @@ impl Chest {
         // starts the VM or waits for a start that is under way
         self.vm_up(nixpkgs)?;
         self.vm_sync()?;
+        self.vm_warn_outdated(nixpkgs);
         // only the project is shared with the guest
         let cwd = std::env::current_dir()?;
         let cwd = if cwd.starts_with(&self.project) { cwd } else { self.project.clone() };
@@ -1055,7 +1101,7 @@ impl Chest {
     }
 
     /// Shows the definition, services and state of the chest.
-    pub fn cmd_status(&self) -> Result<()> {
+    pub fn cmd_status(&self, nixpkgs: &str) -> Result<()> {
         println!("Chest:       {}", self.name);
         println!("Project:     {}", self.project.display());
         println!("Mode:        {}", if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" });
@@ -1095,6 +1141,7 @@ impl Chest {
                 "Ports:       {}",
                 if ports.is_empty() { "none".into() } else { ports.join(", ") }
             );
+            self.vm_warn_outdated(nixpkgs);
         }
         if self.def.mode == Mode::Vm && !self.def.services.is_empty() {
             println!();
@@ -1189,6 +1236,42 @@ depends_on = ["db"]
             bwrap: "/usr/bin/bwrap".into(),
             packages: vec!["/nix/store/m-mariadb".into()],
         }
+    }
+
+    #[test]
+    fn fingerprint_follows_the_definition() {
+        // the guest flake needs the user; tests cannot set it
+        if std::env::var("USER").is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let vm_dir = tmp.path().join("state/vm");
+        fs::create_dir_all(&vm_dir).unwrap();
+        fs::write(vm_dir.join("id_ed25519"), "").unwrap();
+        fs::write(vm_dir.join("id_ed25519.pub"), "ssh-ed25519 AAAA luggage\n").unwrap();
+        let at = |def: Definition| Chest {
+            state: tmp.path().join("state"),
+            run: tmp.path().to_path_buf(),
+            ..chest(def)
+        };
+        let print = |text: &str| at(parse(text).unwrap()).vm_fingerprint("nixpkgs").unwrap();
+        let base = print(SPARENCON);
+        assert_eq!(base, print(SPARENCON));
+        let ported = SPARENCON.replace("-t public\"", "-t public\"\nports = [\"8000\"]");
+        for changed in [
+            SPARENCON.replace("[\"database\"]", "[\"db\"]"),
+            SPARENCON.replace("[\"mariadb\"]", "[\"mariadb\", \"redis\"]"),
+            SPARENCON.replace("8000", "8001"),
+            ported,
+        ] {
+            assert_ne!(base, print(&changed), "{changed}");
+        }
+        // env.sh only counts for the services
+        fs::write(tmp.path().join("env.sh"), "export A=1").unwrap();
+        assert_ne!(base, print(SPARENCON));
+        let no_services = print("");
+        fs::write(tmp.path().join("env.sh"), "export A=2").unwrap();
+        assert_eq!(no_services, print(""));
     }
 
     #[test]

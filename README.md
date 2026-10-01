@@ -192,8 +192,8 @@ if one is taken, `up` only warns and the chest starts without it.
 database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
 ```
 
-In the bubblewrap chest, socat bridges each port from 127.0.0.1 on the host to a socket in the runtime dir,
-where a socat in the chest passes it on; the bridges end with the chest. In a VM, qemu forwards the ports.
+In the bubblewrap chest, socat bridges each port from 127.0.0.1 on the host and enters the network of the chest
+with nsenter for each connection; the bridges end with the chest. In a VM, qemu forwards the ports.
 
 Commands in the chest get the project's dev environment from the flake, not your shell. Of your shell's
 variables only harmless ones go along: `TERM`, `COLORTERM`, `TZ`, `EDITOR`, `VISUAL`, `PAGER`, `NO_COLOR`,

@@ -1036,8 +1036,7 @@ impl Chest {
                 "exec sleep infinity".to_owned()
             } else {
                 format!(
-                    "{}exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml",
-                    self.inside_bridges(&tools)
+                    "exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml"
                 )
             };
         let log = File::create(self.run.join("chest.log"))?;
@@ -1109,22 +1108,6 @@ impl Chest {
         Ok(())
     }
 
-    /// Shell code for the chest that starts one socat per service port, from `/run/luggage/port-<port>.sock` to the port.
-    fn inside_bridges(&self, tools: &Tools) -> String {
-        let guests: BTreeSet<u16> = self
-            .def
-            .services
-            .values()
-            .flat_map(|s| s.ports.iter().filter_map(|p| port_pair(p).ok().map(|(_, g)| g)))
-            .collect();
-        guests.iter().fold(String::new(), |acc, g| {
-            acc + &format!(
-                "{}/bin/socat UNIX-LISTEN:{RUN_INSIDE}/port-{g}.sock,unlink-early,fork TCP:127.0.0.1:{g} & ",
-                tools.socat
-            )
-        })
-    }
-
     /// Shell code for the chest that starts a socat from `PROXY_INSIDE` to the host proxy at `/run/luggage/<sock>`,
     /// if the chest has a `network`.
     fn inside_proxy(&self, tools: &Tools, sock: &str) -> String {
@@ -1161,8 +1144,8 @@ impl Chest {
         Ok(())
     }
 
-    /// Bridges the service ports from 127.0.0.1 on the host to the sockets of `inside_bridges`, one socat per port,
-    /// and serves the `proxy` socket. They share a process group with a guard that ends it once the chest `pid` is gone.
+    /// Bridges the service ports from 127.0.0.1 on the host into the network namespace of the chest `pid` and serves
+    /// the `proxy` socket. They share a process group with a guard that ends it once the chest `pid` is gone.
     fn bridge_ports(&self, tools: &Tools, pid: u32, proxy: Option<UnixListener>) -> Result<()> {
         if self.def.services.values().all(|s| s.ports.is_empty()) && proxy.is_none() {
             return Ok(());
@@ -1180,10 +1163,7 @@ impl Chest {
                 .map_err(|e| anyhow::anyhow!("127.0.0.1:{host}: {e}"))?;
             Command::new(&socat)
                 .arg("ACCEPT-FD:0,fork")
-                .arg(format!(
-                    "UNIX-CONNECT:{}",
-                    self.run.join(format!("port-{guest}.sock")).display()
-                ))
+                .arg(bridge_address(tools, pid, guest))
                 .process_group(i32::try_from(group)?)
                 .stdin(OwnedFd::from(listener))
                 .stdout(Stdio::null())
@@ -1446,6 +1426,17 @@ fn stop_bridges(run: &Path) {
     for f in [pid_file, run.join("ports"), run.join("proxy.sock")] {
         let _ = fs::remove_file(f);
     }
+}
+
+/// The socat address of a port bridge: for each connection, nsenter and a socat to port `guest` in the network
+/// namespace of the chest `pid`. It names no path the chest can write, which it could swap for a link to a host socket.
+fn bridge_address(tools: &Tools, pid: u32, guest: u16) -> String {
+    format!(
+        // socat splits parameters at ":", so those of the inner address are escaped; store paths have none
+        r"EXEC:{} -t {pid} --user --net --preserve-credentials {}/bin/socat STDIO TCP\:127.0.0.1\:{guest}",
+        tools.util("nsenter"),
+        tools.socat
+    )
 }
 
 /// Sends SIGTERM to the process group `group`.
@@ -1758,18 +1749,14 @@ depends_on = ["db"]
     }
 
     #[test]
-    fn one_inside_bridge_per_guest_port() {
-        let mut def = parse(SPARENCON).unwrap();
-        def.services.get_mut("web").unwrap().ports = vec!["8000:80".into(), "443".into()];
-        def.services.get_mut("db").unwrap().ports = vec!["3307:3306".into()];
-        def.ports.insert("web".into(), vec!["8001:80".into()]);
-        let def = merge(def, None).unwrap();
+    fn bridges_enter_the_chest_instead_of_using_its_files() {
+        let address = bridge_address(&tools(), 42, 3306);
         assert_eq!(
-            chest(def).inside_bridges(&tools()),
-            "/nix/store/s-socat/bin/socat UNIX-LISTEN:/run/luggage/port-80.sock,unlink-early,fork TCP:127.0.0.1:80 & \
-             /nix/store/s-socat/bin/socat UNIX-LISTEN:/run/luggage/port-3306.sock,unlink-early,fork TCP:127.0.0.1:3306 & "
+            address,
+            "EXEC:/nix/store/u-util-linux/bin/nsenter -t 42 --user --net --preserve-credentials \
+             /nix/store/s-socat/bin/socat STDIO TCP\\:127.0.0.1\\:3306"
         );
-        assert_eq!(chest(parse(SPARENCON).unwrap()).inside_bridges(&tools()), "");
+        assert!(!address.contains(RUN_INSIDE) && !address.contains(".sock"));
     }
 
     #[test]

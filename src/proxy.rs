@@ -3,7 +3,7 @@
 //! qemu runs `luggage network-proxy <file>` with each guest connection to `GUEST` on stdin and stdout; it serves
 //! one HTTP request or `CONNECT` tunnel to a host in the allowlist `<file>`.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsFd;
@@ -20,6 +20,8 @@ const HEAD_LIMIT: usize = 64 * 1024;
 /// How long the guest may take to send the whole request head, and the proxy to reach the target.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Most proxy processes that may run at the same time for one chest.
+const SLOTS: usize = 256;
 /// Ports that an entry without its own port allows.
 const DEFAULT_PORTS: [u16; 2] = [80, 443];
 
@@ -205,6 +207,21 @@ fn read_head(client: &mut UnixStream, within: Duration) -> Option<(String, Vec<u
     }
 }
 
+/// Locks one of `max` slot files in `dir`, or none if all are taken.
+/// The lock ends with the process, also when it crashes, so no slot is ever lost.
+fn take_slot(dir: &Path, max: usize) -> Option<File> {
+    fs::create_dir_all(dir).ok()?;
+    (0..max).find_map(|i| {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(i.to_string()))
+            .ok()?;
+        file.try_lock().ok().map(|()| file)
+    })
+}
+
 /// Answers the guest with an error and a short text.
 fn refuse(client: &mut UnixStream, status: &str, text: &str) {
     let text = format!("luggage: {text}\n");
@@ -234,6 +251,10 @@ fn connect(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
 /// If stdin is not a socket.
 pub fn serve(file: &Path) -> Result<()> {
     let mut client = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    let Some(_slot) = take_slot(&file.with_file_name("proxy-slots"), SLOTS) else {
+        refuse(&mut client, "503 Service Unavailable", "too many connections at once");
+        return Ok(());
+    };
     let Some((head, rest)) = read_head(&mut client, TIMEOUT) else {
         refuse(&mut client, "400 Bad Request", "cannot read the request");
         return Ok(());
@@ -426,6 +447,16 @@ mod tests {
         let ok = addresses("127.0.0.1", 8080, true).unwrap();
         assert_eq!(ok, [SocketAddr::from(([127, 0, 0, 1], 8080))]);
         assert_eq!(addresses("1.1.1.1", 443, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn slots_run_out_and_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().join("slots");
+        let mut taken: Vec<File> = (0..3).map(|_| take_slot(&dir, 3).unwrap()).collect();
+        assert!(take_slot(&dir, 3).is_none());
+        taken.pop();
+        assert!(take_slot(&dir, 3).is_some());
     }
 
     #[test]

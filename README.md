@@ -264,7 +264,8 @@ or `localhost`, for example `"localhost:8080"` or `"192.168.1.10:443"`.
 The VM then reaches the outside only through a proxy that luggage runs on the host for each connection.
 Commands and services get `http_proxy`, `https_proxy` and `no_proxy` (localhost and the `hosts`), which curl,
 git over HTTPS, Composer and npm follow. The guest has no DNS and no direct connections, so tools that ignore
-these variables, and git over ssh, cannot get out. The forwarded ports work as before. A changed list applies to
+these variables, and git over ssh, cannot get out. At most 256 connections go through the proxy at once; more
+get the error 503. The forwarded ports work as before. A changed list applies to
 the next connection after the next luggage command; adding or removing `network` needs a restart.
 `luggage status` shows the list. `network` needs `mode = "vm"`.
 

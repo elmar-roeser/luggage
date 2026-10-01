@@ -90,7 +90,10 @@ fn parent(pid: u32) -> Option<u32> {
 /// The process in the outermost user namespace above `pid` that is not ours. That namespace owns the mount
 /// namespace: bwrap puts the chest itself into a nested one, where luggage would have no rights over the mounts.
 fn outermost(pid: u32) -> u32 {
-    let user = |p: u32| fs::read_link(format!("/proc/{p}/ns/user")).ok();
+    // Ubuntu gives an empty link instead of an error for processes of other users, like PID 1
+    let user = |p: u32| {
+        fs::read_link(format!("/proc/{p}/ns/user")).ok().filter(|l| !l.as_os_str().is_empty())
+    };
     let ours = user(std::process::id());
     let mut found = pid;
     while let Some(p) = parent(found).filter(|&p| user(p).is_some_and(|u| Some(u) != ours)) {

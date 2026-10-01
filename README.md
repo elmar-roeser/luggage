@@ -206,6 +206,14 @@ Your home in the VM (same path as on the host, but not your host files) lives on
 Composer's survive a restart. `/var` with the service data lives next to it in `var.img`.
 To reset the home, delete the image while the VM is stopped: `luggage down`, `rm …/vm/home.img`, `luggage up`.
 
+File watchers in the VM (Vite, webpack/Encore, `npm run dev`, phpunit-watcher) see your edits on the host:
+inotify in the VM does not notice host writes over virtiofs, so luggage watches the project on the host and
+marks each changed file in the VM with a `chmod` to its own mode, which the watchers report as a change
+(within about 0.1 s). It leaves out `.git`, `vendor`, `var`, `.idea`, `.direnv`, `.luggage` and every
+`node_modules`. Changes made in the VM reach the watchers anyway; a bare `chmod` on the host is not passed on.
+If a watcher still misses changes, e.g. in a left-out directory, switch it to polling: `CHOKIDAR_USEPOLLING=1`
+(Vite, chokidar), `WATCHPACK_POLLING=true` (webpack), or the `usePolling`/`poll` option of the tool.
+
 The `ports` of the taken-over Compose services are reachable from the host browser, but only on 127.0.0.1,
 never from the network (`"8026:8025"` in `compose.yaml` → `127.0.0.1:8026`). Mailpit without `ports`
 gets its web UI on `127.0.0.1:8025`. Your own services list theirs in `chest.toml`, as `"host:guest"` or `"port"`:

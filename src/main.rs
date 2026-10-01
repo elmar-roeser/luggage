@@ -10,6 +10,7 @@ mod remote;
 mod setup;
 mod versions;
 mod vm;
+mod watch;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -112,6 +113,12 @@ enum Cmd {
     NetworkProxy {
         /// File with the allowed hosts, one per line
         file: PathBuf,
+    },
+    /// Print each path the host changes in a project (the VM marks it for file watchers)
+    #[command(hide = true)]
+    WatchProject {
+        /// Project directory
+        dir: PathBuf,
     },
 }
 
@@ -466,6 +473,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             chest::Chest::find(&nixpkgs, true)?.cmd_hook(&nixpkgs)
         }
         Cmd::NetworkProxy { file } => proxy::serve(&file),
+        Cmd::WatchProject { dir } => watch::serve(&dir),
     }
 }
 

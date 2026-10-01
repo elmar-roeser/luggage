@@ -210,6 +210,28 @@ luggage reads the values of all passed variables from your environment at each c
 bwrap, nsenter or ssh in their environment, never on a command line or in a file; only the names are stored.
 They reach `exec`, `open`, `run` and the stand-ins, not the services.
 
+Without `network`, the bubblewrap chest has no network: its services, `exec` and `open` reach only the chest,
+and `luggage run --net` uses the network of the host. The VM has open network access. To allow only some
+hosts in either mode, list them in `network`; an entry allows the host and all its subdomains (`github.com`
+also allows `api.github.com`) on ports 80 and 443, and `network = []` closes the network. An entry with a
+port, like `"git.example.com:22"`, allows only that port; write IPv6 addresses in brackets (`"[::1]:8080"`):
+
+```toml
+network = ["packagist.org", "github.com", "npmjs.org"]
+```
+
+A name that resolves to a loopback, private (LAN, `100.64.0.0/10`) or link-local address is refused, so a
+listed domain cannot lead to services on your machine or network. To reach those, list the IP address itself
+or `localhost`, for example `"localhost:8080"` or `"192.168.1.10:443"`.
+
+The chest then reaches the outside only through a proxy that luggage runs on the host for each connection;
+`luggage run` without `--net` stays offline. Commands and services get `http_proxy`, `https_proxy` and
+`no_proxy` (localhost and the `hosts`), which curl, git over HTTPS, Composer and npm follow. The chest has no
+DNS and no direct connections, so tools that ignore these variables, and git over ssh, cannot get out. At most
+256 connections go through the proxy at once; more get the error 503. In the bubblewrap chest, a socat on
+`127.0.0.1:3128` passes the connections to the host. A changed list applies to the next connection after the
+next luggage command; adding or removing `network` needs a restart. `luggage status` shows the list.
+
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
 
@@ -251,27 +273,6 @@ marks each changed file in the VM with a `chmod` to its own mode, which the watc
 `node_modules`. Changes made in the VM reach the watchers anyway; a bare `chmod` on the host is not passed on.
 If a watcher still misses changes, e.g. in a left-out directory, switch it to polling: `CHOKIDAR_USEPOLLING=1`
 (Vite, chokidar), `WATCHPACK_POLLING=true` (webpack), or the `usePolling`/`poll` option of the tool.
-
-The VM has open network access. To allow only some hosts, list them in `network`; an entry allows the host
-and all its subdomains (`github.com` also allows `api.github.com`) on ports 80 and 443, and `network = []`
-closes the network. An entry with a port, like `"git.example.com:22"`, allows only that port; write IPv6
-addresses in brackets (`"[::1]:8080"`):
-
-```toml
-network = ["packagist.org", "github.com", "npmjs.org"]
-```
-
-A name that resolves to a loopback, private (LAN, `100.64.0.0/10`) or link-local address is refused, so a
-listed domain cannot lead to services on your machine or network. To reach those, list the IP address itself
-or `localhost`, for example `"localhost:8080"` or `"192.168.1.10:443"`.
-
-The VM then reaches the outside only through a proxy that luggage runs on the host for each connection.
-Commands and services get `http_proxy`, `https_proxy` and `no_proxy` (localhost and the `hosts`), which curl,
-git over HTTPS, Composer and npm follow. The guest has no DNS and no direct connections, so tools that ignore
-these variables, and git over ssh, cannot get out. At most 256 connections go through the proxy at once; more
-get the error 503. The forwarded ports work as before. A changed list applies to
-the next connection after the next luggage command; adding or removing `network` needs a restart.
-`luggage status` shows the list. `network` needs `mode = "vm"`.
 
 ## Development
 

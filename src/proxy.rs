@@ -1,7 +1,7 @@
-//! The proxy behind `network` in chest.toml, the only way out of a restricted VM.
+//! The proxy behind `network` in chest.toml, the only way out of a restricted chest.
 //!
-//! qemu runs `luggage network-proxy <file>` with each guest connection to `GUEST` on stdin and stdout; it serves
-//! one HTTP request or `CONNECT` tunnel to a host in the allowlist `<file>`.
+//! qemu (VM) or socat (bubblewrap) runs `luggage network-proxy <file>` with each connection of the chest on stdin
+//! and stdout; it serves one HTTP request or `CONNECT` tunnel to a host in the allowlist `<file>`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

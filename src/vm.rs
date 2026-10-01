@@ -743,20 +743,26 @@ fn render_rc(name: &str, proxy: Option<&[String]>) -> String {
         sh_quote(name)
     );
     if let Some(local) = proxy {
-        let url = format!("http://{}", crate::proxy::GUEST);
-        let no_proxy = ["localhost", "127.0.0.1", "::1"]
-            .into_iter()
-            .chain(local.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(",");
-        rc.push_str("export");
-        for (k, v) in [("http_proxy", &url), ("https_proxy", &url), ("no_proxy", &no_proxy)] {
-            let v = sh_quote(v);
-            let _ = write!(rc, " {k}={v} {}={v}", k.to_ascii_uppercase());
-        }
-        rc.push('\n');
+        rc.push_str(&proxy_env(crate::proxy::GUEST, local));
     }
     rc
+}
+
+/// A shell line that sends HTTP clients to the proxy at `addr`, except for the chest itself and the names in `local`.
+pub fn proxy_env(addr: &str, local: &[String]) -> String {
+    let url = format!("http://{addr}");
+    let no_proxy = ["localhost", "127.0.0.1", "::1"]
+        .into_iter()
+        .chain(local.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut line = String::from("export");
+    for (k, v) in [("http_proxy", &url), ("https_proxy", &url), ("no_proxy", &no_proxy)] {
+        let v = sh_quote(v);
+        let _ = write!(line, " {k}={v} {}={v}", k.to_ascii_uppercase());
+    }
+    line.push('\n');
+    line
 }
 
 /// Does the host variable go into the guest without `pass_env`? Terminal, time zone, editor and color settings

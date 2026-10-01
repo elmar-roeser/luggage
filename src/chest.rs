@@ -9,9 +9,10 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
@@ -29,6 +30,8 @@ const RUN_INSIDE: &str = "/run/luggage";
 const PC_GUEST: &str = "/run/current-system/sw/bin/process-compose";
 /// How many ports after a taken host port luggage tries before it gives up.
 const PORT_TRIES: u16 = 100;
+/// Address of the proxy for `network` in the bubblewrap chest; a socat passes it on to the host.
+const PROXY_INSIDE: &str = "127.0.0.1:3128";
 /// Name of the guard process that ends the port bridges of a bubblewrap chest together with the chest.
 const BRIDGES: &str = "luggage-bridges";
 /// Closes every inherited file descriptor above 2, then runs the arguments.
@@ -54,7 +57,7 @@ pub struct Definition {
     pub ports: BTreeMap<String, Vec<String>>,
     /// Host variables that commands in the chest get besides the harmless defaults, e.g. tokens; read at each command
     pub pass_env: Vec<String>,
-    /// The only hosts the VM may reach, each with its subdomains and on 80 and 443 unless it names a port
+    /// The only hosts the chest may reach, each with its subdomains and on 80 and 443 unless it names a port
     pub network: Option<Vec<String>>,
 }
 
@@ -127,15 +130,12 @@ fn parse(text: &str) -> Result<Definition> {
     if let Some(n) = def.pass_env.iter().find(|n| !vm::is_env_name(n)) {
         bail!("pass_env: {n:?} is not a variable name");
     }
-    if let Some(network) = &def.network {
-        if let Some(h) = network.iter().find(|h| !crate::proxy::is_entry(h)) {
-            bail!(
-                "network: {h:?} is not a host like \"github.com\", \"git.example.com:22\" or \"[::1]:8080\""
-            );
-        }
-        if def.mode != Mode::Vm {
-            bail!("network needs mode = \"vm\"");
-        }
+    if let Some(network) = &def.network
+        && let Some(h) = network.iter().find(|h| !crate::proxy::is_entry(h))
+    {
+        bail!(
+            "network: {h:?} is not a host like \"github.com\", \"git.example.com:22\" or \"[::1]:8080\""
+        );
     }
     Ok(def)
 }
@@ -458,15 +458,14 @@ impl Chest {
     /// The rc file for bash: loads the dev environment, sets `PATH` and changes to the project.
     fn render_rc(&self, tools: &Tools) -> String {
         let user = std::env::var("USER").unwrap_or_default();
-        format!(
+        let mut rc = format!(
             "source {RUN_INSIDE}/env.sh\n\
              export HOME={home} USER={user} TMPDIR=/tmp LUGGAGE_CHEST={name}\n\
              unset NIX_BUILD_TOP TEMP TMP TEMPDIR\n\
              export SSL_CERT_FILE={ca} NIX_SSL_CERT_FILE={ca}\n\
              export PATH={pkgs}{pc}/bin:{bash}/bin:{core}/bin:\"$PATH\"\n\
              cd {project}\n\
-             PS1='[chest:{name_plain}] \\w\\$ '\n\
-             eval \"${{{pass}-}}\"; unset {pass}\n",
+             PS1='[chest:{name_plain}] \\w\\$ '\n",
             home = sh_quote(&home().to_string_lossy()),
             user = sh_quote(&user),
             name = sh_quote(&self.name),
@@ -477,8 +476,12 @@ impl Chest {
             pkgs = tools.packages.iter().fold(String::new(), |acc, p| acc + p + "/bin:"),
             project = sh_quote(&self.project.to_string_lossy()),
             name_plain = self.name,
-            pass = vm::PASS_ENV,
-        )
+        );
+        if self.def.network.is_some() {
+            rc.push_str(&vm::proxy_env(PROXY_INSIDE, &self.def.hosts));
+        }
+        let _ = writeln!(rc, "eval \"${{{p}-}}\"; unset {p}", p = vm::PASS_ENV);
+        rc
     }
 
     /// Generates `process-compose.yaml` from the services.
@@ -638,7 +641,30 @@ impl Chest {
         fs::write(self.run.join("rc"), self.render_rc(&tools))?;
         fs::write(self.run.join("hosts"), self.render_hosts())?;
         fs::write(self.run.join("process-compose.yaml"), self.render_compose())?;
+        if self.def.network.is_none() {
+            let _ = fs::remove_file(self.network_file());
+        }
+        self.sync_network(true)?;
         Ok(tools)
+    }
+
+    /// The allowlist that the proxy reads: in the runtime dir for the VM, in the state dir for bubblewrap,
+    /// whose chest can write its runtime dir.
+    fn network_file(&self) -> PathBuf {
+        if self.def.mode == Mode::Vm { &self.run } else { &self.state }.join("network")
+    }
+
+    /// Writes `network` to `network_file` if it changed and the file exists or `create`.
+    /// The proxy reads it for each connection, so a changed list applies without a restart.
+    fn sync_network(&self, create: bool) -> Result<()> {
+        let file = self.network_file();
+        if let (Some(hosts), true) = (&self.def.network, create || file.exists()) {
+            let hosts = hosts.join("\n");
+            if fs::read_to_string(&file).ok().as_deref() != Some(hosts.as_str()) {
+                fs::write(&file, hosts)?;
+            }
+        }
+        Ok(())
     }
 
     /// Runs a one-off command in a fresh chest; without a command, a shell.
@@ -649,7 +675,22 @@ impl Chest {
         }
         let tools = self.prepare(nixpkgs)?;
         let mut c = self.run_command(&tools, net, cmd, &self.host_env(std::env::vars_os()))?;
-        pass_through(c.status().context("cannot start bwrap")?);
+        if !(net && self.def.network.is_some()) {
+            pass_through(c.status().context("cannot start bwrap")?);
+            return Ok(());
+        }
+        // the proxy for this command alone; its guard follows luggage, which waits for the command
+        let sock = self.run.join(run_proxy_sock());
+        let log = File::create(self.run.join("proxy.log"))?;
+        let listener = bind_proxy(&sock)?;
+        let mut group = guard(&tools, std::process::id(), &log)?;
+        let status = self
+            .serve_proxy(&tools, group.id(), listener, &log)
+            .and_then(|()| c.status().context("cannot start bwrap"));
+        kill_group(group.id());
+        let _ = group.wait();
+        let _ = fs::remove_file(&sock);
+        pass_through(status?);
         Ok(())
     }
 
@@ -661,13 +702,35 @@ impl Chest {
         cmd: &[String],
         pass: &OsStr,
     ) -> Result<Command> {
-        let mut c = Command::new(&tools.bwrap);
+        let proxied = net && self.def.network.is_some();
+        let mut c = if proxied {
+            let own = own_net(tools);
+            let mut c = Command::new(&own[0]);
+            c.args(&own[1..]).arg(&tools.bwrap);
+            c
+        } else {
+            Command::new(&tools.bwrap)
+        };
+        let net = match (net, proxied) {
+            (_, true) => Net::Own,
+            (true, false) => Net::Share,
+            (false, false) => Net::Off,
+        };
         clean_env(&mut c)
             .env(vm::PASS_ENV, pass)
-            .args(self.bwrap_args(tools, if net { Net::Share } else { Net::Off })?)
-            .arg("--die-with-parent")
-            .arg(tools.bash())
-            .arg("--noprofile");
+            .args(self.bwrap_args(tools, net)?)
+            .arg("--die-with-parent");
+        if proxied {
+            // the command must not start before the proxy listens on 127.0.0.1:3128 (0C38 in /proc/net/tcp)
+            let wait = format!(
+                r#"for _ in {{1..100}}; do [[ $(</proc/net/tcp) == *" 0100007F:0C38 00000000:0000 0A "* ]] && break; {}/bin/sleep 0.01; done; exec "$@""#,
+                tools.coreutils
+            );
+            c.args([tools.bash(), "--noprofile".into(), "-c".into()])
+                .arg(self.inside_proxy(tools, &run_proxy_sock()) + &wait)
+                .arg("sh");
+        }
+        c.arg(tools.bash()).arg("--noprofile");
         shell_args(&mut c, cmd);
         Ok(c)
     }
@@ -686,14 +749,7 @@ impl Chest {
         if fs::read_to_string(&compose).ok().as_deref() != Some(yaml.as_str()) {
             fs::write(&compose, yaml)?;
         }
-        // the proxy reads the allowlist for each connection, so a changed list applies without a restart
-        let network = self.run.join("network");
-        if let (Some(hosts), true) = (&self.def.network, network.exists()) {
-            let hosts = hosts.join("\n");
-            if fs::read_to_string(&network).ok().as_deref() != Some(hosts.as_str()) {
-                fs::write(&network, hosts)?;
-            }
-        }
+        self.sync_network(false)?;
         vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env, &compose, &self.def.hosts)
     }
 
@@ -972,30 +1028,36 @@ impl Chest {
         let info_json = self.run.join("info.json");
         let _ = fs::remove_file(&info_json);
         let _ = fs::remove_file(self.socket());
-        let main = if self.def.services.is_empty() {
-            "exec sleep infinity".to_owned()
-        } else {
-            format!(
-                "{}exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml",
-                self.inside_bridges(&tools)
-            )
-        };
+        stop_bridges(&self.run);
+        // bound before the chest starts, so early connections wait for the proxy instead of failing
+        let proxy = self.def.network.as_ref().map(|_| bind_proxy(&self.run.join("proxy.sock")));
+        let main = self.inside_proxy(&tools, "proxy.sock")
+            + &if self.def.services.is_empty() {
+                "exec sleep infinity".to_owned()
+            } else {
+                format!(
+                    "{}exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml",
+                    self.inside_bridges(&tools)
+                )
+            };
         let log = File::create(self.run.join("chest.log"))?;
-        // Own network namespace via unshare: we are root in it and allow ports < 1024, only for the chest.
         // bwrap reports the PID of its child (PID 1 of the chest) on fd 3.
-        let ip = format!("{}/bin/ip", tools.iproute2);
         Command::new(tools.bash())
             .args(["-c", r#"exec 3>"$1"; shift; exec "$@""#, "sh"])
             .arg(&info_json)
             .arg(tools.util("setsid"))
-            .args([&tools.util("unshare"), "--user", "--map-root-user", "--net"])
-            .args([&tools.bash(), "-c"])
-            .arg(format!(
-                r#"{ip} link set lo up && echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start && exec "$@""#
-            ))
-            .args(["sh", &tools.bwrap])
+            .args(own_net(&tools))
+            .arg(&tools.bwrap)
             .args(self.bwrap_args(&tools, Net::Own)?)
-            .args(["--clearenv", "--setenv", "HOME", &home().to_string_lossy(), "--setenv", "TERM", &term()])
+            .args([
+                "--clearenv",
+                "--setenv",
+                "HOME",
+                &home().to_string_lossy(),
+                "--setenv",
+                "TERM",
+                &term(),
+            ])
             .args(["--info-fd", "3"])
             .arg(tools.bash())
             .args(["--noprofile", "-c", &format!("source {RUN_INSIDE}/rc; {main}")])
@@ -1017,7 +1079,7 @@ impl Chest {
         if !alive(pid) {
             bail!("chest stopped right away — see {}/chest.log and pc.log", self.run.display());
         }
-        self.bridge_ports(&tools, pid)?;
+        self.bridge_ports(&tools, pid, proxy.transpose()?)?;
         // Return only once the services are ready. Also, a `down` while a readiness_probe
         // is still pending hangs in process-compose.
         if !self.def.services.is_empty() {
@@ -1063,26 +1125,54 @@ impl Chest {
         })
     }
 
-    /// Bridges the service ports from 127.0.0.1 on the host to the sockets of `inside_bridges`, one socat per port.
-    /// They share a process group with a guard that ends the group once the chest `pid` is gone.
-    fn bridge_ports(&self, tools: &Tools, pid: u32) -> Result<()> {
-        stop_bridges(&self.run);
-        if self.def.services.values().all(|s| s.ports.is_empty()) {
-            return Ok(());
+    /// Shell code for the chest that starts a socat from `PROXY_INSIDE` to the host proxy at `/run/luggage/<sock>`,
+    /// if the chest has a `network`.
+    fn inside_proxy(&self, tools: &Tools, sock: &str) -> String {
+        if self.def.network.is_none() {
+            return String::new();
         }
-        let log = File::create(self.run.join("bridges.log"))?;
-        let guard = Command::new(tools.bash())
-            .args(["-c", r#""$2" --pid="$1" -f /dev/null; kill -TERM 0"#, BRIDGES])
-            .arg(pid.to_string())
-            .arg(format!("{}/bin/tail", tools.coreutils))
-            .process_group(0)
-            .stdin(Stdio::null())
+        let port = PROXY_INSIDE.rsplit_once(':').map_or("", |(_, p)| p);
+        format!(
+            "{}/bin/socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{RUN_INSIDE}/{sock} 2>>{RUN_INSIDE}/proxy.log & ",
+            tools.socat
+        )
+    }
+
+    /// Serves each connection to `listener` with a `luggage network-proxy` of its own, in the process group `group`.
+    fn serve_proxy(
+        &self,
+        tools: &Tools,
+        group: u32,
+        listener: UnixListener,
+        log: &File,
+    ) -> Result<()> {
+        Command::new(format!("{}/bin/socat", tools.socat))
+            .arg("ACCEPT-FD:0,fork")
+            // socat drops plain quotes; the paths come from the environment, so they need no quoting
+            .arg(r#"SYSTEM:exec \"$LUGGAGE_EXE\" network-proxy \"$LUGGAGE_NETWORK\""#)
+            .env("LUGGAGE_EXE", std::env::current_exe()?)
+            .env("LUGGAGE_NETWORK", self.network_file())
+            .process_group(i32::try_from(group)?)
+            .stdin(OwnedFd::from(listener))
             .stdout(Stdio::null())
             .stderr(log.try_clone()?)
             .spawn()
-            .context("cannot start the port bridges")?;
-        let group = guard.id();
+            .context("cannot start the proxy")?;
+        Ok(())
+    }
+
+    /// Bridges the service ports from 127.0.0.1 on the host to the sockets of `inside_bridges`, one socat per port,
+    /// and serves the `proxy` socket. They share a process group with a guard that ends it once the chest `pid` is gone.
+    fn bridge_ports(&self, tools: &Tools, pid: u32, proxy: Option<UnixListener>) -> Result<()> {
+        if self.def.services.values().all(|s| s.ports.is_empty()) && proxy.is_none() {
+            return Ok(());
+        }
+        let log = File::create(self.run.join("bridges.log"))?;
+        let group = guard(tools, pid, &log)?.id();
         fs::write(self.run.join("bridges.pid"), group.to_string())?;
+        if let Some(listener) = proxy {
+            self.serve_proxy(tools, group, listener, &log)?;
+        }
         let socat = format!("{}/bin/socat", tools.socat);
         self.forward_ports(|host, guest| {
             // luggage binds the port itself, so a taken one fails here and not later in socat
@@ -1193,6 +1283,7 @@ impl Chest {
             format!("chest {} is not running — run `luggage up` first", self.name)
         })?;
         let tools = self.tools()?;
+        self.sync_network(false)?;
         let mut c = nsenter(pid, &tools);
         c.env(vm::PASS_ENV, self.host_env(std::env::vars_os()));
         shell_args(&mut c, cmd);
@@ -1312,13 +1403,19 @@ impl Chest {
             "Ports:       {}",
             if ports.is_empty() { "none".into() } else { ports.join(", ") }
         );
-        if self.def.mode == Mode::Vm {
-            let network = match fs::read_to_string(self.run.join("network")) {
-                Err(_) => "open".into(),
-                Ok(n) if n.trim().is_empty() => "closed".into(),
-                Ok(n) => format!("only {}", n.lines().collect::<Vec<_>>().join(", ")),
-            };
-            println!("Network:     {network}");
+        // without the proxy, the VM is open and the bubblewrap chest has no network
+        let vm = self.def.mode == Mode::Vm;
+        let proxied = if vm { self.network_file() } else { self.run.join("proxy.sock") }.exists();
+        let hosts = fs::read_to_string(self.network_file()).unwrap_or_default();
+        let network = if vm && !proxied {
+            "open".into()
+        } else if !proxied || hosts.trim().is_empty() {
+            "closed".into()
+        } else {
+            format!("only {}", hosts.lines().collect::<Vec<_>>().join(", "))
+        };
+        println!("Network:     {network}");
+        if vm {
             self.vm_warn_outdated(nixpkgs);
         }
         if self.def.mode == Mode::Vm && !self.def.services.is_empty() {
@@ -1335,7 +1432,7 @@ impl Chest {
     }
 }
 
-/// Stops the port bridges of a bubblewrap chest, if they still run, and forgets their ports.
+/// Stops the port bridges and the proxy of a bubblewrap chest, if they still run, and forgets their ports.
 fn stop_bridges(run: &Path) {
     let pid_file = run.join("bridges.pid");
     if let Some(pid) = fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
@@ -1343,12 +1440,60 @@ fn stop_bridges(run: &Path) {
         && fs::read(format!("/proc/{pid}/cmdline"))
             .is_ok_and(|c| c.windows(BRIDGES.len()).any(|w| w == BRIDGES.as_bytes()))
     {
-        let _ =
-            Command::new("kill").args(["--", &format!("-{pid}")]).stderr(Stdio::null()).status();
+        kill_group(pid);
         wait_dead(pid, 20);
     }
-    let _ = fs::remove_file(pid_file);
-    let _ = fs::remove_file(run.join("ports"));
+    for f in [pid_file, run.join("ports"), run.join("proxy.sock")] {
+        let _ = fs::remove_file(f);
+    }
+}
+
+/// Sends SIGTERM to the process group `group`.
+fn kill_group(group: u32) {
+    let _ = Command::new("kill").args(["--", &format!("-{group}")]).stderr(Stdio::null()).status();
+}
+
+/// Starts the leader of a new process group that ends the group once `pid` is gone; it logs to `log`.
+fn guard(tools: &Tools, pid: u32, log: &File) -> Result<Child> {
+    Command::new(tools.bash())
+        .args(["-c", r#""$2" --pid="$1" -f /dev/null; kill -TERM 0"#, BRIDGES])
+        .arg(pid.to_string())
+        .arg(format!("{}/bin/tail", tools.coreutils))
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log.try_clone()?)
+        .spawn()
+        .context("cannot start the port bridges")
+}
+
+/// Listens on the socket `sock` for the proxy, in place of an old one.
+fn bind_proxy(sock: &Path) -> Result<UnixListener> {
+    let _ = fs::remove_file(sock);
+    UnixListener::bind(sock).with_context(|| format!("cannot listen on {}", sock.display()))
+}
+
+/// The socket of the proxy for one `luggage run`, in the runtime dir.
+fn run_proxy_sock() -> String {
+    format!("proxy-{}.sock", std::process::id())
+}
+
+/// unshare and a shell that run the rest of the command in its own network namespace with only `lo`,
+/// where it is root and may use ports below 1024.
+fn own_net(tools: &Tools) -> Vec<String> {
+    let ip = format!("{}/bin/ip", tools.iproute2);
+    vec![
+        tools.util("unshare"),
+        "--user".into(),
+        "--map-root-user".into(),
+        "--net".into(),
+        tools.bash(),
+        "-c".into(),
+        format!(
+            r#"{ip} link set lo up && echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start && exec "$@""#
+        ),
+        "sh".into(),
+    ]
 }
 
 /// bash in all namespaces of the running chest (like `docker exec`).
@@ -1500,7 +1645,7 @@ depends_on = ["db"]
             parse("mode = \"vm\"\nnetwork = [\"git.example.com:22\", \"[::1]:8080\"]").unwrap();
         assert_eq!(def.network.unwrap(), ["git.example.com:22", "[::1]:8080"]);
         assert!(parse("mode = \"vm\"\nnetwork = [\"github.com:ssh\"]").is_err());
-        assert!(parse("network = [\"github.com\"]").is_err());
+        assert_eq!(parse("network = [\"github.com\"]").unwrap().network.unwrap(), ["github.com"]);
     }
 
     #[test]
@@ -1669,6 +1814,39 @@ depends_on = ["db"]
             t.render_rc(&tools())
                 .ends_with("eval \"${LUGGAGE_PASS_ENV-}\"; unset LUGGAGE_PASS_ENV\n")
         );
+    }
+
+    #[test]
+    fn bubblewrap_network_goes_through_the_proxy() {
+        let open = chest(Definition::default());
+        let t = chest(parse("hosts = [\"database\"]\nnetwork = [\"github.com\"]").unwrap());
+        assert!(!open.render_rc(&tools()).contains("proxy"));
+        let rc = t.render_rc(&tools());
+        assert!(
+            rc.contains(" https_proxy='http://127.0.0.1:3128' HTTPS_PROXY='http://127.0.0.1:3128'")
+        );
+        assert!(rc.contains(" no_proxy='localhost,127.0.0.1,::1,database' NO_PROXY="));
+        // the chest must not change its own allowlist, so the list lives outside its runtime dir
+        assert!(!t.network_file().starts_with(&t.run));
+        assert_eq!(open.inside_proxy(&tools(), "proxy.sock"), "");
+        assert_eq!(
+            t.inside_proxy(&tools(), "proxy.sock"),
+            "/nix/store/s-socat/bin/socat TCP-LISTEN:3128,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/luggage/proxy.sock 2>>/run/luggage/proxy.log & "
+        );
+        let args = |c: &Chest, net| -> Vec<String> {
+            let c = c.run_command(&tools(), net, &["true".to_owned()], OsStr::new("")).unwrap();
+            std::iter::once(c.get_program())
+                .chain(c.get_args())
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let proxied = args(&t, true);
+        assert_eq!(proxied[0], "/nix/store/u-util-linux/bin/unshare");
+        assert!(proxied.contains(&"--unshare-user".to_owned()));
+        assert!(proxied.iter().any(|a| a.contains("UNIX-CONNECT:/run/luggage/proxy-")));
+        assert!(!proxied.contains(&"--share-net".to_owned()));
+        assert!(args(&t, false).contains(&"--unshare-all".to_owned()));
+        assert!(args(&open, true).contains(&"--share-net".to_owned()));
     }
 
     #[test]

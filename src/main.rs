@@ -108,7 +108,7 @@ enum Cmd {
     Status,
     /// Print shell code for direnv; the .envrc runs it
     Hook,
-    /// Serve one connection of the VM to the proxy for `network` (qemu starts it)
+    /// Serve one connection of the chest to the proxy for `network` (qemu or socat starts it)
     #[command(hide = true)]
     NetworkProxy {
         /// File with the allowed hosts, one per line

@@ -48,7 +48,7 @@ pub struct Definition {
     pub mode: Mode,
     /// Fixed host ports per service, replacing its own; a taken one is not moved to a free port
     pub ports: BTreeMap<String, Vec<String>>,
-    /// Host variables that commands in the VM get, also `ANTHROPIC_*` and `CLAUDE_*`; read at each command
+    /// Host variables that commands in the VM get besides the harmless defaults, e.g. tokens; read at each command
     pub pass_env: Vec<String>,
     /// The only hosts the VM may reach, each with its subdomains and on 80 and 443 unless it names a port
     pub network: Option<Vec<String>>,

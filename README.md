@@ -236,12 +236,15 @@ database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
 
 In the bubblewrap chest, `ports` has no effect yet.
 
-Commands in the VM get your shell's variables, except those that describe the host session and
-API keys: `ANTHROPIC_*` and `CLAUDE_*` stay on the host. To let an agent in the VM use its key,
-name the variables in `pass_env`:
+Commands in the VM get the project's dev environment from the flake, not your shell. Of your shell's
+variables only harmless ones go along: `TERM`, `COLORTERM`, `TZ`, `EDITOR`, `VISUAL`, `PAGER`, `NO_COLOR`,
+`FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `VIRTUAL_ENV` and, with an open network, the proxy variables like
+`https_proxy`. The VM has its own locale (`en_US.UTF-8`), so `LANG` and `LC_*` stay on the host. Everything
+else stays there too, including tokens like `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and `ANTHROPIC_*`, and
+settings like `APP_ENV`. Name the variables a command in the VM needs in `pass_env`:
 
 ```toml
-pass_env = ["ANTHROPIC_API_KEY"]
+pass_env = ["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]
 ```
 
 luggage reads the values of all passed variables from your environment at each command and hands them to ssh

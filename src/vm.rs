@@ -759,58 +759,23 @@ fn render_rc(name: &str, proxy: Option<&[String]>) -> String {
     rc
 }
 
-/// Does the host variable stay on the host? These describe the host session, point to host paths
-/// or would override the dev environment in the guest.
-fn host_only(var: &str) -> bool {
-    const NAMES: [&str; 22] = [
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "PWD",
-        "OLDPWD",
-        "SHLVL",
-        "_",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-        "TEMPDIR",
-        "HOSTNAME",
-        "MAIL",
-        "DISPLAY",
-        "IN_NIX_SHELL",
-        "LANG",
-        "LANGUAGE",
+/// Does the host variable go into the guest without `pass_env`? Terminal, time zone, editor and color settings
+/// and the `.venv` of the luggage `.envrc` do; not the locale, the guest has only its own English one.
+fn harmless(var: &str) -> bool {
+    const NAMES: [&str; 11] = [
         "TERM",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    ];
-    const PREFIXES: [&str; 22] = [
-        "SSH_",
-        "WAYLAND_",
-        "XDG_",
-        "DBUS_",
-        "DIRENV_",
-        "LUGGAGE_",
-        "NIX_",
-        "LC_",
         "COLORTERM",
-        "TERM_PROGRAM",
-        "GPG_",
-        "KRB5",
-        "DESKTOP_",
-        "GDM",
-        "GNOME",
-        "QT_",
-        "GTK_",
-        "ZSH",
-        "LESS",
-        "CLAUDE",
-        "ANTHROPIC",
-        "OTEL",
+        "TZ",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "VIRTUAL_ENV",
     ];
-    NAMES.contains(&var) || PREFIXES.iter().any(|p| var.starts_with(p))
+    NAMES.contains(&var)
 }
 
 /// Can the shell `export` a variable of this name?
@@ -819,7 +784,7 @@ pub fn is_env_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The `host` variables that go along into the guest: those of `pass` and all that need not stay on the host.
+/// The `host` variables that go along into the guest: those of `pass`, the harmless ones and the proxy variables.
 /// Behind the proxy (`proxied`) the proxy variables of the host stay on the host, the guest has its own.
 fn passed_env(
     host: impl IntoIterator<Item = (OsString, OsString)>,
@@ -829,7 +794,7 @@ fn passed_env(
     host.into_iter()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
         .filter(|(k, _)| {
-            pass.contains(k) || (!host_only(k) && is_env_name(k) && !(proxied && is_proxy_var(k)))
+            pass.contains(k) || (is_env_name(k) && (harmless(k) || (!proxied && is_proxy_var(k))))
         })
         .collect()
 }
@@ -1154,7 +1119,7 @@ mod tests {
         ];
         let vars = passed_env(
             host.map(|(k, v)| (k.into(), v.into())),
-            &["ANTHROPIC_API_KEY".to_owned()],
+            &["GITHUB_TOKEN".to_owned(), "ANTHROPIC_API_KEY".to_owned()],
             true,
         );
         let r = remote_command(Path::new("/p"), true, &["claude".to_owned()]);
@@ -1194,21 +1159,39 @@ mod tests {
     }
 
     #[test]
-    fn host_variables_stay_on_the_host() {
-        for v in [
+    fn only_harmless_host_variables_go_along() {
+        let host = [
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "NPM_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "APP_ENV",
             "PATH",
             "HOME",
             "SSH_AUTH_SOCK",
-            "XDG_RUNTIME_DIR",
             "NIX_PATH",
-            "SSL_CERT_FILE",
+            "LANG",
+            "LC_ALL",
             "TERM",
-        ] {
-            assert!(host_only(v), "{v}");
-        }
-        for v in ["APP_ENV", "DATABASE_URL", "XDEBUG_MODE", "PHP_INI_SCAN_DIR"] {
-            assert!(!host_only(v), "{v}");
-        }
+            "COLORTERM",
+            "TZ",
+            "EDITOR",
+            "NO_COLOR",
+            "VIRTUAL_ENV",
+            "https_proxy",
+        ];
+        let names = |pass: &[&str], proxied| {
+            let pass: Vec<String> = pass.iter().map(|&p| p.to_owned()).collect();
+            let host = host.map(|k| (k.into(), "v".into()));
+            passed_env(host, &pass, proxied).into_iter().map(|(k, _)| k).collect::<Vec<_>>()
+        };
+        let harmless = ["TERM", "COLORTERM", "TZ", "EDITOR", "NO_COLOR", "VIRTUAL_ENV"];
+        assert_eq!(names(&[], true), harmless);
+        assert_eq!(names(&[], false), [&harmless[..], &["https_proxy"]].concat());
+        assert_eq!(
+            names(&["NPM_TOKEN", "APP_ENV"], true),
+            [&["NPM_TOKEN", "APP_ENV"], &harmless[..]].concat()
+        );
         for v in ["http_proxy", "HTTPS_PROXY", "no_proxy", "ALL_PROXY"] {
             assert!(is_proxy_var(v), "{v}");
         }

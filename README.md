@@ -210,11 +210,12 @@ luggage reads the values of all passed variables from your environment at each c
 bwrap, nsenter or ssh in their environment, never on a command line or in a file; only the names are stored.
 They reach `exec`, `open`, `run` and the stand-ins, not the services.
 
-Without `network`, the bubblewrap chest has no network: its services, `exec` and `open` reach only the chest,
-and `luggage run --net` uses the network of the host. The VM has open network access. To allow only some
-hosts in either mode, list them in `network`; an entry allows the host and all its subdomains (`github.com`
-also allows `api.github.com`) on ports 80 and 443, and `network = []` closes the network. An entry with a
-port, like `"git.example.com:22"`, allows only that port; write IPv6 addresses in brackets (`"[::1]:8080"`):
+**Without `network`, the two modes differ:** the bubblewrap chest has no network (its services, `exec` and
+`open` reach only the chest, and `luggage run --net` uses the network of the host), but the VM has open network
+access. To allow only some hosts in either mode, list them in `network`; an entry allows the host and all its
+subdomains (`github.com` also allows `api.github.com`) on ports 80 and 443, and `network = []` closes the
+network. An entry with a port, like `"git.example.com:22"`, allows only that port; write IPv6 addresses in
+brackets (`"[::1]:8080"`):
 
 ```toml
 network = ["packagist.org", "github.com", "npmjs.org"]

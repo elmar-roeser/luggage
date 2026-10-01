@@ -50,7 +50,7 @@ pub struct Definition {
     pub ports: BTreeMap<String, Vec<String>>,
     /// Host variables that commands in the VM get, also `ANTHROPIC_*` and `CLAUDE_*`; read at each command
     pub pass_env: Vec<String>,
-    /// The only hosts the VM may reach, each with its subdomains; without it the network is open
+    /// The only hosts the VM may reach, each with its subdomains and on 80 and 443 unless it names a port
     pub network: Option<Vec<String>>,
 }
 
@@ -128,9 +128,9 @@ fn parse(text: &str) -> Result<Definition> {
         bail!("pass_env needs mode = \"vm\"");
     }
     if let Some(network) = &def.network {
-        if let Some(h) = network.iter().find(|h| !crate::proxy::is_host(h)) {
+        if let Some(h) = network.iter().find(|h| !crate::proxy::is_entry(h)) {
             bail!(
-                "network: {h:?} is not a host name like \"github.com\" (it allows the subdomains too)"
+                "network: {h:?} is not a host like \"github.com\", \"git.example.com:22\" or \"[::1]:8080\""
             );
         }
         if def.mode != Mode::Vm {
@@ -1389,6 +1389,10 @@ depends_on = ["db"]
         let def = parse("mode = \"vm\"\nnetwork = [\"packagist.org\", \"github.com\"]").unwrap();
         assert_eq!(def.network.unwrap(), ["packagist.org", "github.com"]);
         assert!(parse("mode = \"vm\"\nnetwork = [\"*.github.com\"]").is_err());
+        let def =
+            parse("mode = \"vm\"\nnetwork = [\"git.example.com:22\", \"[::1]:8080\"]").unwrap();
+        assert_eq!(def.network.unwrap(), ["git.example.com:22", "[::1]:8080"]);
+        assert!(parse("mode = \"vm\"\nnetwork = [\"github.com:ssh\"]").is_err());
         assert!(parse("network = [\"github.com\"]").is_err());
     }
 

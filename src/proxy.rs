@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -20,22 +20,119 @@ const HEAD_LIMIT: usize = 64 * 1024;
 /// How long the guest may take to send the whole request head, and the proxy to reach the target.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ports that an entry without its own port allows.
+const DEFAULT_PORTS: [u16; 2] = [80, 443];
+
 /// Is `entry` a host name for `network`: labels of letters, digits and `-`, separated by dots?
-pub fn is_host(entry: &str) -> bool {
+fn is_host(entry: &str) -> bool {
     entry.len() <= 253
         && entry
             .split('.')
             .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// May the guest reach `host`? An entry allows the host itself and every subdomain of it.
-/// Only host names count: anything else would go to the resolver of the host as it is.
-fn allows(allowed: &[String], host: &str) -> bool {
+/// What an entry of `network` names.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// A host name and all its subdomains
+    Name(String),
+    /// Exactly this address
+    Ip(IpAddr),
+}
+
+/// An entry of `network`: a target and the one port it allows, or 80 and 443 without a port.
+#[derive(Debug, PartialEq, Eq)]
+struct Entry {
+    /// The host name or address
+    target: Target,
+    /// The only allowed port, if any
+    port: Option<u16>,
+}
+
+/// A port from 1 to 65535, digits only.
+fn port(p: &str) -> Option<u16> {
+    p.bytes().all(|b| b.is_ascii_digit()).then(|| p.parse().ok()).flatten().filter(|&p| p != 0)
+}
+
+/// Reads an entry of `network`: `host`, `host:port`, an IP address, `ip:port` or `[v6]:port`.
+fn entry(s: &str) -> Option<Entry> {
+    if let Ok(ip) = s.parse() {
+        return Some(Entry { target: Target::Ip(ip), port: None });
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (ip, tail) = rest.split_once(']')?;
+        let port = if tail.is_empty() { None } else { Some(port(tail.strip_prefix(':')?)?) };
+        return Some(Entry { target: Target::Ip(IpAddr::V6(ip.parse().ok()?)), port });
+    }
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, Some(port(p)?)),
+        None => (s, None),
+    };
+    let target = match host.parse() {
+        Ok(ip @ IpAddr::V4(_)) => Target::Ip(ip),
+        _ if is_host(host) => Target::Name(host.to_ascii_lowercase()),
+        _ => return None,
+    };
+    Some(Entry { target, port })
+}
+
+/// Is `entry` valid in `network`?
+pub fn is_entry(entry: &str) -> bool {
+    self::entry(entry).is_some()
+}
+
+/// May the guest reach `host` on `port`? `None` if not, else whether private addresses are fine too.
+/// Only an IP address or `localhost` in `network` opens private addresses: a name could point anywhere.
+fn allows(entries: &[Entry], host: &str, port: u16) -> Option<bool> {
     let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    is_host(&host)
-        && allowed.iter().map(|a| a.to_ascii_lowercase()).any(|a| {
-            host == a || host.strip_suffix(a.as_str()).is_some_and(|sub| sub.ends_with('.'))
+    let ip = host.parse::<IpAddr>().ok();
+    entries
+        .iter()
+        .filter(|e| e.port.map_or(DEFAULT_PORTS.contains(&port), |p| p == port))
+        .filter_map(|e| match &e.target {
+            Target::Ip(a) => (ip == Some(*a)).then_some(true),
+            Target::Name(n) => (ip.is_none()
+                && is_host(&host)
+                && (host == *n || host.strip_suffix(n.as_str()).is_some_and(|s| s.ends_with('.'))))
+            .then_some(n == "localhost"),
         })
+        .max()
+}
+
+/// Can every host reach `ip` the same way, or is it loopback, the LAN, link-local or otherwise special?
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            let [first, second, ..] = a.octets();
+            !(a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || a.is_broadcast()
+                || first == 0
+                || first >= 240
+                || (first == 100 && second & 0xc0 == 64))
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let first = a.segments()[0];
+            // ::/96 holds ::, ::1 and the old IPv4-compatible addresses
+            !(a.segments()[..6].iter().all(|&s| s == 0)
+                || a.is_multicast()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80
+                || first & 0xffc0 == 0xfec0)
+        }
+    }
+}
+
+/// Resolves `host` once and keeps the addresses the guest may reach; private ones only with `private`.
+/// The proxy connects to exactly these, so a second lookup cannot swap in another address.
+fn addresses(host: &str, port: u16, private: bool) -> std::io::Result<Vec<SocketAddr>> {
+    Ok((host, port).to_socket_addrs()?.filter(|a| private || is_public(a.ip())).collect())
 }
 
 /// Host and port of `authority` (`host:port`, `[v6]:port` or `host`).
@@ -118,11 +215,11 @@ fn refuse(client: &mut UnixStream, status: &str, text: &str) {
     );
 }
 
-/// Connects to `host` on the host side; the guest has no name resolution of its own.
-fn connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
+/// Connects to the first of `addrs` that answers.
+fn connect(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
     let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no address");
-    for addr in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, TIMEOUT) {
+    for addr in addrs {
+        match TcpStream::connect_timeout(addr, TIMEOUT) {
             Ok(s) => return Ok(s),
             Err(e) => last = e,
         }
@@ -147,14 +244,26 @@ pub fn serve(file: &Path) -> Result<()> {
         return Ok(());
     };
     let (Request::Tunnel(host, port) | Request::Plain(host, port, _)) = &request;
-    let allowed: Vec<String> =
-        fs::read_to_string(file).unwrap_or_default().lines().map(str::to_owned).collect();
-    if !allows(&allowed, host) {
-        let text = format!("{host} is not in `network` of chest.toml");
+    let entries: Vec<Entry> =
+        fs::read_to_string(file).unwrap_or_default().lines().filter_map(entry).collect();
+    let Some(private) = allows(&entries, host, *port) else {
+        let text = format!("{host}:{port} is not in `network` of chest.toml");
         refuse(&mut client, "403 Forbidden", &text);
         return Ok(());
-    }
-    let mut server = match connect(host, *port) {
+    };
+    let addrs = match addresses(host, *port, private) {
+        Ok(a) if a.is_empty() => {
+            let text = format!("{host} has only private addresses; list the address in `network`");
+            refuse(&mut client, "403 Forbidden", &text);
+            return Ok(());
+        }
+        Ok(a) => a,
+        Err(e) => {
+            refuse(&mut client, "502 Bad Gateway", &format!("{host}:{port}: {e}"));
+            return Ok(());
+        }
+    };
+    let mut server = match connect(&addrs) {
         Ok(s) => s,
         Err(e) => {
             refuse(&mut client, "502 Bad Gateway", &format!("{host}:{port}: {e}"));
@@ -180,20 +289,24 @@ pub fn serve(file: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn entries(list: &[&str]) -> Vec<Entry> {
+        list.iter().map(|e| entry(e).unwrap()).collect()
+    }
+
     #[test]
     fn hosts_and_subdomains_are_allowed() {
-        let allowed = ["github.com".to_owned(), "Packagist.org".to_owned()];
-        assert!(allows(&allowed, "github.com"));
-        assert!(allows(&allowed, "api.github.com"));
-        assert!(allows(&allowed, "repo.packagist.org."));
-        assert!(!allows(&allowed, "evilgithub.com"));
-        assert!(!allows(&allowed, "github.com.evil.org"));
-        assert!(!allows(&[], "github.com"));
+        let allowed = entries(&["github.com", "Packagist.org"]);
+        assert_eq!(allows(&allowed, "github.com", 443), Some(false));
+        assert_eq!(allows(&allowed, "api.github.com", 80), Some(false));
+        assert_eq!(allows(&allowed, "repo.packagist.org.", 443), Some(false));
+        assert_eq!(allows(&allowed, "evilgithub.com", 443), None);
+        assert_eq!(allows(&allowed, "github.com.evil.org", 443), None);
+        assert_eq!(allows(&[], "github.com", 443), None);
     }
 
     #[test]
     fn only_host_names_are_allowed() {
-        let allowed = ["github.com".to_owned()];
+        let allowed = entries(&["github.com"]);
         for host in [
             "evil@x.github.com",
             "::1%.github.com",
@@ -202,8 +315,117 @@ mod tests {
             "github.com..",
             "ä.github.com",
         ] {
-            assert!(!allows(&allowed, host), "{host:?}");
+            assert_eq!(allows(&allowed, host, 443), None, "{host:?}");
         }
+    }
+
+    #[test]
+    fn ports_are_80_and_443_unless_listed() {
+        let allowed = entries(&["github.com", "git.example.com:22"]);
+        assert_eq!(allows(&allowed, "github.com", 22), None);
+        assert_eq!(allows(&allowed, "github.com", 8443), None);
+        assert_eq!(allows(&allowed, "git.example.com", 22), Some(false));
+        assert_eq!(allows(&allowed, "a.git.example.com", 22), Some(false));
+        assert_eq!(allows(&allowed, "git.example.com", 443), None);
+        assert_eq!(allows(&allowed, "example.com", 22), None);
+    }
+
+    #[test]
+    fn only_addresses_and_localhost_open_private_targets() {
+        let allowed = entries(&["localhost", "10.0.0.5", "[::1]:8080", "192.168.1.2:8000"]);
+        assert_eq!(allows(&allowed, "localhost", 443), Some(true));
+        assert_eq!(allows(&allowed, "10.0.0.5", 80), Some(true));
+        assert_eq!(allows(&allowed, "::1", 8080), Some(true));
+        assert_eq!(allows(&allowed, "::1", 443), None);
+        assert_eq!(allows(&allowed, "192.168.1.2", 8000), Some(true));
+        assert_eq!(allows(&allowed, "x.10.0.0.5", 80), None);
+        assert_eq!(allows(&allowed, "127.0.0.1", 443), None);
+        // a name entry that looks like the end of an address does not match the address
+        assert_eq!(allows(&entries(&["0.0.5"]), "10.0.0.5", 443), None);
+    }
+
+    #[test]
+    fn parses_entries() {
+        let name = |n: &str, port| Some(Entry { target: Target::Name(n.into()), port });
+        let ip = |a: &str, port| Some(Entry { target: Target::Ip(a.parse().unwrap()), port });
+        assert_eq!(entry("GitHub.com"), name("github.com", None));
+        assert_eq!(entry("git.example.com:22"), name("git.example.com", Some(22)));
+        assert_eq!(entry("localhost:8080"), name("localhost", Some(8080)));
+        assert_eq!(entry("127.0.0.1"), ip("127.0.0.1", None));
+        assert_eq!(entry("127.0.0.1:8080"), ip("127.0.0.1", Some(8080)));
+        assert_eq!(entry("::1"), ip("::1", None));
+        assert_eq!(entry("[::1]"), ip("::1", None));
+        assert_eq!(entry("[fd00::1]:8080"), ip("fd00::1", Some(8080)));
+        for bad in [
+            "",
+            "*.github.com",
+            ".github.com",
+            "https://github.com",
+            "github.com:",
+            "github.com:0",
+            "github.com:65536",
+            "github.com:+22",
+            "github.com:22:22",
+            "[::1]8080",
+            "[::1]:",
+            "[127.0.0.1]:80",
+            "[github.com]:80",
+        ] {
+            assert_eq!(entry(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn private_addresses_are_not_public() {
+        for a in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.169.254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::127.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "febf::1",
+            "fec0::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public(a.parse().unwrap()), "{a}");
+        }
+        for a in [
+            "1.1.1.1",
+            "140.82.121.4",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1",
+        ] {
+            assert!(is_public(a.parse().unwrap()), "{a}");
+        }
+    }
+
+    #[test]
+    fn private_addresses_need_an_explicit_entry() {
+        assert_eq!(addresses("localhost", 443, false).unwrap(), []);
+        assert_eq!(addresses("127.0.0.1", 443, false).unwrap(), []);
+        let ok = addresses("127.0.0.1", 8080, true).unwrap();
+        assert_eq!(ok, [SocketAddr::from(([127, 0, 0, 1], 8080))]);
+        assert_eq!(addresses("1.1.1.1", 443, false).unwrap().len(), 1);
     }
 
     #[test]

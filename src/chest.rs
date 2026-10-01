@@ -3,7 +3,7 @@
 //! State (home, data) lives in `$XDG_DATA_HOME/luggage/chests/<name>`, runtime files (sockets,
 //! generated files) in `$XDG_RUNTIME_DIR/luggage/<name>` — Unix socket paths must not exceed 108 characters.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -25,6 +25,8 @@ const DEFAULT_READY_TIMEOUT: u32 = 60;
 const RUN_INSIDE: &str = "/run/luggage";
 /// process-compose in the VM guest, from its system packages.
 const PC_GUEST: &str = "/run/current-system/sw/bin/process-compose";
+/// How many ports after a taken host port luggage tries before it gives up.
+const PORT_TRIES: u16 = 100;
 /// Closes every inherited file descriptor above 2, then runs the arguments.
 const CLOSE_FDS_AND_EXEC: &str = r#"for fd in /proc/self/fd/*; do fd=${fd##*/}; if [ "$fd" -gt 2 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; exec "$@""#;
 
@@ -44,6 +46,8 @@ pub struct Definition {
     pub ignore: Vec<String>,
     /// How the chest isolates the project
     pub mode: Mode,
+    /// Fixed host ports per service, replacing its own; a taken one is not moved to a free port
+    pub ports: BTreeMap<String, Vec<String>>,
 }
 
 /// How the chest isolates the project.
@@ -91,6 +95,11 @@ pub fn port_pair(spec: &str) -> Result<(u16, u16)> {
     }
 }
 
+/// The first port after `host` that is not `reserved` and is `free`, within `PORT_TRIES` ports.
+fn next_free_port(host: u16, reserved: &BTreeSet<u16>, free: impl Fn(u16) -> bool) -> Option<u16> {
+    (1..=PORT_TRIES).filter_map(|i| host.checked_add(i)).find(|p| !reserved.contains(p) && free(*p))
+}
+
 /// Reads `chest.toml`. `once` and `ready` cannot be used together.
 fn parse(text: &str) -> Result<Definition> {
     let def: Definition = toml::from_str(text)?;
@@ -100,6 +109,11 @@ fn parse(text: &str) -> Result<Definition> {
         }
         for p in &svc.ports {
             port_pair(p).with_context(|| format!("service {name}"))?;
+        }
+    }
+    for (name, specs) in &def.ports {
+        for p in specs {
+            port_pair(p).with_context(|| format!("ports of {name}"))?;
         }
     }
     Ok(def)
@@ -134,6 +148,13 @@ fn merge(mut def: Definition, detected: Option<&Detected>) -> Result<Definition>
         def.hosts.dedup();
         def.packages.sort();
         def.packages.dedup();
+    }
+    for (name, specs) in &def.ports {
+        let svc = def
+            .services
+            .get_mut(name)
+            .with_context(|| format!("ports: \"{name}\" is not a service"))?;
+        svc.ports.clone_from(specs);
     }
     for (name, svc) in &def.services {
         for dep in &svc.depends_on {
@@ -703,11 +724,15 @@ impl Chest {
             &self.def.packages,
             &self.def.hosts,
         )?;
+        // the configured specs, not the ports chosen at start: those differ whenever one was taken
         let ports: Vec<String> = self
             .def
             .services
             .iter()
-            .flat_map(|(name, svc)| svc.ports.iter().map(move |p| format!("{name}={p}")))
+            .flat_map(|(name, svc)| {
+                let fixed = if self.def.ports.contains_key(name) { "fixed " } else { "" };
+                svc.ports.iter().map(move |p| format!("{fixed}{name}={p}"))
+            })
             .collect();
         // commands get a fresh env.sh anyway, only the running services keep the old one
         let env = if self.def.services.is_empty() {
@@ -734,19 +759,42 @@ impl Chest {
     }
 
     /// Forwards the ports of the services from 127.0.0.1 on the host into the guest and lists them in `<run>/ports`.
-    /// A port that is taken on the host is only reported, so the VM still works without it.
+    /// A taken host port moves to the next free one, except a fixed one from `[ports]`, which is only reported.
     fn vm_forward_ports(&self) -> Result<()> {
-        let mut forwarded = String::new();
+        let mut wanted = Vec::new();
         for (name, svc) in &self.def.services {
+            let fixed = self.def.ports.contains_key(name);
             for spec in &svc.ports {
                 let (host, guest) = port_pair(spec)?;
-                match vm::forward_port(&self.run, host, guest) {
-                    Ok(()) => {
-                        let _ = writeln!(forwarded, "127.0.0.1:{host} → {name}:{guest}");
+                wanted.push((!fixed, name, host, guest));
+            }
+        }
+        // fixed ports first, and a moved port never takes one that another service asks for
+        wanted.sort_by_key(|w| w.0);
+        let reserved: BTreeSet<u16> = wanted.iter().map(|w| w.2).collect();
+        let mut forwarded = String::new();
+        for (movable, name, host, guest) in wanted {
+            let mut result = vm::forward_port(&self.run, host, guest).map(|()| host);
+            if let (Err(e), true) = (&result, movable) {
+                let free = |p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok();
+                result = match next_free_port(host, &reserved, free) {
+                    Some(p) => vm::forward_port(&self.run, p, guest).map(|()| {
+                        info(&format!("{name}:{guest} is on 127.0.0.1:{p} — {e:#}"));
+                        p
+                    }),
+                    None => {
+                        Err(anyhow::anyhow!("{e:#}, and no free port up to {PORT_TRIES} above"))
                     }
-                    Err(e) => info(&format!(
+                };
+            }
+            match result {
+                Ok(p) => {
+                    let _ = writeln!(forwarded, "127.0.0.1:{p} → {name}:{guest}");
+                }
+                Err(e) => {
+                    info(&format!(
                         "warning: {name}:{guest} is not reachable from the host — {e:#}"
-                    )),
+                    ));
                 }
             }
         }
@@ -1265,10 +1313,12 @@ depends_on = ["db"]
             SPARENCON.replace("[\"database\"]", "[\"db\"]"),
             SPARENCON.replace("[\"mariadb\"]", "[\"mariadb\", \"redis\"]"),
             SPARENCON.replace("8000", "8001"),
-            ported,
+            ported.clone(),
         ] {
             assert_ne!(base, print(&changed), "{changed}");
         }
+        // a fixed port behaves differently when it is taken
+        assert_ne!(print(&ported), print(&format!("{ported}\n[ports]\nweb = [\"8000\"]")));
         // env.sh only counts for the services
         fs::write(tmp.path().join("env.sh"), "export A=1").unwrap();
         assert_ne!(base, print(SPARENCON));
@@ -1299,6 +1349,43 @@ depends_on = ["db"]
         assert!(parse("[services.a]\nready = \"y\"").is_err());
         assert!(parse("[services.a]\ncommand = \"x\"\nports = [\"80:0\"]").is_err());
         assert!(parse("[services.a]\ncommand = \"x\"\nports = [8000]").is_err());
+        assert!(parse("[ports]\na = [\"80:0\"]").is_err());
+        assert!(merged("[ports]\na = [\"8000\"]").is_err());
+    }
+
+    #[test]
+    fn port_table_replaces_the_ports_of_a_service() {
+        let detected = Detected {
+            found: BTreeMap::from([("db".into(), "mariadb 10.11".into())]),
+            services: BTreeMap::from([(
+                "db".into(),
+                Service {
+                    command: "mariadbd".into(),
+                    ports: vec!["3306:3306".into()],
+                    ..Service::default()
+                },
+            )]),
+            ..Detected::default()
+        };
+        let m = merge(parse("[ports]\ndb = [\"3307:3306\"]").unwrap(), Some(&detected)).unwrap();
+        assert_eq!(m.services["db"].ports, ["3307:3306"]);
+        assert_eq!(m.services["db"].command, "mariadbd");
+        let none = merge(parse("[ports]\ndb = []").unwrap(), Some(&detected)).unwrap();
+        assert!(none.services["db"].ports.is_empty());
+        assert!(
+            merge(parse("ignore = [\"db\"]\n[ports]\ndb = []").unwrap(), Some(&detected)).is_err()
+        );
+    }
+
+    #[test]
+    fn next_free_port_is_bounded_and_skips_reserved() {
+        let reserved = BTreeSet::from([3307]);
+        assert_eq!(next_free_port(3306, &reserved, |_| true), Some(3308));
+        assert_eq!(next_free_port(3306, &reserved, |p| p > 3310), Some(3311));
+        assert_eq!(next_free_port(3306, &reserved, |p| p == 3306 + PORT_TRIES), Some(3406));
+        assert_eq!(next_free_port(3306, &reserved, |p| p > 3306 + PORT_TRIES), None);
+        assert_eq!(next_free_port(65534, &BTreeSet::new(), |_| true), Some(65535));
+        assert_eq!(next_free_port(65535, &BTreeSet::new(), |_| true), None);
     }
 
     #[test]

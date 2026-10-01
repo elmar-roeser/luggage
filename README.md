@@ -211,7 +211,16 @@ command = "exec php -S 127.0.0.1:80 -t public"
 ports = ["8000:80"]         # http://127.0.0.1:8000 on the host
 ```
 
-`luggage status` shows the forwarded addresses. If a host port is taken, `up` warns and the VM starts without it.
+If a host port is taken, `up` moves it to the next free one (at most 100 higher) and says so;
+`luggage status` shows the real addresses. To choose the host ports of a service yourself, e.g. of a detected
+one, without redefining it, use the `[ports]` table. Its ports replace those of the service and stay fixed:
+if one is taken, `up` only warns and the VM starts without it.
+
+```toml
+[ports]
+database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
+```
+
 In the bubblewrap chest, `ports` has no effect yet.
 
 ## Development

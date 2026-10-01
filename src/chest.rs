@@ -430,9 +430,24 @@ impl Chest {
         self.run.join("chest.pid")
     }
 
-    /// Socket of process-compose
+    /// The part of the runtime dir that the bubblewrap chest can write, at `/run/luggage`.
+    /// luggage never reads or follows what is in it; its own files stay outside.
+    fn inside(&self) -> PathBuf {
+        self.run.join("chest")
+    }
+
+    /// bwrap options that show the file `name` of the runtime dir read-only at `/run/luggage/<name>`.
+    fn bind_inside(&self, name: &str) -> [String; 3] {
+        [
+            "--ro-bind".into(),
+            self.run.join(name).to_string_lossy().into_owned(),
+            format!("{RUN_INSIDE}/{name}"),
+        ]
+    }
+
+    /// Socket of process-compose in the bubblewrap chest
     fn socket(&self) -> PathBuf {
-        self.run.join("pc.sock")
+        self.inside().join("pc.sock")
     }
 
     /// PID of the running chest, if it is alive.
@@ -568,7 +583,7 @@ impl Chest {
                 &s(&self.state.join("data")),
                 "/data",
                 "--bind",
-                &s(&self.run),
+                &s(&self.inside()),
                 RUN_INSIDE,
                 "--ro-bind",
                 &s(&self.run.join("hosts")),
@@ -591,6 +606,9 @@ impl Chest {
             ]
             .map(str::to_owned),
         );
+        for f in ["rc", "env.sh", "process-compose.yaml"] {
+            a.extend(self.bind_inside(f));
+        }
         if let Some(d) = &self.def_dir {
             a.extend(["--ro-bind".into(), s(d), "/chest".into()]);
         }
@@ -631,7 +649,7 @@ impl Chest {
 
     /// Creates the directories and writes env.sh, rc, hosts and process-compose.yaml.
     fn prepare(&self, nixpkgs: &str) -> Result<Tools> {
-        for d in [self.state.join("home"), self.state.join("data"), self.run.clone()] {
+        for d in [self.state.join("home"), self.state.join("data"), self.inside()] {
             fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
         }
         fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
@@ -649,7 +667,7 @@ impl Chest {
     }
 
     /// The allowlist that the proxy reads: in the runtime dir for the VM, in the state dir for bubblewrap,
-    /// whose chest can write its runtime dir.
+    /// whose chest can write part of its runtime dir.
     fn network_file(&self) -> PathBuf {
         if self.def.mode == Mode::Vm { &self.run } else { &self.state }.join("network")
     }
@@ -721,6 +739,7 @@ impl Chest {
             .args(self.bwrap_args(tools, net)?)
             .arg("--die-with-parent");
         if proxied {
+            c.args(self.bind_inside(&run_proxy_sock()));
             // the command must not start before the proxy listens on 127.0.0.1:3128 (0C38 in /proc/net/tcp)
             let wait = format!(
                 r#"for _ in {{1..100}}; do [[ $(</proc/net/tcp) == *" 0100007F:0C38 00000000:0000 0A "* ]] && break; {}/bin/sleep 0.01; done; exec "$@""#,
@@ -1048,6 +1067,7 @@ impl Chest {
             .args(own_net(&tools))
             .arg(&tools.bwrap)
             .args(self.bwrap_args(&tools, Net::Own)?)
+            .args(proxy.as_ref().map(|_| self.bind_inside("proxy.sock")).into_iter().flatten())
             .args([
                 "--clearenv",
                 "--setenv",
@@ -1076,7 +1096,10 @@ impl Chest {
             }
         }
         if !alive(pid) {
-            bail!("chest stopped right away — see {}/chest.log and pc.log", self.run.display());
+            bail!(
+                "chest stopped right away — see {}/chest.log and chest/pc.log",
+                self.run.display()
+            );
         }
         self.bridge_ports(&tools, pid, proxy.transpose()?)?;
         // Return only once the services are ready. Also, a `down` while a readiness_probe
@@ -1085,7 +1108,7 @@ impl Chest {
             let limit = self.ready_limit();
             let mut ready = false;
             for _ in 0..limit * 4 {
-                if self.services_ready(&tools)? {
+                if self.services_ready(&tools, pid)? {
                     ready = true;
                     break;
                 }
@@ -1175,9 +1198,10 @@ impl Chest {
     }
 
     /// Are all services ready? Fails if a service stopped that should keep running.
-    fn services_ready(&self, tools: &Tools) -> Result<bool> {
-        let out =
-            self.pc(tools, &["process", "list", "-o", "json"]).stderr(Stdio::null()).output()?;
+    fn services_ready(&self, tools: &Tools, pid: u32) -> Result<bool> {
+        let out = Self::pc(tools, pid, &["process", "list", "-o", "json"])
+            .stderr(Stdio::null())
+            .output()?;
         self.check_services(&out.stdout, &self.run.join("chest.log").display().to_string())
     }
 
@@ -1281,15 +1305,14 @@ impl Chest {
         self.enter(&[], nixpkgs)
     }
 
-    /// The process-compose client on the host. The socket is in the runtime dir.
-    fn pc(&self, tools: &Tools, args: &[&str]) -> Command {
-        let mut c = Command::new(format!("{}/bin/process-compose", tools.process_compose));
-        c.args(args)
-            .arg("-U")
-            .arg("-u")
-            .arg(self.socket())
-            .arg("-L")
-            .arg(self.run.join("pc-client.log"));
+    /// The process-compose client, run in the chest `pid`: its socket could be swapped for a link to a host socket.
+    fn pc(tools: &Tools, pid: u32, args: &[&str]) -> Command {
+        let mut c = nsenter(pid, tools);
+        c.args(["-c", r#"exec "$@""#, "bash"])
+            .arg(format!("{}/bin/process-compose", tools.process_compose))
+            .args(args)
+            .args(["-U", "-u", &format!("{RUN_INSIDE}/pc.sock")])
+            .args(["-L", &format!("{RUN_INSIDE}/pc-client.log")]);
         c
     }
 
@@ -1313,8 +1336,10 @@ impl Chest {
         } else if self.socket().exists() {
             // Stop the services in order; the SIGKILL below is only for when nothing else works.
             let tools = self.tools()?;
-            let client =
-                self.pc(&tools, &["down"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+            let client = Self::pc(&tools, pid, &["down"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
             let stopped = wait_dead(pid, 50);
             if !stopped {
                 // process-compose hangs: all processes in the chest get SIGTERM, so databases shut down cleanly.
@@ -1406,7 +1431,9 @@ impl Chest {
             println!();
             let tools = self.tools()?;
             // stderr is hidden: process-compose prints debug lines there about its missing config
-            self.pc(&tools, &["process", "list", "-o", "wide"]).stderr(Stdio::null()).status()?;
+            Self::pc(&tools, pid, &["process", "list", "-o", "wide"])
+                .stderr(Stdio::null())
+                .status()?;
         }
         Ok(())
     }
@@ -1834,6 +1861,33 @@ depends_on = ["db"]
         assert!(!proxied.contains(&"--share-net".to_owned()));
         assert!(args(&t, false).contains(&"--unshare-all".to_owned()));
         assert!(args(&open, true).contains(&"--share-net".to_owned()));
+    }
+
+    #[test]
+    fn chest_writes_only_its_own_part_of_the_runtime_dir() {
+        let t = chest(parse("network = []").unwrap());
+        let a = t.bwrap_args(&tools(), Net::Own).unwrap();
+        let writable: Vec<_> =
+            a.windows(2).filter(|w| w[0] == "--bind").map(|w| PathBuf::from(&w[1])).collect();
+        assert!(writable.contains(&t.inside()));
+        assert!(
+            writable
+                .iter()
+                .all(|w| !t.run.starts_with(w) && (w == &t.inside() || !w.starts_with(&t.run)))
+        );
+        // luggage reads, runs or kills what these files name, so the chest must not write them
+        for f in [
+            t.pid_file(),
+            t.run.join("tools.json"),
+            t.run.join("info.json"),
+            t.run.join("bridges.pid"),
+        ] {
+            assert!(!f.starts_with(t.inside()), "{}", f.display());
+        }
+        for f in ["rc", "env.sh", "process-compose.yaml"] {
+            let bind = t.bind_inside(f);
+            assert!(a.windows(3).any(|w| w == bind), "{f}");
+        }
     }
 
     #[test]

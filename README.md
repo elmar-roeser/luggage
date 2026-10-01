@@ -236,8 +236,8 @@ name the variables in `pass_env`:
 pass_env = ["ANTHROPIC_API_KEY"]
 ```
 
-luggage reads their values from your environment at each command and hands them to ssh in its environment,
-never on a command line or in a file; only the names are stored. They reach `exec`, `open`, `run` and the
+luggage reads the values of all passed variables from your environment at each command and hands them to ssh
+in its environment, never on a command line or in a file; only the names are stored. They reach `exec`, `open`, `run` and the
 stand-ins, not the services. `pass_env` needs `mode = "vm"`: the bubblewrap chest gets no host variables at all.
 
 The VM has open network access. To allow only some hosts, list them in `network`; an entry allows the host

@@ -1094,6 +1094,8 @@ impl Chest {
         if alive(pid) {
             let kill = self.tools().map_or_else(|_| "kill".into(), |t| t.util("kill"));
             let _ = Command::new(kill).args(["-9", &pid.to_string()]).status();
+            // the kernel still tears down the namespace; report "stopped" only once it is gone
+            wait_dead(pid, 50);
         }
         let _ = fs::remove_file(self.pid_file());
         let _ = fs::remove_file(self.socket());

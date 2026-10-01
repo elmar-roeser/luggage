@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{self, Detected};
-use crate::{config, find_in_path, home, info, versions, vm};
+use crate::{config, find_in_path, gitcheck, home, info, versions, vm};
 
 /// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
@@ -740,13 +740,18 @@ impl Chest {
     /// Runs a one-off command in a fresh chest; without a command, a shell.
     /// In VM mode it runs in the VM, without network unless `net`.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
+        self.check_git_files(false)?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(net, cmd, nixpkgs);
         }
         let tools = self.prepare(nixpkgs)?;
         let mut c = self.run_command(&tools, net, cmd, &self.host_env(std::env::vars_os()))?;
+        // this chest is gone when the command ends, so luggage compares right after it
+        let before = gitcheck::snapshot(&self.project, true);
         if !(net && self.def.network.is_some()) {
-            pass_through(c.status().context("cannot start bwrap")?);
+            let status = c.status().context("cannot start bwrap")?;
+            check_run(&before, &self.project)?;
+            pass_through(status);
             return Ok(());
         }
         // the proxy for this command alone; its guard follows luggage, which waits for the command
@@ -762,7 +767,9 @@ impl Chest {
         let _ = fs::remove_file(&sock);
         // bwrap left an empty file in the chest's part to mount the socket on
         let _ = fs::remove_file(self.inside().join(run_proxy_sock()));
-        pass_through(status?);
+        let status = status?;
+        check_run(&before, &self.project)?;
+        pass_through(status);
         Ok(())
     }
 
@@ -882,6 +889,7 @@ impl Chest {
         self.ensure_envrc_hook()?;
         let dir = self.state.join("vm");
         vm::build(&self.name, &self.project, nixpkgs, &dir, &self.def.packages, &self.def.hosts)?;
+        self.note_git_files()?;
         let pid = vm::start(
             &self.name,
             &self.project,
@@ -1031,6 +1039,7 @@ impl Chest {
     /// Shell code for direnv: in VM mode the stand-ins come first on the `PATH` and the VM starts in the background.
     /// Must be fast, it runs on every `cd` into the project.
     pub fn cmd_hook(&self, nixpkgs: &str) -> Result<()> {
+        self.check_git_files(true)?;
         if self.def.mode != Mode::Vm {
             return Ok(());
         }
@@ -1083,6 +1092,7 @@ impl Chest {
 
     /// Starts the chest in the background and waits until all services are ready.
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
+        self.check_git_files(true)?;
         if self.def.mode == Mode::Vm {
             let pid = self.vm_up(nixpkgs)?;
             self.vm_warn_outdated(nixpkgs);
@@ -1112,6 +1122,7 @@ impl Chest {
                     "exec process-compose up -t=false -U -u {RUN_INSIDE}/pc.sock -L {RUN_INSIDE}/pc.log -f {RUN_INSIDE}/process-compose.yaml"
                 )
             };
+        self.note_git_files()?;
         let log = File::create(self.run.join("chest.log"))?;
         // bwrap reports the PID of its child (PID 1 of the chest) on fd 3.
         Command::new(tools.bash())
@@ -1334,6 +1345,7 @@ impl Chest {
 
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
+        self.check_git_files(false)?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(true, cmd, nixpkgs);
         }
@@ -1370,8 +1382,56 @@ impl Chest {
         c
     }
 
-    /// Stops the chest: first the services in order, SIGKILL as a last resort.
+    /// The git files as the chest found them at its start, in the state dir, which the chest cannot write.
+    fn git_files(&self) -> PathBuf {
+        self.state.join("git-files")
+    }
+
+    /// The first git file that the host trusts and that changed since the chest started, if any.
+    /// `deep` also looks for nested repos in the whole project.
+    fn changed_git_file(&self, deep: bool) -> Option<String> {
+        let before = fs::read_to_string(self.git_files()).ok()?;
+        let before = if deep { before } else { gitcheck::shallow(&before) };
+        gitcheck::changed(&before, &gitcheck::snapshot(&self.project, deep))
+    }
+
+    /// Stops the chest and fails if a git file that the host trusts changed since the start.
+    fn check_git_files(&self, deep: bool) -> Result<()> {
+        let Some(path) = self.changed_git_file(deep) else {
+            return Ok(());
+        };
+        if self.running().is_some() {
+            self.stop()?;
+        }
+        bail!(
+            "{path} changed while chest {} ran, and git on the host could run code from it — the chest is stopped; check the file, then `luggage down` accepts it",
+            self.name
+        )
+    }
+
+    /// Checks the git files and notes them anew, right before the chest starts.
+    fn note_git_files(&self) -> Result<()> {
+        self.check_git_files(true)?;
+        fs::create_dir_all(&self.state)?;
+        fs::write(self.git_files(), gitcheck::snapshot(&self.project, true))?;
+        Ok(())
+    }
+
+    /// Stops the chest and accepts the git files as they are, after a warning if one changed.
     pub fn cmd_down(&self) -> Result<()> {
+        if let Some(path) = self.changed_git_file(true) {
+            info(&format!(
+                "warning: {path} changed while chest {} ran, and git on the host could run code from it — check the file",
+                self.name
+            ));
+        }
+        self.stop()?;
+        let _ = fs::remove_file(self.git_files());
+        Ok(())
+    }
+
+    /// Stops the chest: first the services in order, SIGKILL as a last resort.
+    fn stop(&self) -> Result<()> {
         // control.socket also finds a VM whose chest.toml is broken right now
         let is_vm = self.def.mode == Mode::Vm || self.run.join("control.socket").exists();
         let Some(pid) = self.running() else {
@@ -1424,6 +1484,7 @@ impl Chest {
 
     /// Shows the definition, services and state of the chest.
     pub fn cmd_status(&self, nixpkgs: &str) -> Result<()> {
+        self.check_git_files(false)?;
         println!("Chest:       {}", self.name);
         println!("Project:     {}", self.project.display());
         println!("Mode:        {}", if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" });
@@ -1491,6 +1552,16 @@ impl Chest {
         }
         Ok(())
     }
+}
+
+/// Fails if a git file that the host trusts changed during `luggage run`, compared with `before`.
+fn check_run(before: &str, project: &Path) -> Result<()> {
+    if let Some(path) = gitcheck::changed(before, &gitcheck::snapshot(project, true)) {
+        bail!(
+            "{path} changed in the chest, and git on the host could run code from it — check the file"
+        );
+    }
+    Ok(())
 }
 
 /// Stops the port bridges and the proxy of a bubblewrap chest, if they still run, and forgets their ports.
@@ -1979,6 +2050,33 @@ depends_on = ["db"]
         create_protected_dirs(wt.path()).unwrap();
         let git = wt.path().join(".git").to_string_lossy().into_owned();
         assert_eq!(protect_args(wt.path())[..3], ["--ro-bind", git.as_str(), git.as_str()]);
+    }
+
+    #[test]
+    fn a_git_file_that_leads_to_another_config_stops_the_chest_until_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("demo");
+        fs::create_dir_all(p.join(".git/objects")).unwrap();
+        let t = Chest {
+            project: p.clone(),
+            state: tmp.path().join("state"),
+            run: tmp.path().join("run"),
+            ..chest(Definition::default())
+        };
+        // no start yet: nothing to compare with
+        fs::write(p.join(".git/commondir"), "../evil").unwrap();
+        t.check_git_files(true).unwrap();
+        fs::remove_file(p.join(".git/commondir")).unwrap();
+        t.note_git_files().unwrap();
+        t.check_git_files(false).unwrap();
+        fs::write(p.join(".git/commondir"), "../evil").unwrap();
+        let e = t.check_git_files(false).unwrap_err().to_string();
+        assert!(e.contains(".git/commondir") && e.contains("stopped"), "{e}");
+        // the next start refuses as well, until `down` accepts the files
+        assert!(t.note_git_files().is_err());
+        t.cmd_down().unwrap();
+        t.note_git_files().unwrap();
+        t.check_git_files(true).unwrap();
     }
 
     #[test]

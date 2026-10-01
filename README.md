@@ -245,6 +245,13 @@ a new `flake.lock`, stay writable until the next start. If a program on the host
 instead of writing into it (`git config` does, some editors do), that file is writable in the chest until the
 next start.
 
+The rest of `.git` can still lead git on the host to another config, for example `.git/commondir`, worktrees,
+submodules in `.git/modules` or a repo nested in the project. So luggage notes these files when the chest starts
+and checks them again at each command (nested repos only at `up`, `down` and in the direnv hook). If one changed,
+luggage stops the chest and refuses to go on until you checked the file and ran `luggage down`; this also happens
+when you run `git worktree add` or `git submodule update` on the host. It is a check, not a lock: a `git` command
+that you run on the host before the next luggage command still reads the changed file.
+
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
 

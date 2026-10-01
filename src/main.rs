@@ -5,6 +5,7 @@ mod compose;
 mod config;
 mod detect;
 mod flake;
+mod gitcheck;
 mod proxy;
 mod remote;
 mod setup;

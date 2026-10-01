@@ -123,6 +123,13 @@ const FLAKE: &str = r#"{
         pkgs.virtiofsd
         (pkgs.writeShellScriptBin "chest-ssh-proxy" ''exec ${pkgs.systemd}/lib/systemd/systemd-ssh-proxy "$@"'')
       ];
+      # luggage adds options to the user network at start ($LUGGAGE_NETDEV), so `network` needs no new build
+      postBuild = ''
+        rm $out/bin/microvm-run
+        substitute ${self.nixosConfigurations.chest.config.microvm.declaredRunner}/bin/microvm-run $out/bin/microvm-run \
+          --replace-fail "'user,id=usernet'" '"user,id=usernet''${LUGGAGE_NETDEV:-}"'
+        chmod +x $out/bin/microvm-run
+      '';
     };
   };
 }
@@ -444,12 +451,30 @@ fn stop_virtiofsd(name: &str, run: &Path) {
     }
 }
 
-/// Starts virtiofsd for both shares and then the VM, all in the runtime dir `run`.
-/// Writes the qemu PID to `pid_file` and returns once the guest answers on ssh.
+/// Options for the user network of qemu that allow only the proxy: qemu runs `luggage network-proxy <file>` for
+/// each connection to `proxy::GUEST`. qemu reads a comma as the end of an option, so commas in the paths are doubled.
+fn restricted_netdev(exe: &Path, file: &Path) -> String {
+    let cmd = format!(
+        "{} network-proxy {}",
+        sh_quote(&exe.to_string_lossy()),
+        sh_quote(&file.to_string_lossy())
+    );
+    format!(",restrict=on,guestfwd=tcp:{}-cmd:{}", crate::proxy::GUEST, cmd.replace(',', ",,"))
+}
+
+/// Starts virtiofsd for both shares and the VM in the runtime dir `run`, writes the qemu PID to `pid_file` and
+/// returns once the guest answers on ssh. With `network` the VM reaches only these hosts, through the proxy; the list lives in `<run>/network`.
 ///
 /// # Errors
 /// If a process cannot start or the guest does not become ready; the VM is stopped again then.
-pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path) -> Result<u32> {
+pub fn start(
+    name: &str,
+    project: &Path,
+    dir: &Path,
+    run: &Path,
+    pid_file: &Path,
+    network: Option<&[String]>,
+) -> Result<u32> {
     fs::create_dir_all(run).with_context(|| format!("cannot create {}", run.display()))?;
     fs::set_permissions(run, fs::Permissions::from_mode(0o700))?;
     // the readiness probe would otherwise reach the other VM and report success
@@ -458,9 +483,17 @@ pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path
     }
     stop_virtiofsd(name, run);
     // the guest has not seen the environment yet, so it must be sent again
-    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started"] {
+    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started", "network"] {
         let _ = fs::remove_file(run.join(f));
     }
+    let netdev = match network {
+        Some(hosts) => {
+            let file = run.join("network");
+            fs::write(&file, hosts.join("\n"))?;
+            restricted_netdev(&std::env::current_exe()?, &file)
+        }
+        None => String::new(),
+    };
     let bin = dir.join("runner/bin");
     // The store never changes, so the guest may cache it for good.
     for (tag, shared, cache) in
@@ -497,6 +530,7 @@ pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path
     }
     let log = File::create(run.join("vm.log"))?;
     let mut vm = Command::new(bin.join("microvm-run"))
+        .env("LUGGAGE_NETDEV", netdev)
         .current_dir(run)
         .process_group(0)
         .stdin(Stdio::null())
@@ -619,20 +653,36 @@ pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
         }
     }
     stop_virtiofsd(name, run);
-    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started"] {
+    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started", "network"] {
         let _ = fs::remove_file(run.join(f));
     }
 }
 
 /// The rc file in the guest: loads the dev environment and undoes what only makes sense in a Nix build.
-fn render_rc(name: &str) -> String {
-    format!(
+/// With `proxy` the guest goes out through the proxy, except to itself and the names in `proxy`.
+fn render_rc(name: &str, proxy: Option<&[String]>) -> String {
+    let mut rc = format!(
         "source ~/.luggage/env.sh\n\
          unset NIX_BUILD_TOP TEMP TMP TEMPDIR SSL_CERT_FILE NIX_SSL_CERT_FILE\n\
          export TMPDIR=/tmp LUGGAGE_CHEST={}\n\
          PS1='[chest:{name}] \\w\\$ '\n",
         sh_quote(name)
-    )
+    );
+    if let Some(local) = proxy {
+        let url = format!("http://{}", crate::proxy::GUEST);
+        let no_proxy = ["localhost", "127.0.0.1", "::1"]
+            .into_iter()
+            .chain(local.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(",");
+        rc.push_str("export");
+        for (k, v) in [("http_proxy", &url), ("https_proxy", &url), ("no_proxy", &no_proxy)] {
+            let v = sh_quote(v);
+            let _ = write!(rc, " {k}={v} {}={v}", k.to_ascii_uppercase());
+        }
+        rc.push('\n');
+    }
+    rc
 }
 
 /// Does the host variable stay on the host? These describe the host session, point to host paths
@@ -696,11 +746,18 @@ pub fn is_env_name(name: &str) -> bool {
 }
 
 /// Host variables that go along into the guest on the command line, except those of `pass_env`.
-fn passed_env(pass: &[String]) -> Vec<(String, String)> {
+/// Behind the proxy (`proxied`) the proxy variables of the host stay on the host, the guest has its own.
+fn passed_env(pass: &[String], proxied: bool) -> Vec<(String, String)> {
     std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .filter(|(k, _)| !host_only(k) && is_env_name(k) && !pass.contains(k))
+        .filter(|(k, _)| !(proxied && is_proxy_var(k)))
         .collect()
+}
+
+/// Does the variable point HTTP clients to a proxy, e.g. `https_proxy` or `ALL_PROXY`?
+fn is_proxy_var(var: &str) -> bool {
+    var.to_ascii_lowercase().ends_with("_proxy")
 }
 
 /// Prefix under which ssh sends a `pass_env` variable; the guest shell exports it under its own name.
@@ -797,11 +854,18 @@ pub fn write_shims(run: &Path, inputs: &str) -> Result<()> {
 }
 
 /// Copies `env_sh` and the rc file into the guest (`~/.luggage`) and `compose` to `/run/luggage/process-compose.yaml`,
-/// unless that already happened for these files and this VM.
+/// unless that already happened for these files and this VM; `hosts` bypass the proxy of a restricted VM.
 ///
 /// # Errors
 /// If env.sh cannot be read or the copy over ssh fails.
-pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path, compose: &Path) -> Result<()> {
+pub fn sync_env(
+    name: &str,
+    dir: &Path,
+    run: &Path,
+    env_sh: &Path,
+    compose: &Path,
+    hosts: &[String],
+) -> Result<()> {
     let sent = run.join("env.sent");
     let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
     let newest = modified(env_sh).max(modified(compose));
@@ -812,7 +876,7 @@ pub fn sync_env(name: &str, dir: &Path, run: &Path, env_sh: &Path, compose: &Pat
         .arg("-T")
         .arg(format!(
             "mkdir -p ~/.luggage && cat > ~/.luggage/env.sh && printf %s {} > ~/.luggage/rc && printf %s {} > /run/luggage/process-compose.yaml",
-            sh_quote(&render_rc(name)),
+            sh_quote(&render_rc(name, run.join("network").exists().then_some(hosts))),
             sh_quote(&fs::read_to_string(compose)?)
         ))
         .stdin(File::open(env_sh)?)
@@ -859,7 +923,7 @@ pub fn exec(
         }
     }
     c.arg(if tty { "-t" } else { "-T" })
-        .arg(remote_command(cwd, &passed_env(pass), &sent, net, cmd))
+        .arg(remote_command(cwd, &passed_env(pass, run.join("network").exists()), &sent, net, cmd))
         .status()
         .context("cannot start ssh")
 }
@@ -1047,6 +1111,29 @@ mod tests {
         for v in ["APP_ENV", "DATABASE_URL", "XDEBUG_MODE", "PHP_INI_SCAN_DIR"] {
             assert!(!host_only(v), "{v}");
         }
+        for v in ["http_proxy", "HTTPS_PROXY", "no_proxy", "ALL_PROXY"] {
+            assert!(is_proxy_var(v), "{v}");
+        }
+        assert!(!is_proxy_var("PROXY_URL"));
+    }
+
+    #[test]
+    fn restricted_network_allows_only_the_proxy() {
+        let netdev = restricted_netdev(Path::new("/opt/a,b/luggage"), Path::new("/run/x/network"));
+        assert_eq!(
+            netdev,
+            ",restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:'/opt/a,,b/luggage' network-proxy '/run/x/network'"
+        );
+    }
+
+    #[test]
+    fn rc_sends_restricted_guests_through_the_proxy() {
+        assert!(!render_rc("demo", None).contains("proxy"));
+        let rc = render_rc("demo", Some(&["database".to_owned()]));
+        assert!(rc.contains(
+            " https_proxy='http://10.0.2.100:3128' HTTPS_PROXY='http://10.0.2.100:3128'"
+        ));
+        assert!(rc.contains(" no_proxy='localhost,127.0.0.1,::1,database' NO_PROXY="));
     }
 
     #[test]
@@ -1070,7 +1157,7 @@ mod tests {
 
     #[test]
     fn rc_resets_build_only_variables() {
-        let rc = render_rc("demo");
+        let rc = render_rc("demo", None);
         assert!(rc.starts_with("source ~/.luggage/env.sh\n"));
         assert!(
             rc.contains("unset NIX_BUILD_TOP TEMP TMP TEMPDIR SSL_CERT_FILE NIX_SSL_CERT_FILE\n")

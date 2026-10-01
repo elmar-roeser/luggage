@@ -50,6 +50,8 @@ pub struct Definition {
     pub ports: BTreeMap<String, Vec<String>>,
     /// Host variables that commands in the VM get, also `ANTHROPIC_*` and `CLAUDE_*`; read at each command
     pub pass_env: Vec<String>,
+    /// The only hosts the VM may reach, each with its subdomains; without it the network is open
+    pub network: Option<Vec<String>>,
 }
 
 /// How the chest isolates the project.
@@ -124,6 +126,16 @@ fn parse(text: &str) -> Result<Definition> {
     // the bubblewrap chest gets no host variables at all
     if !def.pass_env.is_empty() && def.mode != Mode::Vm {
         bail!("pass_env needs mode = \"vm\"");
+    }
+    if let Some(network) = &def.network {
+        if let Some(h) = network.iter().find(|h| !crate::proxy::is_host(h)) {
+            bail!(
+                "network: {h:?} is not a host name like \"github.com\" (it allows the subdomains too)"
+            );
+        }
+        if def.mode != Mode::Vm {
+            bail!("network needs mode = \"vm\"");
+        }
     }
     Ok(def)
 }
@@ -655,7 +667,15 @@ impl Chest {
         if fs::read_to_string(&compose).ok().as_deref() != Some(yaml.as_str()) {
             fs::write(&compose, yaml)?;
         }
-        vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env, &compose)
+        // the proxy reads the allowlist for each connection, so a changed list applies without a restart
+        let network = self.run.join("network");
+        if let (Some(hosts), true) = (&self.def.network, network.exists()) {
+            let hosts = hosts.join("\n");
+            if fs::read_to_string(&network).ok().as_deref() != Some(hosts.as_str()) {
+                fs::write(&network, hosts)?;
+            }
+        }
+        vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env, &compose, &self.def.hosts)
     }
 
     /// A process-compose command in the guest, e.g. `process list -o json`.
@@ -714,7 +734,14 @@ impl Chest {
         self.ensure_envrc_hook()?;
         let dir = self.state.join("vm");
         vm::build(&self.name, &self.project, nixpkgs, &dir, &self.def.packages, &self.def.hosts)?;
-        let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
+        let pid = vm::start(
+            &self.name,
+            &self.project,
+            &dir,
+            &self.run,
+            &self.pid_file(),
+            self.def.network.as_deref(),
+        )?;
         self.vm_forward_ports()?;
         self.vm_sync()?;
         fs::write(self.run.join("started"), self.vm_fingerprint(nixpkgs)?)?;
@@ -749,7 +776,9 @@ impl Chest {
         } else {
             fs::read_to_string(self.run.join("env.sh")).unwrap_or_default()
         };
-        Ok(vm::fingerprint(&[&flake, &self.render_compose(), &ports.join(" "), &env]))
+        // only whether the network is restricted: the proxy follows a changed list by itself
+        let network = if self.def.network.is_some() { "restricted" } else { "" };
+        Ok(vm::fingerprint(&[&flake, &self.render_compose(), &ports.join(" "), &env, network]))
     }
 
     /// Warns if the running VM was started with another definition than the current one; never restarts it.
@@ -1202,6 +1231,12 @@ impl Chest {
                 "Ports:       {}",
                 if ports.is_empty() { "none".into() } else { ports.join(", ") }
             );
+            let network = match fs::read_to_string(self.run.join("network")) {
+                Err(_) => "open".into(),
+                Ok(n) if n.trim().is_empty() => "closed".into(),
+                Ok(n) => format!("only {}", n.lines().collect::<Vec<_>>().join(", ")),
+            };
+            println!("Network:     {network}");
             self.vm_warn_outdated(nixpkgs);
         }
         if self.def.mode == Mode::Vm && !self.def.services.is_empty() {
@@ -1335,6 +1370,10 @@ depends_on = ["db"]
         let no_services = print("");
         fs::write(tmp.path().join("env.sh"), "export A=2").unwrap();
         assert_eq!(no_services, print(""));
+        // restricting the network needs a restart, a changed list does not
+        let closed = print("mode = \"vm\"\nnetwork = []");
+        assert_ne!(print("mode = \"vm\""), closed);
+        assert_eq!(closed, print("mode = \"vm\"\nnetwork = [\"github.com\"]"));
     }
 
     #[test]
@@ -1346,6 +1385,11 @@ depends_on = ["db"]
         assert_eq!(def.mode, Mode::Bubblewrap);
         assert_eq!(parse("mode = \"vm\"").unwrap().mode, Mode::Vm);
         assert!(parse("mode = \"docker\"").is_err());
+        assert_eq!(parse("mode = \"vm\"").unwrap().network, None);
+        let def = parse("mode = \"vm\"\nnetwork = [\"packagist.org\", \"github.com\"]").unwrap();
+        assert_eq!(def.network.unwrap(), ["packagist.org", "github.com"]);
+        assert!(parse("mode = \"vm\"\nnetwork = [\"*.github.com\"]").is_err());
+        assert!(parse("network = [\"github.com\"]").is_err());
     }
 
     #[test]

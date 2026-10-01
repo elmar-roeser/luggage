@@ -5,6 +5,7 @@ mod compose;
 mod config;
 mod detect;
 mod flake;
+mod proxy;
 mod remote;
 mod setup;
 mod versions;
@@ -106,6 +107,12 @@ enum Cmd {
     Status,
     /// Print shell code for direnv; the .envrc runs it
     Hook,
+    /// Serve one connection of the VM to the proxy for `network` (qemu starts it)
+    #[command(hide = true)]
+    NetworkProxy {
+        /// File with the allowed hosts, one per line
+        file: PathBuf,
+    },
 }
 
 /// Options for the Nix environment (`new` and `init`).
@@ -458,6 +465,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let nixpkgs = config::load()?.nixpkgs();
             chest::Chest::find(&nixpkgs, true)?.cmd_hook(&nixpkgs)
         }
+        Cmd::NetworkProxy { file } => proxy::serve(&file),
     }
 }
 

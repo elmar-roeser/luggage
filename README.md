@@ -197,9 +197,9 @@ This needs `/dev/kvm` and `/dev/vhost-vsock` (your user in the group `kvm`) and 
 checks them in its optional VM section. `luggage up` adds the line
 `if has luggage; then eval "$(luggage hook)"; fi` to the `.envrc` if it is missing; then run `direnv allow` once.
 The services (from `compose.yaml` and `chest.toml`) run in the VM too, with their data on the VM disk.
-The running VM keeps the definition it was started with. After changing services, packages, hosts, `ports`
-or (with services) the project flake, `up`, `exec`, `status` and the stand-ins warn until you restart it
-with `luggage down && luggage up`.
+The running VM keeps the definition it was started with. After changing services, packages, hosts, `ports`,
+whether there is a `network` or (with services) the project flake, `up`, `exec`, `status` and the stand-ins warn
+until you restart it with `luggage down && luggage up`.
 
 Your home in the VM (same path as on the host, but not your host files) lives on its own disk,
 `~/.local/share/luggage/chests/<project>/vm/home.img` (up to 8 GB, sparse), so caches such as
@@ -239,6 +239,20 @@ pass_env = ["ANTHROPIC_API_KEY"]
 luggage reads their values from your environment at each command and hands them to ssh in its environment,
 never on a command line or in a file; only the names are stored. They reach `exec`, `open`, `run` and the
 stand-ins, not the services. `pass_env` needs `mode = "vm"`: the bubblewrap chest gets no host variables at all.
+
+The VM has open network access. To allow only some hosts, list them in `network`; an entry allows the host
+and all its subdomains (`github.com` also allows `api.github.com`), and `network = []` closes the network:
+
+```toml
+network = ["packagist.org", "github.com", "npmjs.org"]
+```
+
+The VM then reaches the outside only through a proxy that luggage runs on the host for each connection.
+Commands and services get `http_proxy`, `https_proxy` and `no_proxy` (localhost and the `hosts`), which curl,
+git over HTTPS, Composer and npm follow. The guest has no DNS and no direct connections, so tools that ignore
+these variables, and git over ssh, cannot get out. The forwarded ports work as before. A changed list applies to
+the next connection after the next luggage command; adding or removing `network` needs a restart.
+`luggage status` shows the list. `network` needs `mode = "vm"`.
 
 ## Development
 

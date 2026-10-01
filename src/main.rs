@@ -128,9 +128,9 @@ struct EnvOpts {
     no_build: bool,
 }
 
-/// Prints a message prefixed with `luggage:`.
+/// Prints a message prefixed with `luggage:` to stderr, so stdout stays free for results and the program run.
 fn info(msg: &str) {
-    println!("luggage: {msg}");
+    eprintln!("luggage: {msg}");
 }
 
 /// Runs a command and returns whether it succeeded. `quiet` hides its output.

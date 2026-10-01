@@ -489,6 +489,14 @@ fn restricted_netdev(exe: &Path, file: &Path) -> String {
     format!(",restrict=on,guestfwd=tcp:{}-cmd:{}", crate::proxy::GUEST, cmd.replace(',', ",,"))
 }
 
+/// The process of the project's virtiofsd: the child of bwrap, in the namespace with the read-only binds.
+pub fn project_server(run: &Path) -> Option<u32> {
+    let bwrap: u32 =
+        fs::read_to_string(run.join("virtiofsd-project.pid")).ok()?.trim().parse().ok()?;
+    let children = fs::read_to_string(format!("/proc/{bwrap}/task/{bwrap}/children")).ok()?;
+    children.split_whitespace().next()?.parse().ok()
+}
+
 /// virtiofsd for the project, in a mount namespace where the paths that the host trusts are read-only.
 /// So the guest cannot change them, not even as root.
 fn protected_virtiofsd(bin: &Path, project: &Path, run: &Path) -> Command {

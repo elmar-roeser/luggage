@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{self, Detected};
-use crate::{config, find_in_path, gitcheck, home, info, versions, vm};
+use crate::{config, find_in_path, gitcheck, home, info, remount, versions, vm};
 
 /// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
@@ -740,7 +740,7 @@ impl Chest {
     /// Runs a one-off command in a fresh chest; without a command, a shell.
     /// In VM mode it runs in the VM, without network unless `net`.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
-        self.check_git_files(false)?;
+        self.guard(false)?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(net, cmd, nixpkgs);
         }
@@ -1039,7 +1039,7 @@ impl Chest {
     /// Shell code for direnv: in VM mode the stand-ins come first on the `PATH` and the VM starts in the background.
     /// Must be fast, it runs on every `cd` into the project.
     pub fn cmd_hook(&self, nixpkgs: &str) -> Result<()> {
-        self.check_git_files(true)?;
+        self.guard(true)?;
         if self.def.mode != Mode::Vm {
             return Ok(());
         }
@@ -1092,7 +1092,7 @@ impl Chest {
 
     /// Starts the chest in the background and waits until all services are ready.
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
-        self.check_git_files(true)?;
+        self.guard(true)?;
         if self.def.mode == Mode::Vm {
             let pid = self.vm_up(nixpkgs)?;
             self.vm_warn_outdated(nixpkgs);
@@ -1345,7 +1345,7 @@ impl Chest {
 
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
-        self.check_git_files(false)?;
+        self.guard(false)?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(true, cmd, nixpkgs);
         }
@@ -1407,6 +1407,24 @@ impl Chest {
             "{path} changed while chest {} ran, and git on the host could run code from it — the chest is stopped; check the file, then `luggage down` accepts it",
             self.name
         )
+    }
+
+    /// Checks the git files, then binds the files that the host trusts read-only again where the host replaced one.
+    fn guard(&self, deep: bool) -> Result<()> {
+        self.check_git_files(deep)?;
+        let pid = self.running();
+        let target = if self.def.mode == Mode::Vm {
+            // the guest sees the files through virtiofsd, whose namespace has the project at /
+            pid.and_then(|_| vm::project_server(&self.run)).map(|p| (p, PathBuf::from("/")))
+        } else {
+            pid.map(|p| (p, self.project.clone()))
+        };
+        if let Some((pid, root)) = target
+            && let Err(e) = remount::protect_again(pid, &self.project, &root)
+        {
+            info(&format!("warning: {e:#} — run `luggage down && luggage up`"));
+        }
+        Ok(())
     }
 
     /// Checks the git files and notes them anew, right before the chest starts.
@@ -1484,7 +1502,7 @@ impl Chest {
 
     /// Shows the definition, services and state of the chest.
     pub fn cmd_status(&self, nixpkgs: &str) -> Result<()> {
-        self.check_git_files(false)?;
+        self.guard(false)?;
         println!("Chest:       {}", self.name);
         println!("Project:     {}", self.project.display());
         println!("Mode:        {}", if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" });

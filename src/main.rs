@@ -8,6 +8,7 @@ mod flake;
 mod gitcheck;
 mod proxy;
 mod remote;
+mod remount;
 mod setup;
 mod versions;
 mod vm;
@@ -114,6 +115,14 @@ enum Cmd {
     NetworkProxy {
         /// File with the allowed hosts, one per line
         file: PathBuf,
+    },
+    /// Bind paths read-only again in the namespace of a chest (luggage starts it)
+    #[command(hide = true)]
+    Rebind {
+        /// Process in the namespace
+        pid: u32,
+        /// Paths as the process sees them
+        paths: Vec<PathBuf>,
     },
     /// Print each path the host changes in a project (the VM marks it for file watchers)
     #[command(hide = true)]
@@ -474,6 +483,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             chest::Chest::find(&nixpkgs, true)?.cmd_hook(&nixpkgs)
         }
         Cmd::NetworkProxy { file } => proxy::serve(&file),
+        Cmd::Rebind { pid, paths } => remount::rebind(pid, &paths),
         Cmd::WatchProject { dir } => watch::serve(&dir),
     }
 }

@@ -240,10 +240,11 @@ Some files in the project are read-only in the chest, because programs on the ho
 - `.git/config` and `.git/hooks/`: git on the host runs hooks, and the config can name programs to run.
 
 Everything else, including the rest of `.git`, stays writable, so `git commit` works in the chest. luggage creates
-an empty `.luggage/`, `.direnv/` and `.git/hooks/` if they are missing; files that are missing at the start, like
-a new `flake.lock`, stay writable until the next start. If a program on the host replaces one of the files
-instead of writing into it (`git config` does, some editors do), that file is writable in the chest until the
-next start.
+an empty `.luggage/`, `.direnv/` and `.git/hooks/` if they are missing. If a program on the host replaces one of
+the files instead of writing into it (`git config` does, some editors do), the kernel drops its read-only mount in
+the chest. luggage notices this at the next luggage command or direnv hook and makes the new file read-only again;
+the same happens to a file that was missing at the start, like a new `flake.lock`. Until then the file is
+writable in the chest, and a program that opened it before stays able to write it.
 
 The rest of `.git` can still lead git on the host to another config, for example `.git/commondir`, worktrees,
 submodules in `.git/modules` or a repo nested in the project. So luggage notes these files when the chest starts

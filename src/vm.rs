@@ -500,8 +500,9 @@ pub fn project_server(run: &Path) -> Option<u32> {
 /// virtiofsd for the project, in a mount namespace where the paths that the host trusts are read-only.
 /// So the guest cannot change them, not even as root.
 fn protected_virtiofsd(bin: &Path, project: &Path, run: &Path) -> Command {
-    // Ubuntu allows user namespaces only for programs with an AppArmor profile, like /usr/bin/bwrap
-    let mut c = Command::new(crate::find_in_path("bwrap").unwrap_or_else(|| bin.join("bwrap")));
+    // Not /usr/bin/bwrap: Ubuntu's AppArmor profile for it takes all capabilities from its children,
+    // and virtiofsd needs them for its own sandbox
+    let mut c = Command::new(bin.join("bwrap"));
     c.args(["--bind", "/", "/"])
         .args(crate::chest::protect_args(project))
         .arg("--chdir")
@@ -1057,6 +1058,7 @@ mod tests {
         let c = protected_virtiofsd(Path::new("/r/bin"), tmp.path(), Path::new("/run/x"));
         let a: Vec<_> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let flake = tmp.path().join("flake.nix").to_string_lossy().into_owned();
+        assert_eq!(c.get_program(), "/r/bin/bwrap");
         assert_eq!(a[..2], ["--bind", "/"]);
         assert!(a.windows(3).any(|w| w == ["--ro-bind", flake.as_str(), flake.as_str()]));
         assert!(a.ends_with(&["--".into(), "/r/bin/virtiofsd".into()]));

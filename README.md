@@ -233,6 +233,18 @@ DNS and no direct connections, so tools that ignore these variables, and git ove
 `127.0.0.1:3128` passes the connections to the host. A changed list applies to the next connection after the
 next luggage command; adding or removing `network` needs a restart. `luggage status` shows the list.
 
+Some files in the project are read-only in the chest, because programs on the host read or run them:
+
+- `.luggage/`: luggage reads `chest.toml` at each command, so the chest could add `pass_env` or `network`.
+- `flake.nix`, `flake.lock`, `.envrc` and `.direnv/`: direnv on the host loads them when you `cd` into the project.
+- `.git/config` and `.git/hooks/`: git on the host runs hooks, and the config can name programs to run.
+
+Everything else, including the rest of `.git`, stays writable, so `git commit` works in the chest. luggage creates
+an empty `.luggage/`, `.direnv/` and `.git/hooks/` if they are missing; files that are missing at the start, like
+a new `flake.lock`, stay writable until the next start. If a program on the host replaces one of the files
+instead of writing into it (`git config` does, some editors do), that file is writable in the chest until the
+next start.
+
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
 

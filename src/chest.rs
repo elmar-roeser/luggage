@@ -370,6 +370,51 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+/// Paths in the project that luggage, direnv or git read or run on the host. The chest may only read them,
+/// else it could add host variables to `pass_env` or run its code on the host.
+pub const PROTECTED: [&str; 7] =
+    [".luggage", ".direnv", ".envrc", "flake.nix", "flake.lock", ".git/config", ".git/hooks"];
+
+/// Creates the missing directories of `PROTECTED`, so the chest cannot create them with its own content.
+///
+/// # Errors
+/// If a directory cannot be created.
+pub fn create_protected_dirs(project: &Path) -> Result<()> {
+    let mut dirs = vec![".luggage", ".direnv"];
+    if project.join(".git").is_dir() {
+        dirs.push(".git/hooks");
+    }
+    for d in dirs.into_iter().map(|d| project.join(d)) {
+        if d.symlink_metadata().is_err() {
+            fs::create_dir(&d).with_context(|| format!("cannot create {}", d.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// bwrap options that make the existing `PROTECTED` paths read-only; they go after the bind of the project.
+/// `.git` becomes a mount point first, so the chest cannot rename it and put its own in its place.
+pub fn protect_args(project: &Path) -> Vec<String> {
+    let mut a = Vec::new();
+    let mut bind = |option: &str, p: &Path| {
+        let p = p.to_string_lossy().into_owned();
+        a.extend([option.to_owned(), p.clone(), p]);
+    };
+    let git = project.join(".git");
+    if git.is_dir() {
+        bind("--bind", &git);
+    } else if git.exists() {
+        // a worktree or submodule: the file names the git dir
+        bind("--ro-bind", &git);
+    }
+    for p in PROTECTED.map(|n| project.join(n)) {
+        if p.exists() {
+            bind("--ro-bind", &p);
+        }
+    }
+    a
+}
+
 /// Exits luggage with the exit code of the child process if it was not 0.
 fn pass_through(status: ExitStatus) {
     if !status.success() {
@@ -579,6 +624,12 @@ impl Chest {
                 "--bind",
                 &project,
                 &project,
+            ]
+            .map(str::to_owned),
+        );
+        a.extend(protect_args(&self.project));
+        a.extend(
+            [
                 "--bind",
                 &s(&self.state.join("data")),
                 "/data",
@@ -652,6 +703,7 @@ impl Chest {
         for d in [self.state.join("home"), self.state.join("data"), self.inside()] {
             fs::create_dir_all(&d).with_context(|| format!("cannot create {}", d.display()))?;
         }
+        create_protected_dirs(&self.project)?;
         fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
         let tools = Tools::fetch(nixpkgs, &self.def.packages)?;
         self.dev_env()?;
@@ -1890,6 +1942,43 @@ depends_on = ["db"]
             let bind = t.bind_inside(f);
             assert!(a.windows(3).any(|w| w == bind), "{f}");
         }
+    }
+
+    #[test]
+    fn files_the_host_trusts_are_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        fs::create_dir(p.join(".git")).unwrap();
+        for f in ["flake.nix", ".envrc", ".git/config"] {
+            fs::write(p.join(f), "").unwrap();
+        }
+        create_protected_dirs(p).unwrap();
+        for d in [".luggage", ".direnv", ".git/hooks"] {
+            assert!(p.join(d).is_dir(), "{d}");
+        }
+        let t = Chest { project: p.to_path_buf(), ..chest(Definition::default()) };
+        let a = t.bwrap_args(&tools(), Net::Off).unwrap();
+        let at = |option: &str, path: &Path| {
+            let path = path.to_string_lossy().into_owned();
+            a.windows(3).position(|w| w == [option, path.as_str(), path.as_str()])
+        };
+        let bind = |option: &str, name: &str| at(option, &p.join(name));
+        let project = at("--bind", p).unwrap();
+        // .git is a mount point before its parts are protected, so it cannot be renamed away
+        let git = bind("--bind", ".git").unwrap();
+        assert!(project < git && git < bind("--ro-bind", ".git/config").unwrap());
+        for f in [".luggage", ".direnv", ".envrc", "flake.nix", ".git/hooks"] {
+            assert!(bind("--ro-bind", f).is_some_and(|i| i > project), "{f}");
+        }
+        // missing files are left out: bwrap would fail on them
+        assert!(bind("--ro-bind", "flake.lock").is_none());
+
+        // a worktree or submodule: .git is a file that names the git dir
+        let wt = tempfile::tempdir().unwrap();
+        fs::write(wt.path().join(".git"), "gitdir: /elsewhere").unwrap();
+        create_protected_dirs(wt.path()).unwrap();
+        let git = wt.path().join(".git").to_string_lossy().into_owned();
+        assert_eq!(protect_args(wt.path())[..3], ["--ro-bind", git.as_str(), git.as_str()]);
     }
 
     #[test]

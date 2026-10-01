@@ -143,6 +143,7 @@ const FLAKE: &str = r#"{
       paths = [
         self.nixosConfigurations.chest.config.microvm.declaredRunner
         pkgs.virtiofsd
+        pkgs.bubblewrap
         (pkgs.writeShellScriptBin "chest-ssh-proxy" ''exec ${pkgs.systemd}/lib/systemd/systemd-ssh-proxy "$@"'')
       ];
       # luggage adds options to the user network at start ($LUGGAGE_NETDEV), so `network` needs no new build
@@ -463,7 +464,11 @@ fn stop_virtiofsd(name: &str, run: &Path) {
             fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
             && alive(pid)
         {
-            let _ = Command::new("kill").arg(pid.to_string()).stderr(Stdio::null()).status();
+            // the whole group: for the project, bwrap runs virtiofsd as its child
+            let _ = Command::new("kill")
+                .args(["-TERM", "--", &format!("-{pid}")])
+                .stderr(Stdio::null())
+                .status();
             wait_dead(pid, 20);
         }
         let sock = run.join(socket(name, tag));
@@ -482,6 +487,20 @@ fn restricted_netdev(exe: &Path, file: &Path) -> String {
         sh_quote(&file.to_string_lossy())
     );
     format!(",restrict=on,guestfwd=tcp:{}-cmd:{}", crate::proxy::GUEST, cmd.replace(',', ",,"))
+}
+
+/// virtiofsd for the project, in a mount namespace where the paths that the host trusts are read-only.
+/// So the guest cannot change them, not even as root.
+fn protected_virtiofsd(bin: &Path, project: &Path, run: &Path) -> Command {
+    // Ubuntu allows user namespaces only for programs with an AppArmor profile, like /usr/bin/bwrap
+    let mut c = Command::new(crate::find_in_path("bwrap").unwrap_or_else(|| bin.join("bwrap")));
+    c.args(["--bind", "/", "/"])
+        .args(crate::chest::protect_args(project))
+        .arg("--chdir")
+        .arg(run)
+        .arg("--")
+        .arg(bin.join("virtiofsd"));
+    c
 }
 
 /// Starts virtiofsd for both shares and the VM in the runtime dir `run`, writes the qemu PID to `pid_file` and
@@ -518,12 +537,18 @@ pub fn start(
         None => String::new(),
     };
     let bin = dir.join("runner/bin");
+    crate::chest::create_protected_dirs(project)?;
     // The store never changes, so the guest may cache it for good.
     for (tag, shared, cache) in
         [("ro-store", Path::new("/nix/store"), "always"), ("project", project, "auto")]
     {
         let log = File::create(run.join(format!("virtiofsd-{tag}.log")))?;
-        let child = Command::new(bin.join("virtiofsd"))
+        let mut virtiofsd = if tag == "project" {
+            protected_virtiofsd(&bin, project, run)
+        } else {
+            Command::new(bin.join("virtiofsd"))
+        };
+        let child = virtiofsd
             .arg(format!("--socket-path={}", socket(name, tag)))
             .arg("--shared-dir")
             .arg(shared)
@@ -1015,6 +1040,19 @@ mod tests {
         assert!(
             !f.split('@').skip(1).any(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
         );
+    }
+
+    #[test]
+    fn virtiofsd_shows_the_files_the_host_trusts_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("flake.nix"), "").unwrap();
+        let c = protected_virtiofsd(Path::new("/r/bin"), tmp.path(), Path::new("/run/x"));
+        let a: Vec<_> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let flake = tmp.path().join("flake.nix").to_string_lossy().into_owned();
+        assert_eq!(a[..2], ["--bind", "/"]);
+        assert!(a.windows(3).any(|w| w == ["--ro-bind", flake.as_str(), flake.as_str()]));
+        assert!(a.ends_with(&["--".into(), "/r/bin/virtiofsd".into()]));
+        assert!(render(&guest("demo", "u")).contains("pkgs.bubblewrap"));
     }
 
     #[test]

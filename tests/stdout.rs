@@ -27,7 +27,7 @@ fn hook_reports_on_stderr_only() -> Result<(), Box<dyn std::error::Error>> {
 
 /// A git file that changed while the chest ran stops the hook with a warning on stderr; stdout stays empty.
 #[test]
-fn hook_warns_about_changed_git_files_on_stderr() -> Result<(), Box<dyn std::error::Error>> {
+fn hook_stops_on_changed_git_files_on_stderr() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = tempfile::tempdir()?;
     let project = tmp.path().join("demo");
     fs::create_dir_all(project.join(".git/objects"))?;

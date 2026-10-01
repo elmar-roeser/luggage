@@ -740,14 +740,14 @@ impl Chest {
     /// Runs a one-off command in a fresh chest; without a command, a shell.
     /// In VM mode it runs in the VM, without network unless `net`.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
-        self.guard(false)?;
+        self.guard()?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(net, cmd, nixpkgs);
         }
         let tools = self.prepare(nixpkgs)?;
         let mut c = self.run_command(&tools, net, cmd, &self.host_env(std::env::vars_os()))?;
         // this chest is gone when the command ends, so luggage compares right after it
-        let before = gitcheck::snapshot(&self.project, true);
+        let before = gitcheck::snapshot(&self.project, false);
         if !(net && self.def.network.is_some()) {
             let status = c.status().context("cannot start bwrap")?;
             check_run(&before, &self.project)?;
@@ -1039,7 +1039,7 @@ impl Chest {
     /// Shell code for direnv: in VM mode the stand-ins come first on the `PATH` and the VM starts in the background.
     /// Must be fast, it runs on every `cd` into the project.
     pub fn cmd_hook(&self, nixpkgs: &str) -> Result<()> {
-        self.guard(true)?;
+        self.guard()?;
         if self.def.mode != Mode::Vm {
             return Ok(());
         }
@@ -1092,7 +1092,7 @@ impl Chest {
 
     /// Starts the chest in the background and waits until all services are ready.
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
-        self.guard(true)?;
+        self.guard_up()?;
         if self.def.mode == Mode::Vm {
             let pid = self.vm_up(nixpkgs)?;
             self.vm_warn_outdated(nixpkgs);
@@ -1345,7 +1345,7 @@ impl Chest {
 
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
-        self.guard(false)?;
+        self.guard()?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(true, cmd, nixpkgs);
         }
@@ -1395,9 +1395,9 @@ impl Chest {
         gitcheck::changed(&before, &gitcheck::snapshot(&self.project, deep))
     }
 
-    /// Stops the chest and fails if a git file that the host trusts changed since the start.
-    fn check_git_files(&self, deep: bool) -> Result<()> {
-        let Some(path) = self.changed_git_file(deep) else {
+    /// Stops the chest and fails if a file of the top `.git` that the host trusts changed since the start.
+    fn check_git_files(&self) -> Result<()> {
+        let Some(path) = self.changed_git_file(false) else {
             return Ok(());
         };
         if self.running().is_some() {
@@ -1409,9 +1409,26 @@ impl Chest {
         )
     }
 
+    /// Warns if a nested repo changed since the start; it walks the whole project, so only `up` calls it.
+    /// Only a warning: tools in the chest create such repos on purpose, like `composer` from source.
+    fn warn_nested_repos(&self) {
+        let Ok(before) = fs::read_to_string(self.git_files()) else {
+            return;
+        };
+        let now = gitcheck::snapshot(&self.project, true);
+        if let Some(path) =
+            gitcheck::changed(&gitcheck::nested_repos(&before), &gitcheck::nested_repos(&now))
+        {
+            info(&format!(
+                "warning: the repo {path} changed while chest {} ran, and git on the host could run code from it there — check it",
+                self.name
+            ));
+        }
+    }
+
     /// Checks the git files, then binds the files that the host trusts read-only again where the host replaced one.
-    fn guard(&self, deep: bool) -> Result<()> {
-        self.check_git_files(deep)?;
+    fn guard(&self) -> Result<()> {
+        self.check_git_files()?;
         let pid = self.running();
         let target = if self.def.mode == Mode::Vm {
             // the guest sees the files through virtiofsd, whose namespace has the project at /
@@ -1427,9 +1444,19 @@ impl Chest {
         Ok(())
     }
 
+    /// `guard` for `up`; a running chest also gets the check for nested repos, which a start does anyway.
+    fn guard_up(&self) -> Result<()> {
+        self.guard()?;
+        if self.running().is_some() {
+            self.warn_nested_repos();
+        }
+        Ok(())
+    }
+
     /// Checks the git files and notes them anew, right before the chest starts.
     fn note_git_files(&self) -> Result<()> {
-        self.check_git_files(true)?;
+        self.check_git_files()?;
+        self.warn_nested_repos();
         fs::create_dir_all(&self.state)?;
         fs::write(self.git_files(), gitcheck::snapshot(&self.project, true))?;
         Ok(())
@@ -1502,7 +1529,7 @@ impl Chest {
 
     /// Shows the definition, services and state of the chest.
     pub fn cmd_status(&self, nixpkgs: &str) -> Result<()> {
-        self.guard(false)?;
+        self.guard()?;
         println!("Chest:       {}", self.name);
         println!("Project:     {}", self.project.display());
         println!("Mode:        {}", if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" });
@@ -1574,7 +1601,7 @@ impl Chest {
 
 /// Fails if a git file that the host trusts changed during `luggage run`, compared with `before`.
 fn check_run(before: &str, project: &Path) -> Result<()> {
-    if let Some(path) = gitcheck::changed(before, &gitcheck::snapshot(project, true)) {
+    if let Some(path) = gitcheck::changed(before, &gitcheck::snapshot(project, false)) {
         bail!(
             "{path} changed in the chest, and git on the host could run code from it — check the file"
         );
@@ -2083,18 +2110,22 @@ depends_on = ["db"]
         };
         // no start yet: nothing to compare with
         fs::write(p.join(".git/commondir"), "../evil").unwrap();
-        t.check_git_files(true).unwrap();
+        t.check_git_files().unwrap();
         fs::remove_file(p.join(".git/commondir")).unwrap();
         t.note_git_files().unwrap();
-        t.check_git_files(false).unwrap();
+        t.check_git_files().unwrap();
         fs::write(p.join(".git/commondir"), "../evil").unwrap();
-        let e = t.check_git_files(false).unwrap_err().to_string();
+        let e = t.check_git_files().unwrap_err().to_string();
         assert!(e.contains(".git/commondir") && e.contains("stopped"), "{e}");
         // the next start refuses as well, until `down` accepts the files
         assert!(t.note_git_files().is_err());
         t.cmd_down().unwrap();
         t.note_git_files().unwrap();
-        t.check_git_files(true).unwrap();
+        t.check_git_files().unwrap();
+        // a nested repo only warns: tools in the chest create them on purpose
+        fs::create_dir_all(p.join("vendor/x/.git")).unwrap();
+        t.check_git_files().unwrap();
+        t.note_git_files().unwrap();
     }
 
     #[test]

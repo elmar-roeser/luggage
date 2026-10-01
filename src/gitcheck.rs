@@ -139,12 +139,22 @@ pub fn snapshot(project: &Path, deep: bool) -> String {
 
 /// Keeps the lines of `snapshot` without `deep`: those of the top `.git`.
 pub fn shallow(snapshot: &str) -> String {
+    part(snapshot, true)
+}
+
+/// Keeps the lines that only `deep` adds: those of the nested repos.
+pub fn nested_repos(snapshot: &str) -> String {
+    part(snapshot, false)
+}
+
+/// The lines of the top `.git` if `top`, else the others.
+fn part(snapshot: &str, top: bool) -> String {
     let path = |l: &str| l.splitn(4, ' ').nth(3).unwrap_or_default().to_owned();
     snapshot
         .lines()
         .filter(|l| {
             let p = path(l);
-            p == ".git" || p.starts_with(".git/")
+            (p == ".git" || p.starts_with(".git/")) == top
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -216,6 +226,12 @@ mod tests {
         let before = snapshot(p, true);
         fs::create_dir_all(p.join("src/deep/.git")).unwrap();
         assert_eq!(changed(&shallow(&before), &snapshot(p, false)), None);
+        let now = snapshot(p, true);
+        assert_eq!(changed(&shallow(&before), &shallow(&now)), None);
+        assert_eq!(
+            changed(&nested_repos(&before), &nested_repos(&now)).as_deref(),
+            Some("src/deep/.git")
+        );
         assert_eq!(changed(&before, &snapshot(p, true)).as_deref(), Some("src/deep/.git"));
         fs::remove_dir(p.join("src/deep/.git")).unwrap();
         // git also takes a directory with HEAD and objects as a bare repo

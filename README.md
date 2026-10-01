@@ -248,10 +248,11 @@ writable in the chest, and a program that opened it before stays able to write i
 
 The rest of `.git` can still lead git on the host to another config, for example `.git/commondir`, worktrees,
 submodules in `.git/modules` or a repo nested in the project. So luggage notes these files when the chest starts
-and checks them again at each command (nested repos only at `up`, `down` and in the direnv hook). If one changed,
-luggage stops the chest and refuses to go on until you checked the file and ran `luggage down`; this also happens
-when you run `git worktree add` or `git submodule update` on the host. It is a check, not a lock: a `git` command
-that you run on the host before the next luggage command still reads the changed file.
+and checks the ones in `.git` again at each command. If one changed, luggage stops the chest and refuses to go on
+until you checked the file and ran `luggage down`; this also happens when you run `git worktree add` or
+`git submodule update` on the host. Nested repos are checked only at `up` and `down`, and only with a warning,
+because tools in the chest create them on purpose (`composer` from source). It is a check, not a lock: a `git`
+command that you run on the host before the next luggage command still reads the changed file.
 
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).

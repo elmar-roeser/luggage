@@ -62,9 +62,11 @@ const FLAKE: &str = r#"{
             { proto = "virtiofs"; tag = "ro-store"; source = "/nix/store"; mountPoint = "/nix/.ro-store"; }
             { proto = "virtiofs"; tag = "project"; source = @PROJECT@; mountPoint = @PROJECT@; }
           ];
-          volumes = [ { image = @VAR_IMG@; mountPoint = "/var"; size = 2048; } ];
+          # The home disk keeps caches (Composer etc.) across restarts; systemd mounts it before the project.
+          volumes = [ { image = @VAR_IMG@; mountPoint = "/var"; size = 2048; } @HOME_VOLUME@ ];
           interfaces = [ { type = "user"; id = "usernet"; mac = "02:00:00:00:00:01"; } ];
         };
+        @HOME_FS@
         # Same uid and gid as on the host: unprivileged virtiofsd maps only these two.
         users.groups.@USER@.gid = @GID@;
         users.users.@USER@ = {
@@ -107,6 +109,7 @@ const FLAKE: &str = r#"{
           "d /var/lib/luggage/data 0700 @UID@ @GID@ -"
           "L+ /data - - - - /var/lib/luggage/data"
           "d /run/luggage 0700 @UID@ @GID@ -"
+          @HOME_DIRS@
         ];
       }) ];
     };
@@ -134,6 +137,8 @@ pub struct Guest<'a> {
     pub nixpkgs: &'a str,
     /// Disk image for `/var` in the guest
     pub var_img: &'a Path,
+    /// Disk image for the home directory in the guest
+    pub home_img: &'a Path,
     /// Name of the guest user (the host user)
     pub user: &'a str,
     /// uid of the host user
@@ -193,9 +198,56 @@ pub fn render(g: &Guest) -> String {
         .replace("@GID@", &g.gid.to_string())
         .replace("@HOME@", &s(g.home))
         .replace("@SSH_KEY@", &nix_str(g.ssh_key.trim()))
+        .replace("@HOME_VOLUME@", &home_volume(g))
+        .replace("@HOME_FS@", &home_fs(g))
+        .replace("@HOME_DIRS@", &list(&home_dirs(g)))
         // last: these come from project files and must not be scanned for placeholders again
         .replace("@PACKAGES@", &list(g.packages))
         .replace("@HOSTS@", &list(g.hosts))
+}
+
+/// The volume for the home directory; none if the project contains the home, as the disk would hide part of it.
+fn home_volume(g: &Guest) -> String {
+    if g.home.starts_with(g.project) {
+        return String::new();
+    }
+    let s = |p: &Path| nix_str(&p.to_string_lossy());
+    format!("{{ image = {}; mountPoint = {}; size = 8192; }}", s(g.home_img), s(g.home))
+}
+
+/// Skips fsck of the home disk: it is on the boot path before the project (60 ms), and ext4 recovers from its journal.
+fn home_fs(g: &Guest) -> String {
+    if home_volume(g).is_empty() {
+        return String::new();
+    }
+    format!("fileSystems.{}.noCheck = true;", nix_str(&g.home.to_string_lossy()))
+}
+
+/// tmpfiles rules that give the home and the directories down to the project to the user.
+/// systemd creates missing mount points as root, so `~/.cache` would not be writable otherwise.
+fn home_dirs(g: &Guest) -> Vec<String> {
+    let mut rules = vec![format!("d {} 0700 {} {} -", tmpfiles_path(g.home), g.uid, g.gid)];
+    if let Ok(rest) = g.project.strip_prefix(g.home) {
+        let mut dir = g.home.to_path_buf();
+        // all but the last component: the project itself is the share
+        for c in rest.parent().into_iter().flat_map(Path::components) {
+            dir.push(c);
+            rules.push(format!("d {} - {} {} -", tmpfiles_path(&dir), g.uid, g.gid));
+        }
+    }
+    rules
+}
+
+/// A path for a tmpfiles.d line: whitespace and `\` as C escapes.
+fn tmpfiles_path(p: &Path) -> String {
+    p.to_string_lossy().chars().fold(String::new(), |mut out, c| {
+        if c == '\\' || c.is_ascii_whitespace() {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+        out
+    })
 }
 
 /// Nix strings separated by spaces, for a list.
@@ -237,11 +289,13 @@ pub fn guest_flake(
     let home = crate::home();
     let ssh_key = ssh_key(dir)?;
     let var_img = dir.join("var.img");
+    let home_img = dir.join("home.img");
     Ok(render(&Guest {
         name,
         project,
         nixpkgs,
         var_img: &var_img,
+        home_img: &home_img,
         user: &user,
         uid: meta.uid(),
         gid: meta.gid(),
@@ -379,7 +433,7 @@ pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path
         return Err(cid_error(name));
     }
     stop_virtiofsd(name, run);
-    // a new guest has an empty home, so the environment must be sent again
+    // the guest has not seen the environment yet, so it must be sent again
     for f in ["control.socket", "cm.sock", "env.sent", "ports", "started"] {
         let _ = fs::remove_file(run.join(f));
     }
@@ -769,6 +823,7 @@ mod tests {
             project: Path::new("/home/u/projects/demo"),
             nixpkgs: "github:NixOS/nixpkgs/nixos-26.05",
             var_img: Path::new("/home/u/.local/share/luggage/chests/demo/vm/var.img"),
+            home_img: Path::new("/home/u/.local/share/luggage/chests/demo/vm/home.img"),
             user,
             uid: 1000,
             gid: 1000,
@@ -793,6 +848,32 @@ mod tests {
         assert!(
             !f.split('@').skip(1).any(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
         );
+    }
+
+    #[test]
+    fn renders_home_disk() {
+        let f = render(&guest("demo", "u"));
+        assert!(f.contains(
+            "{ image = \"/home/u/.local/share/luggage/chests/demo/vm/home.img\"; mountPoint = \"/home/u\"; size = 8192; } ];"
+        ));
+        assert!(f.contains(
+            "\"d /home/u 0700 1000 1000 -\" \"d /home/u/projects - 1000 1000 -\"\n        ];"
+        ));
+        assert!(!f.contains("d /home/u/projects/demo "));
+        assert!(f.contains("fileSystems.\"/home/u\".noCheck = true;"));
+        // the project outside the home: only the home itself
+        let f = render(&Guest { project: Path::new("/srv/my app"), ..guest("demo", "u") });
+        assert!(f.contains("\"d /home/u 0700 1000 1000 -\"\n        ];"));
+        let f = render(&Guest {
+            home: Path::new("/home/my u"),
+            project: Path::new("/home/my u/a b/c"),
+            ..guest("demo", "u")
+        });
+        assert!(f.contains("\"d /home/my\\\\x20u/a\\\\x20b - 1000 1000 -\""));
+        // a disk on the home would hide the project
+        let f = render(&Guest { project: Path::new("/home/u"), ..guest("demo", "u") });
+        assert!(f.contains("size = 2048; }  ];"));
+        assert!(!f.contains("fileSystems"));
     }
 
     #[test]

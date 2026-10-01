@@ -201,6 +201,11 @@ The running VM keeps the definition it was started with. After changing services
 or (with services) the project flake, `up`, `exec`, `status` and the stand-ins warn until you restart it
 with `luggage down && luggage up`.
 
+Your home in the VM (same path as on the host, but not your host files) lives on its own disk,
+`~/.local/share/luggage/chests/<project>/vm/home.img` (up to 8 GB, sparse), so caches such as
+Composer's survive a restart. `/var` with the service data lives next to it in `var.img`.
+To reset the home, delete the image while the VM is stopped: `luggage down`, `rm …/vm/home.img`, `luggage up`.
+
 The `ports` of the taken-over Compose services are reachable from the host browser, but only on 127.0.0.1,
 never from the network (`"8026:8025"` in `compose.yaml` → `127.0.0.1:8026`). Mailpit without `ports`
 gets its web UI on `127.0.0.1:8025`. Your own services list theirs in `chest.toml`, as `"host:guest"` or `"port"`:

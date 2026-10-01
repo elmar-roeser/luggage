@@ -119,7 +119,8 @@ ignored; a higher `rust-version` in `Cargo.toml` is reported.
 ## What luggage writes
 
 - `flake.nix` with a `devShell`, and `.envrc` (`use flake`, with `.venv` for Python, and a
-  `luggage hook` line that only does something for a [chest in a VM](#the-chest-in-a-vm))
+  `luggage hook` line that starts a [chest in a VM](#the-chest-in-a-vm) and moves a running chest to the
+  [data of a newly checked-out branch](#service-data-per-branch))
 - `.direnv/` (and `.venv/` for Python) in `.gitignore`
 - `flake.lock` via `nix flake lock`
 
@@ -256,6 +257,20 @@ command that you run on the host before the next luggage command still reads the
 
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
+
+### Service data per branch
+
+Each git branch has its own service data (databases and everything else in `/data`); the home stays shared.
+When you check out another branch, the next luggage command (`up`, `exec`, `run`, a stand-in, or the direnv hook
+in the background) stops the chest, puts the data of the old branch aside and starts the chest again with the
+data of the new one. A branch that has no data yet gets a copy of the data in use, so a new feature branch starts
+where its base branch was; run its migrations then. The copy uses reflinks (btrfs, XFS), which take no time and
+no space until the data differs; elsewhere luggage copies in full and says how much. A detached HEAD, a rebase
+or a bisect keeps the data in use. Each worktree is its own chest with its own branches.
+
+`luggage status` shows the branch in use and the size of each branch's data. `luggage prune` removes the data of
+branches that no longer exist; luggage never removes it by itself. The data that is put aside lives in
+`~/.local/share/luggage/chests/<project>/branches/`.
 
 ### The chest in a VM
 

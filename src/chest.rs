@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::branch::{self, Head};
 use crate::compose::{self, Detected};
 use crate::{config, find_in_path, gitcheck, home, info, remount, versions, vm};
 
@@ -741,6 +742,7 @@ impl Chest {
     /// In VM mode it runs in the VM, without network unless `net`.
     pub fn cmd_run(&self, net: bool, cmd: &[String], nixpkgs: &str) -> Result<()> {
         self.guard()?;
+        self.follow_branch(nixpkgs)?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(net, cmd, nixpkgs);
         }
@@ -1041,6 +1043,10 @@ impl Chest {
     pub fn cmd_hook(&self, nixpkgs: &str) -> Result<()> {
         self.guard()?;
         if self.def.mode != Mode::Vm {
+            // a running bubblewrap chest follows a newly checked-out branch in the background
+            if self.running().is_some() && self.branch_changed() {
+                self.up_in_background()?;
+            }
             return Ok(());
         }
         fs::create_dir_all(&self.run)?;
@@ -1062,25 +1068,238 @@ impl Chest {
         if let Some(d) = &self.def_dir {
             println!("watch_file {}", sh_quote(&d.join("chest.toml").to_string_lossy()));
         }
-        if self.running().is_some() {
+        // `up` also moves the chest to the data of a newly checked-out branch
+        if self.running().is_some() && !self.branch_changed() {
             self.vm_warn_outdated(nixpkgs);
         } else {
-            // direnv reads the environment from fd 3 and waits until every holder closed it,
-            // and Rust passes such descriptors on to children, so a small shell closes them all first.
-            let log = File::create(self.run.join("up.log"))?;
-            Command::new("/bin/sh")
-                .args(["-c", CLOSE_FDS_AND_EXEC, "sh"])
-                .arg(std::env::current_exe()?)
-                .arg("up")
-                .current_dir(&self.project)
-                .process_group(0)
-                .stdin(Stdio::null())
-                .stdout(log.try_clone()?)
-                .stderr(log)
-                .spawn()
-                .context("cannot start luggage up in the background")?;
+            self.up_in_background()?;
         }
         Ok(())
+    }
+
+    /// Starts `luggage up` in the background, for the hook: it must not wait for the chest.
+    fn up_in_background(&self) -> Result<()> {
+        // direnv reads the environment from fd 3 and waits until every holder closed it,
+        // and Rust passes such descriptors on to children, so a small shell closes them all first.
+        let log = File::create(self.run.join("up.log"))?;
+        Command::new("/bin/sh")
+            .args(["-c", CLOSE_FDS_AND_EXEC, "sh"])
+            .arg(std::env::current_exe()?)
+            .arg("up")
+            .current_dir(&self.project)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .context("cannot start luggage up in the background")?;
+        Ok(())
+    }
+
+    /// The file that names the branch whose service data is in use.
+    fn branch_file(&self) -> PathBuf {
+        self.state.join("branch")
+    }
+
+    /// The service data in use: `/data` of the bubblewrap chest, or the VM disk that holds it.
+    fn data_slot(&self) -> PathBuf {
+        if self.def.mode == Mode::Vm {
+            self.state.join("vm/var.img")
+        } else {
+            self.state.join("data")
+        }
+    }
+
+    /// Where the service data of the branch with directory name `dir` waits while another branch is checked out.
+    fn parked(&self, dir: &str) -> PathBuf {
+        let slot = self.data_slot();
+        self.state.join("branches").join(dir).join(slot.file_name().unwrap_or_default())
+    }
+
+    /// The branch whose service data is in use, if luggage noted one.
+    fn active_branch(&self) -> Option<String> {
+        let b = fs::read_to_string(self.branch_file()).ok()?;
+        let b = b.trim();
+        (!b.is_empty()).then(|| b.to_owned())
+    }
+
+    /// The checked-out branch whose data the chest should use; `None` keeps the data in use.
+    /// A detached HEAD (also during a rebase or bisect) gets a note once.
+    fn wanted_branch(&self) -> Option<String> {
+        let note = self.run.join("branch-note");
+        let skip = match branch::head(&self.project) {
+            Head::Branch(b) if branch::dir_name(&b).is_some() => {
+                let _ = fs::remove_file(&note);
+                return Some(b);
+            }
+            Head::Branch(b) => format!("the branch name {b} is too long"),
+            Head::Detached => "HEAD is detached (or a rebase or bisect is under way)".to_owned(),
+            Head::None => return None,
+        };
+        let active = self.active_branch()?;
+        if fs::read_to_string(&note).ok().as_deref() != Some(skip.as_str()) {
+            info(&format!("note: {skip} — chest {} keeps the data of branch {active}", self.name));
+            let _ = fs::create_dir_all(&self.run).and_then(|()| fs::write(&note, &skip));
+        }
+        None
+    }
+
+    /// Does the checked-out branch differ from the one whose data is in use?
+    fn branch_changed(&self) -> bool {
+        match (self.wanted_branch(), self.active_branch()) {
+            (Some(want), Some(active)) => want != active,
+            _ => false,
+        }
+    }
+
+    /// Gives each git branch its own service data: after a checkout the chest stops, its data is put aside, and the branch
+    /// gets its own data back or a copy of the data in use. A running chest starts again, and the result tells whether it did.
+    fn follow_branch(&self, nixpkgs: &str) -> Result<bool> {
+        let Some(want) = self.wanted_branch() else {
+            return Ok(false);
+        };
+        if self.active_branch().as_deref() == Some(want.as_str()) {
+            return Ok(false);
+        }
+        fs::create_dir_all(&self.run)
+            .with_context(|| format!("cannot create {}", self.run.display()))?;
+        let lock = File::create(self.run.join("branch.lock"))?;
+        lock.lock()?;
+        // another luggage may have switched while this one waited
+        let Some(active) = self.active_branch().filter(|a| *a != want) else {
+            if self.active_branch().is_none() {
+                // the first time: the data in use belongs to the branch checked out now
+                fs::create_dir_all(&self.state)?;
+                fs::write(self.branch_file(), &want)?;
+            }
+            return Ok(false);
+        };
+        let started = std::time::Instant::now();
+        let pid = self.running();
+        info(&format!("chest {}: branch {active} → {want}, switching its service data", self.name));
+        {
+            // a VM start under way must not use the data while it moves
+            let up = File::create(self.run.join("up.lock"))?;
+            up.lock()?;
+            if pid.is_some() {
+                self.stop()?;
+            }
+            self.swap_data(&active, &want)?;
+        }
+        if pid.is_some() {
+            if self.def.mode == Mode::Vm {
+                self.vm_up(nixpkgs)?;
+            } else {
+                self.bwrap_up(nixpkgs)?;
+            }
+        }
+        info(&format!(
+            "chest {} uses the data of branch {want} ({:.1} s)",
+            self.name,
+            started.elapsed().as_secs_f32()
+        ));
+        Ok(pid.is_some())
+    }
+
+    /// Puts the data of branch `active` aside and brings in that of `want`, or a copy of `active`'s if `want` has none.
+    /// A switch that was cut short continues: data that is already aside stays there.
+    fn swap_data(&self, active: &str, want: &str) -> Result<()> {
+        let dir =
+            |b: &str| branch::dir_name(b).with_context(|| format!("unusable branch name {b}"));
+        let slot = self.data_slot();
+        let aside = self.parked(&dir(active)?);
+        let back = self.parked(&dir(want)?);
+        if slot.symlink_metadata().is_ok() {
+            if aside.symlink_metadata().is_ok() {
+                bail!(
+                    "both {} and {} exist — keep one of them, then run luggage again",
+                    slot.display(),
+                    aside.display()
+                );
+            }
+            if let Some(parent) = aside.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&slot, &aside).with_context(|| format!("cannot move {}", slot.display()))?;
+        }
+        if back.symlink_metadata().is_ok() {
+            fs::rename(&back, &slot).with_context(|| format!("cannot move {}", back.display()))?;
+            if let Some(parent) = back.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        } else if aside.symlink_metadata().is_ok() {
+            branch::copy(&aside, &slot)?;
+        }
+        fs::write(self.branch_file(), want)?;
+        Ok(())
+    }
+
+    /// Removes the service data of branches that no longer exist in the repo; never the data in use.
+    pub fn cmd_prune(&self) -> Result<()> {
+        self.guard()?;
+        let out = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
+            .current_dir(&self.project)
+            .stderr(Stdio::inherit())
+            .output()
+            .context("cannot start git")?;
+        if !out.status.success() {
+            bail!("git for-each-ref failed");
+        }
+        let refs = String::from_utf8_lossy(&out.stdout);
+        let exists: BTreeSet<&str> =
+            refs.lines().filter_map(|r| r.strip_prefix("refs/heads/")).collect();
+        let mut removed = 0;
+        for (name, dir) in self.parked_branches() {
+            if exists.contains(name.as_str()) || self.active_branch().as_deref() == Some(&name) {
+                continue;
+            }
+            let size = branch::usage(&dir);
+            fs::remove_dir_all(&dir).with_context(|| format!("cannot remove {}", dir.display()))?;
+            info(&format!("removed the data of branch {name} ({})", branch::human(size)));
+            removed += 1;
+        }
+        if removed == 0 {
+            info("no data of deleted branches");
+        }
+        Ok(())
+    }
+
+    /// The branches whose data is put aside, with their directories, sorted by name.
+    fn parked_branches(&self) -> Vec<(String, PathBuf)> {
+        let mut v: Vec<(String, PathBuf)> = fs::read_dir(self.state.join("branches"))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                Some((branch::branch_name(&e.file_name().to_string_lossy())?, e.path()))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The `Branch:` lines of `status`: the branch in use, what HEAD wants, and the data of each branch with its size.
+    fn print_branches(&self) {
+        let Some(active) = self.active_branch() else {
+            return;
+        };
+        let pending = match branch::head(&self.project) {
+            Head::Branch(b) if b != active => {
+                format!(" (checked out: {b} — switches with the next command)")
+            }
+            Head::Detached => " (HEAD is detached)".to_owned(),
+            _ => String::new(),
+        };
+        println!("Branch:      {active}{pending}");
+        let mut rows =
+            vec![format!("{active} {} (in use)", branch::human(branch::usage(&self.data_slot())))];
+        rows.extend(
+            self.parked_branches()
+                .into_iter()
+                .map(|(name, dir)| format!("{name} {}", branch::human(branch::usage(&dir)))),
+        );
+        println!("Branch data: {}", rows.join(", "));
     }
 
     /// Prints the notes from service detection.
@@ -1093,6 +1312,7 @@ impl Chest {
     /// Starts the chest in the background and waits until all services are ready.
     pub fn cmd_up(&self, nixpkgs: &str) -> Result<()> {
         self.guard_up()?;
+        let switched = self.follow_branch(nixpkgs)?;
         if self.def.mode == Mode::Vm {
             let pid = self.vm_up(nixpkgs)?;
             self.vm_warn_outdated(nixpkgs);
@@ -1103,9 +1323,16 @@ impl Chest {
             return Ok(());
         }
         if let Some(pid) = self.running() {
-            info(&format!("chest {} is already running (pid {pid})", self.name));
+            if !switched {
+                info(&format!("chest {} is already running (pid {pid})", self.name));
+            }
             return Ok(());
         }
+        self.bwrap_up(nixpkgs)
+    }
+
+    /// Starts the bubblewrap chest and waits until all services are ready.
+    fn bwrap_up(&self, nixpkgs: &str) -> Result<()> {
         self.print_notes();
         let tools = self.prepare(nixpkgs)?;
         let info_json = self.run.join("info.json");
@@ -1346,6 +1573,7 @@ impl Chest {
     /// Runs `cmd` in the running chest; without a command, a shell.
     fn enter(&self, cmd: &[String], nixpkgs: &str) -> Result<()> {
         self.guard()?;
+        self.follow_branch(nixpkgs)?;
         if self.def.mode == Mode::Vm {
             return self.vm_enter(true, cmd, nixpkgs);
         }
@@ -1557,6 +1785,7 @@ impl Chest {
         );
         self.print_notes();
         println!("State:       {}", self.state.display());
+        self.print_branches();
         let Some(pid) = self.running() else {
             println!("Status:      not running");
             return Ok(());
@@ -1772,6 +2001,37 @@ depends_on = ["db"]
             bwrap: "/usr/bin/bwrap".into(),
             packages: vec!["/nix/store/m-mariadb".into()],
         }
+    }
+
+    #[test]
+    fn each_branch_keeps_its_own_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = chest(Definition::default());
+        c.state = dir.path().join("state");
+        let data = c.state.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("db"), "main").unwrap();
+        // a new branch starts with a copy of the data in use
+        c.swap_data("main", "feature/x").unwrap();
+        assert_eq!(c.active_branch().as_deref(), Some("feature/x"));
+        assert_eq!(fs::read_to_string(data.join("db")).unwrap(), "main");
+        fs::write(data.join("db"), "feature").unwrap();
+        // back on main, its own data returns unchanged
+        c.swap_data("feature/x", "main").unwrap();
+        assert_eq!(fs::read_to_string(data.join("db")).unwrap(), "main");
+        let parked = c.state.join("branches/feature%2Fx/data/db");
+        assert_eq!(fs::read_to_string(&parked).unwrap(), "feature");
+        assert!(!c.state.join("branches/main").exists());
+        let names: Vec<_> = c.parked_branches().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["feature/x"]);
+        // a switch cut short after the data was put aside continues
+        fs::create_dir_all(c.state.join("branches/main")).unwrap();
+        fs::rename(&data, c.state.join("branches/main/data")).unwrap();
+        c.swap_data("main", "feature/x").unwrap();
+        assert_eq!(fs::read_to_string(data.join("db")).unwrap(), "feature");
+        // data in use and data put aside for the same branch: luggage does not pick one
+        fs::create_dir_all(c.state.join("branches/feature%2Fx/data")).unwrap();
+        assert!(c.swap_data("feature/x", "main").is_err());
     }
 
     #[test]

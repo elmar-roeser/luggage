@@ -1,5 +1,6 @@
 //! luggage — create or clone a project and set up a Nix dev environment (flake + direnv).
 
+mod branch;
 mod chest;
 mod compose;
 mod config;
@@ -110,6 +111,8 @@ enum Cmd {
     Status,
     /// Print shell code for direnv; the .envrc runs it
     Hook,
+    /// Remove the service data of branches that no longer exist
+    Prune,
     /// Serve one connection of the chest to the proxy for `network` (qemu or socat starts it)
     #[command(hide = true)]
     NetworkProxy {
@@ -482,6 +485,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let nixpkgs = config::load()?.nixpkgs();
             chest::Chest::find(&nixpkgs, true)?.cmd_hook(&nixpkgs)
         }
+        Cmd::Prune => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_prune(),
         Cmd::NetworkProxy { file } => proxy::serve(&file),
         Cmd::Rebind { pid, paths } => remount::rebind(pid, &paths),
         Cmd::WatchProject { dir } => watch::serve(&dir),

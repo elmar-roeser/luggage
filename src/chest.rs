@@ -435,11 +435,12 @@ impl Chest {
     /// Generates `process-compose.yaml` from the services.
     fn render_compose(&self) -> String {
         let wd = yaml_str(&self.project.to_string_lossy());
-        let mut y = String::from("version: \"0.5\"\nprocesses:\n");
+        // Only bash expands variables; process-compose ignores this key per process.
+        let mut y = String::from("version: \"0.5\"\ndisable_env_expansion: true\nprocesses:\n");
         for (name, svc) in &self.def.services {
             let _ = write!(
                 y,
-                "  {}:\n    command: {}\n    working_dir: {wd}\n    disable_env_expansion: true\n",
+                "  {}:\n    command: {}\n    working_dir: {wd}\n",
                 yaml_str(name),
                 yaml_str(&svc.command)
             );
@@ -1343,7 +1344,9 @@ depends_on = ["db"]
     #[test]
     fn compose_uses_matching_conditions() {
         let y = chest(parse(SPARENCON).unwrap()).render_compose();
-        assert!(y.contains("  \"db\":\n    command: \"mariadbd --no-defaults --datadir=/data/mariadb\"\n    working_dir: \"/home/u/projects/demo\"\n    disable_env_expansion: true\n"));
+        // process-compose 1.110 only honours the key at the top level and would expand `${VAR}` itself.
+        assert!(y.starts_with("version: \"0.5\"\ndisable_env_expansion: true\nprocesses:\n"));
+        assert!(y.contains("  \"db\":\n    command: \"mariadbd --no-defaults --datadir=/data/mariadb\"\n    working_dir: \"/home/u/projects/demo\"\n    depends_on:\n"));
         assert!(
             y.contains("      \"db-init\":\n        condition: process_completed_successfully\n")
         );

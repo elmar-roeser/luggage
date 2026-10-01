@@ -581,8 +581,9 @@ pub fn start(
     if let Some(t) = TAGS.iter().find(|t| !run.join(socket(name, t)).exists()) {
         stop_virtiofsd(name, run);
         bail!(
-            "virtiofsd for {t} does not start — log: {}",
-            run.join(format!("virtiofsd-{t}.log")).display()
+            "virtiofsd for {t} does not start — log: {}{}",
+            run.join(format!("virtiofsd-{t}.log")).display(),
+            crate::setup::userns_hint()
         );
     }
     let log = File::create(run.join("vm.log"))?;

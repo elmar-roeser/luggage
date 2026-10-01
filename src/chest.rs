@@ -1389,8 +1389,9 @@ impl Chest {
         }
         if !alive(pid) {
             bail!(
-                "chest stopped right away — see {}/chest.log and chest/pc.log",
-                self.run.display()
+                "chest stopped right away — see {}/chest.log and chest/pc.log{}",
+                self.run.display(),
+                crate::setup::userns_hint()
             );
         }
         self.bridge_ports(&tools, pid, proxy.transpose()?)?;
@@ -1553,7 +1554,11 @@ impl Chest {
             }
             sleep(Duration::from_millis(100));
         }
-        bail!("chest does not start — see {}", self.run.join("chest.log").display())
+        bail!(
+            "chest does not start — see {}{}",
+            self.run.join("chest.log").display(),
+            crate::setup::userns_hint()
+        )
     }
 
     /// Runs `cmd` in the VM, which starts if needed; without a command, a shell.

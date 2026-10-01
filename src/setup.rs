@@ -267,6 +267,23 @@ fn check_hook() -> Check {
     )
 }
 
+/// With 1, AppArmor allows user namespaces only to programs with a profile (Ubuntu 24.04 and later).
+const USERNS_RESTRICTION: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// Does the kernel setting `sysctl` say that AppArmor restricts user namespaces?
+fn userns_restricted(sysctl: &Path) -> bool {
+    fs::read_to_string(sysctl).is_ok_and(|v| v.trim() == "1")
+}
+
+/// Addition to errors of a starting chest or VM when AppArmor restricts user namespaces; empty otherwise.
+pub fn userns_hint() -> &'static str {
+    if userns_restricted(Path::new(USERNS_RESTRICTION)) {
+        " — AppArmor restricts user namespaces on this system, see `luggage doctor`"
+    } else {
+        ""
+    }
+}
+
 /// Checks that the chest may create user namespaces, with the same programs as `luggage up`.
 fn check_userns(nixpkgs: &str) -> Check {
     let tools = match Tools::fetch(nixpkgs, &[]) {
@@ -298,14 +315,19 @@ fn check_userns(nixpkgs: &str) -> Check {
     } else {
         "unshare and bwrap"
     };
-    Check::missing(
-        "chest",
+    let detail = if userns_restricted(Path::new(USERNS_RESTRICTION)) {
         format!(
-            "{failed} may not create user namespaces — Ubuntu 24.04 and later: install the bubblewrap package \
-             or set kernel.apparmor_restrict_unprivileged_userns=0"
-        ),
-        Vec::new(),
-    )
+            "{failed} may not create user namespaces: AppArmor allows them only to programs with a profile \
+             (kernel.apparmor_restrict_unprivileged_userns = 1), so neither the chest nor the VM mode starts — \
+             until the next reboot, `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` lifts it for all programs"
+        )
+    } else {
+        format!(
+            "{failed} may not create user namespaces — check the kernel settings user.max_user_namespaces \
+             and kernel.unprivileged_userns_clone"
+        )
+    };
+    Check::missing("chest", detail, Vec::new())
 }
 
 /// Checks gh/glab; both are optional, luggage fetches a missing one with `nix run` when needed.
@@ -508,6 +530,17 @@ mod tests {
         assert_eq!(Check::ok("git", "2.47".into()).line(), "  ✓ git              2.47");
         let c = Check::missing("Nix", "missing".into(), Vec::new());
         assert_eq!(c.line(), "  ✗ Nix              missing");
+    }
+
+    #[test]
+    fn reads_the_userns_restriction() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysctl = dir.path().join("restrict");
+        assert!(!userns_restricted(&sysctl));
+        fs::write(&sysctl, "1\n").unwrap();
+        assert!(userns_restricted(&sysctl));
+        fs::write(&sysctl, "0\n").unwrap();
+        assert!(!userns_restricted(&sysctl));
     }
 
     #[test]

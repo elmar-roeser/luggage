@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 
-use crate::chest::{Service, sh_quote};
+use crate::chest::{Service, port_pair, sh_quote};
 use crate::detect::pick;
 use crate::versions::Available;
 
@@ -34,6 +34,9 @@ struct ComposeService {
     /// `environment:` as a map or list, not yet parsed
     #[serde(default)]
     environment: Value,
+    /// `ports:` in short (`"8026:8025"`) or long syntax, not yet parsed
+    #[serde(default)]
+    ports: Vec<Value>,
 }
 
 /// What was taken over from the Compose file.
@@ -87,8 +90,61 @@ pub fn detect(
             }
         }
         d.hosts.push(name.clone());
+        let mut ports = Vec::new();
+        for p in &svc.ports {
+            match port(p, &dotenv) {
+                Some(p) => ports.push(p),
+                None => d.notes.push(format!("{name}: port {} is not forwarded", show(p))),
+            }
+        }
+        // without published ports the web UI of Mailpit is still worth reaching
+        if ports.is_empty() && matches!(repo, "mailpit" | "mailhog") {
+            ports.push("8025".into());
+        }
+        if let Some(s) = d.services.get_mut(name) {
+            s.ports = ports;
+        }
     }
     Ok(Some(d))
+}
+
+/// A Compose port as `"host:guest"`; the host address is dropped, the VM always uses 127.0.0.1.
+/// `None` for UDP, ranges and anything else that cannot be forwarded one to one.
+fn port(value: &Value, vars: &BTreeMap<String, String>) -> Option<String> {
+    let text = |v: &Value| match v {
+        Value::String(s) => Some(interpolate(s, vars)),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let (host, guest) = match value {
+        Value::Mapping(m) => {
+            if m.get("protocol").and_then(Value::as_str).is_some_and(|p| p != "tcp") {
+                return None;
+            }
+            let guest = text(m.get("target")?)?;
+            (m.get("published").and_then(text).unwrap_or_else(|| guest.clone()), guest)
+        }
+        v => {
+            let spec = text(v)?;
+            let spec = match spec.split_once('/') {
+                Some((s, "tcp")) => s.to_owned(),
+                Some(_) => return None,
+                None => spec,
+            };
+            // [address:]host:guest; an empty host port means any port in Docker
+            let mut parts = spec.rsplitn(3, ':');
+            let guest = parts.next()?.to_owned();
+            let host = parts.next().filter(|h| !h.is_empty()).unwrap_or(&guest).to_owned();
+            (host, guest)
+        }
+    };
+    let spec = format!("{host}:{guest}");
+    port_pair(&spec).is_ok().then_some(spec)
+}
+
+/// A Compose value for a note.
+fn show(value: &Value) -> String {
+    serde_yaml_ng::to_string(value).map_or_else(|_| "?".into(), |s| s.trim().replace('\n', ", "))
 }
 
 /// Reads a simple `.env` file: `KEY=value`, with quotes removed.
@@ -418,6 +474,20 @@ services:
         ));
         assert_eq!(d.services["database"].depends_on, ["database-init"]);
         assert!(d.notes.iter().any(|n| n.contains("root password")));
+        assert!(d.services["database-setup"].ports.is_empty());
+        assert_eq!(d.services["mailer"].ports, ["8025"]);
+    }
+
+    #[test]
+    fn takes_over_published_ports() {
+        let d = run(
+            "services:\n  db:\n    image: mariadb:10.11\n    ports:\n      - \"127.0.0.1:${DB_PORT:-3307}:3306\"\n      - 33060\n      - \"9000-9001:9000-9001\"\n  mail:\n    image: axllent/mailpit\n    ports:\n      - target: 8025\n        published: \"8026\"\n      - \"1025/udp\"\n",
+            "",
+        );
+        assert_eq!(d.services["db"].ports, ["3307:3306", "33060:33060"]);
+        assert_eq!(d.services["mail"].ports, ["8026:8025"]);
+        assert_eq!(d.notes.len(), 2, "{:?}", d.notes);
+        assert!(d.notes[0].starts_with("db: port 9000-9001:9000-9001"));
     }
 
     #[test]

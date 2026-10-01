@@ -88,6 +88,21 @@ const FLAKE: &str = r#"{
         environment.etc."luggage/path".text = lib.makeBinPath servicePackages;
         networking.hosts."127.0.0.1" = [ @HOSTS@ ];
         boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 0;
+        # qemu delivers the ports forwarded from 127.0.0.1 on the host to the network card; they go on to 127.0.0.1,
+        # where the services listen. Only new connections from outside pass the nat hook.
+        boot.kernel.sysctl."net.ipv4.conf.all.route_localnet" = 1;
+        networking.nftables = {
+          enable = true;
+          tables.luggage = {
+            family = "ip";
+            content = ''
+              chain prerouting {
+                type nat hook prerouting priority dstnat; policy accept;
+                iifname != "lo" meta l4proto tcp dnat to 127.0.0.1
+              }
+            '';
+          };
+        };
         systemd.tmpfiles.rules = [
           "d /var/lib/luggage/data 0700 @UID@ @GID@ -"
           "L+ /data - - - - /var/lib/luggage/data"
@@ -341,7 +356,7 @@ pub fn start(name: &str, project: &Path, dir: &Path, run: &Path, pid_file: &Path
     }
     stop_virtiofsd(name, run);
     // a new guest has an empty home, so the environment must be sent again
-    for f in ["control.socket", "cm.sock", "env.sent"] {
+    for f in ["control.socket", "cm.sock", "env.sent", "ports"] {
         let _ = fs::remove_file(run.join(f));
     }
     let bin = dir.join("runner/bin");
@@ -440,6 +455,54 @@ fn powerdown(control: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The qemu rule that forwards `host` on 127.0.0.1 to `guest` in the VM; never on all addresses, that would open it to the network.
+fn hostfwd(host: u16, guest: u16) -> String {
+    format!("tcp:127.0.0.1:{host}-:{guest}")
+}
+
+/// Forwards TCP port `host` on 127.0.0.1 of the host to port `guest` in the running VM, through the QMP socket of qemu.
+///
+/// # Errors
+/// If qemu cannot be reached or refuses the rule, e.g. because the host port is taken.
+pub fn forward_port(run: &Path, host: u16, guest: u16) -> Result<()> {
+    let mut s = UnixStream::connect(run.join("control.socket")).context("cannot reach qemu")?;
+    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut reply = BufReader::new(s.try_clone()?);
+    let mut line = String::new();
+    reply.read_line(&mut line)?;
+    let command = serde_json::json!({
+        "execute": "human-monitor-command",
+        "arguments": { "command-line": format!("hostfwd_add usernet {}", hostfwd(host, guest)) },
+    });
+    writeln!(s, "{{\"execute\":\"qmp_capabilities\"}}")?;
+    writeln!(s, "{command}")?;
+    // the answer to the second command; events in between are skipped
+    let mut answers = 0;
+    loop {
+        line.clear();
+        if reply.read_line(&mut line)? == 0 {
+            bail!("qemu closed the connection");
+        }
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if v.get("return").is_none() && v.get("error").is_none() {
+            continue;
+        }
+        answers += 1;
+        if answers == 2 {
+            // the monitor answers with an empty text on success, otherwise with the error
+            let text = v["return"].as_str().map_or_else(|| v.to_string(), |t| t.trim().to_owned());
+            if text.is_empty() {
+                return Ok(());
+            }
+            // qemu does not say why, so ask the system
+            let why = std::net::TcpListener::bind(("127.0.0.1", host))
+                .err()
+                .map_or(text, |e| format!("127.0.0.1:{host}: {e}"));
+            bail!("{why}");
+        }
+    }
+}
+
 /// Shuts the VM down cleanly, kills it as a last resort and stops virtiofsd.
 pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
     if let Some(pid) = pid {
@@ -454,7 +517,7 @@ pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
         }
     }
     stop_virtiofsd(name, run);
-    for f in ["control.socket", "cm.sock", "env.sent"] {
+    for f in ["control.socket", "cm.sock", "env.sent", "ports"] {
         let _ = fs::remove_file(run.join(f));
     }
 }
@@ -725,6 +788,14 @@ mod tests {
     fn nix_strings_are_escaped() {
         assert_eq!(nix_str(r#"a"b\c${d}"#), r#""a\"b\\c\${d}""#);
         assert!(render(&guest("x", "we\"ird")).contains("users.users.\"we\\\"ird\""));
+    }
+
+    #[test]
+    fn forwards_only_on_loopback() {
+        assert_eq!(hostfwd(8026, 8025), "tcp:127.0.0.1:8026-:8025");
+        let f = render(&guest("demo", "u"));
+        assert!(f.contains("iifname != \"lo\" meta l4proto tcp dnat to 127.0.0.1"));
+        assert!(f.contains("\"net.ipv4.conf.all.route_localnet\" = 1;"));
     }
 
     #[test]

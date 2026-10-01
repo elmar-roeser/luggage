@@ -198,6 +198,19 @@ This needs `/dev/kvm` (your user in the group `kvm`) and ssh. `luggage up` adds 
 The services (from `compose.yaml` and `chest.toml`) run in the VM too, with their data on the VM disk.
 After changing services, packages or hosts, restart the VM with `luggage down` and `luggage up`.
 
+The `ports` of the taken-over Compose services are reachable from the host browser, but only on 127.0.0.1,
+never from the network (`"8026:8025"` in `compose.yaml` → `127.0.0.1:8026`). Mailpit without `ports`
+gets its web UI on `127.0.0.1:8025`. Your own services list theirs in `chest.toml`, as `"host:guest"` or `"port"`:
+
+```toml
+[services.web]
+command = "exec php -S 127.0.0.1:80 -t public"
+ports = ["8000:80"]         # http://127.0.0.1:8000 on the host
+```
+
+`luggage status` shows the forwarded addresses. If a host port is taken, `up` warns and the VM starts without it.
+In the bubblewrap chest, `ports` has no effect yet.
+
 ## Development
 
 `make ci` runs every check locally (format, clippy, tests, `cargo audit`, gitleaks).

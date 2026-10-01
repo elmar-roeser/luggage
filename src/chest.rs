@@ -73,6 +73,22 @@ pub struct Service {
     /// Runs once to the end (e.g. to create a database). Dependent services wait until it succeeds.
     #[serde(default)]
     pub once: bool,
+    /// Ports that the VM makes reachable on 127.0.0.1 of the host: `"8026:8025"` (host:guest) or `"8025"`
+    #[serde(default)]
+    pub ports: Vec<String>,
+}
+
+/// Host and guest port of `"8026:8025"`, or the same port twice for `"8025"`.
+pub fn port_pair(spec: &str) -> Result<(u16, u16)> {
+    let port = |p: &str| {
+        p.trim().parse::<u16>().ok().filter(|p| *p > 0).with_context(|| {
+            format!("port \"{spec}\": use \"host:guest\" or \"port\" with ports from 1 to 65535")
+        })
+    };
+    match spec.split_once(':') {
+        Some((host, guest)) => Ok((port(host)?, port(guest)?)),
+        None => port(spec).map(|p| (p, p)),
+    }
 }
 
 /// Reads `chest.toml`. `once` and `ready` cannot be used together.
@@ -81,6 +97,9 @@ fn parse(text: &str) -> Result<Definition> {
     for (name, svc) in &def.services {
         if svc.once && svc.ready.is_some() {
             bail!("service {name}: once and ready cannot be used together");
+        }
+        for p in &svc.ports {
+            port_pair(p).with_context(|| format!("service {name}"))?;
         }
     }
     Ok(def)
@@ -666,9 +685,31 @@ impl Chest {
         let dir = self.state.join("vm");
         vm::build(&self.name, &self.project, nixpkgs, &dir, &self.def.packages, &self.def.hosts)?;
         let pid = vm::start(&self.name, &self.project, &dir, &self.run, &self.pid_file())?;
+        self.vm_forward_ports()?;
         self.vm_sync()?;
         self.vm_services(pid)?;
         Ok(pid)
+    }
+
+    /// Forwards the ports of the services from 127.0.0.1 on the host into the guest and lists them in `<run>/ports`.
+    /// A port that is taken on the host is only reported, so the VM still works without it.
+    fn vm_forward_ports(&self) -> Result<()> {
+        let mut forwarded = String::new();
+        for (name, svc) in &self.def.services {
+            for spec in &svc.ports {
+                let (host, guest) = port_pair(spec)?;
+                match vm::forward_port(&self.run, host, guest) {
+                    Ok(()) => {
+                        let _ = writeln!(forwarded, "127.0.0.1:{host} → {name}:{guest}");
+                    }
+                    Err(e) => info(&format!(
+                        "warning: {name}:{guest} is not reachable from the host — {e:#}"
+                    )),
+                }
+            }
+        }
+        fs::write(self.run.join("ports"), forwarded)?;
+        Ok(())
     }
 
     /// Stops the VMs of other chests: one at a time keeps memory free, and switching projects is the moment for it.
@@ -1048,6 +1089,14 @@ impl Chest {
             return Ok(());
         };
         println!("Status:      running (pid {pid})");
+        if self.def.mode == Mode::Vm {
+            let ports = fs::read_to_string(self.run.join("ports")).unwrap_or_default();
+            let ports: Vec<_> = ports.lines().collect();
+            println!(
+                "Ports:       {}",
+                if ports.is_empty() { "none".into() } else { ports.join(", ") }
+            );
+        }
         if self.def.mode == Mode::Vm && !self.def.services.is_empty() {
             println!();
             // stderr is hidden: process-compose prints debug lines there about its missing config
@@ -1163,6 +1212,17 @@ depends_on = ["db"]
         assert!(merged("ignore = [\"db\"]").is_err());
         assert!(parse("[services.a]\ncommand = \"x\"\nonce = true\nready = \"y\"").is_err());
         assert!(parse("[services.a]\nready = \"y\"").is_err());
+        assert!(parse("[services.a]\ncommand = \"x\"\nports = [\"80:0\"]").is_err());
+        assert!(parse("[services.a]\ncommand = \"x\"\nports = [8000]").is_err());
+    }
+
+    #[test]
+    fn port_pairs() {
+        assert_eq!(port_pair("8026:8025").unwrap(), (8026, 8025));
+        assert_eq!(port_pair("8000").unwrap(), (8000, 8000));
+        for bad in ["", "x", "70000", "1:2:3", "8000-8001"] {
+            assert!(port_pair(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

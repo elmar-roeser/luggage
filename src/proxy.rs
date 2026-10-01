@@ -9,7 +9,7 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -17,7 +17,7 @@ use anyhow::Result;
 pub const GUEST: &str = "10.0.2.100:3128";
 /// Longest request head the proxy reads.
 const HEAD_LIMIT: usize = 64 * 1024;
-/// How long the guest may take to send the request head, and the proxy to reach the target.
+/// How long the guest may take to send the whole request head, and the proxy to reach the target.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Is `entry` a host name for `network`: labels of letters, digits and `-`, separated by dots?
@@ -29,12 +29,13 @@ pub fn is_host(entry: &str) -> bool {
 }
 
 /// May the guest reach `host`? An entry allows the host itself and every subdomain of it.
+/// Only host names count: anything else would go to the resolver of the host as it is.
 fn allows(allowed: &[String], host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    allowed
-        .iter()
-        .map(|a| a.to_ascii_lowercase())
-        .any(|a| host == a || host.strip_suffix(a.as_str()).is_some_and(|sub| sub.ends_with('.')))
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    is_host(&host)
+        && allowed.iter().map(|a| a.to_ascii_lowercase()).any(|a| {
+            host == a || host.strip_suffix(a.as_str()).is_some_and(|sub| sub.ends_with('.'))
+        })
 }
 
 /// Host and port of `authority` (`host:port`, `[v6]:port` or `host`).
@@ -83,8 +84,9 @@ fn parse(head: &str) -> Option<Request> {
     Some(Request::Plain(host, port, out.into_bytes()))
 }
 
-/// Reads up to the end of the request head; returns the head and what came after it.
-fn read_head(client: &mut UnixStream) -> Option<(String, Vec<u8>)> {
+/// Reads up to the end of the request head within `within`; returns the head and what came after it.
+fn read_head(client: &mut UnixStream, within: Duration) -> Option<(String, Vec<u8>)> {
+    let deadline = Instant::now() + within;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -95,6 +97,9 @@ fn read_head(client: &mut UnixStream) -> Option<(String, Vec<u8>)> {
         if buf.len() > HEAD_LIMIT {
             return None;
         }
+        // a timeout per read alone would let a guest that sends a byte now and then hold the process forever
+        let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+        client.set_read_timeout(Some(left)).ok()?;
         let n = client.read(&mut chunk).ok()?;
         if n == 0 {
             return None;
@@ -132,8 +137,7 @@ fn connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
 /// If stdin is not a socket.
 pub fn serve(file: &Path) -> Result<()> {
     let mut client = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
-    client.set_read_timeout(Some(TIMEOUT))?;
-    let Some((head, rest)) = read_head(&mut client) else {
+    let Some((head, rest)) = read_head(&mut client, TIMEOUT) else {
         refuse(&mut client, "400 Bad Request", "cannot read the request");
         return Ok(());
     };
@@ -185,6 +189,34 @@ mod tests {
         assert!(!allows(&allowed, "evilgithub.com"));
         assert!(!allows(&allowed, "github.com.evil.org"));
         assert!(!allows(&[], "github.com"));
+    }
+
+    #[test]
+    fn only_host_names_are_allowed() {
+        let allowed = ["github.com".to_owned()];
+        for host in [
+            "evil@x.github.com",
+            "::1%.github.com",
+            "127.0.0.1\t.github.com",
+            "x..github.com",
+            "github.com..",
+            "ä.github.com",
+        ] {
+            assert!(!allows(&allowed, host), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn a_slow_head_ends_in_time() {
+        let (mut client, mut guest) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            while guest.write_all(b"G").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        assert_eq!(read_head(&mut client, Duration::from_millis(200)), None);
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

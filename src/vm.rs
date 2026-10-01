@@ -327,11 +327,9 @@ pub fn build(
     fs::create_dir_all(&flake_dir)?;
     let file = flake_dir.join("flake.nix");
     let runner = dir.join("runner");
-    // flake.lock pins the inputs, so the same flake.nix gives the same runner
-    if fs::read_to_string(&file).ok().as_deref() == Some(flake.as_str()) && runner.exists() {
+    if !stage_flake(&file, &runner, &flake)? {
         return Ok(runner);
     }
-    fs::write(&file, flake)?;
     info("building the chest VM (nix build)");
     let status = Command::new("nix")
         .args(["build", "--out-link"])
@@ -343,6 +341,23 @@ pub fn build(
         bail!("nix build of the chest VM failed — flake: {}", file.display());
     }
     Ok(runner)
+}
+
+/// Writes `flake` to `file` and tells whether `runner` must be built from it.
+/// A changed flake removes the old runner first, so a failed or interrupted build is retried next time.
+fn stage_flake(file: &Path, runner: &Path, flake: &str) -> Result<bool> {
+    // flake.lock pins the inputs, so the same flake.nix gives the same runner
+    if fs::read_to_string(file).ok().as_deref() == Some(flake) && runner.exists() {
+        return Ok(false);
+    }
+    match fs::remove_file(runner) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("cannot remove {}", runner.display()));
+        }
+        _ => {}
+    }
+    fs::write(file, flake)?;
+    Ok(true)
 }
 
 /// Socket of a virtiofs share, relative to the runtime dir. microvm.nix picks this name for qemu.
@@ -918,6 +933,20 @@ mod tests {
         for name in ["", "a", "sparencon", "x".repeat(200).as_str()] {
             assert!((3..0x7fff_0003).contains(&cid(name)));
         }
+    }
+
+    #[test]
+    fn failed_build_is_retried() {
+        let dir = std::env::temp_dir().join(format!("luggage-stage-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (file, runner) = (dir.join("flake.nix"), dir.join("runner"));
+        fs::write(&runner, "old").unwrap();
+        fs::write(&file, "a").unwrap();
+        assert!(!stage_flake(&file, &runner, "a").unwrap(), "unchanged flake with a runner");
+        assert!(stage_flake(&file, &runner, "b").unwrap(), "changed flake");
+        // the build of "b" failed or was interrupted: the old runner must not count as built from it
+        assert!(stage_flake(&file, &runner, "b").unwrap(), "retry after a failed build");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

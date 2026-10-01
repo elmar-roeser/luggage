@@ -786,7 +786,7 @@ pub fn is_env_name(name: &str) -> bool {
 
 /// The `host` variables that go along into the guest: those of `pass`, the harmless ones and the proxy variables.
 /// Behind the proxy (`proxied`) the proxy variables of the host stay on the host, the guest has its own.
-fn passed_env(
+pub fn passed_env(
     host: impl IntoIterator<Item = (OsString, OsString)>,
     pass: &[String],
     proxied: bool,
@@ -800,7 +800,7 @@ fn passed_env(
 }
 
 /// Shell lines that export `vars`; ssh sends them in the environment variable `PASS_ENV`, never on a command line.
-fn env_script(vars: &[(String, OsString)]) -> OsString {
+pub fn env_script(vars: &[(String, OsString)]) -> OsString {
     let mut s = Vec::new();
     for (k, v) in vars {
         s.extend_from_slice(b"export ");
@@ -827,7 +827,7 @@ fn is_proxy_var(var: &str) -> bool {
 const PASS_PREFIX: &str = "LUGGAGE_PASS_";
 
 /// Variable with the host variables for the guest as shell lines (one variable: sshd accepts at most 128).
-const PASS_ENV: &str = "LUGGAGE_PASS_ENV";
+pub const PASS_ENV: &str = "LUGGAGE_PASS_ENV";
 
 /// Runs the rest of the line without network: its own network namespace with only `lo`, as root to bring `lo` up,
 /// then a second user namespace maps the user back to its own uid.

@@ -195,6 +195,21 @@ database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
 In the bubblewrap chest, socat bridges each port from 127.0.0.1 on the host to a socket in the runtime dir,
 where a socat in the chest passes it on; the bridges end with the chest. In a VM, qemu forwards the ports.
 
+Commands in the chest get the project's dev environment from the flake, not your shell. Of your shell's
+variables only harmless ones go along: `TERM`, `COLORTERM`, `TZ`, `EDITOR`, `VISUAL`, `PAGER`, `NO_COLOR`,
+`FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `VIRTUAL_ENV` and, with an open network, the proxy variables like
+`https_proxy`. `LANG` and `LC_*` stay on the host; the VM has its own locale (`en_US.UTF-8`). Everything
+else stays there too, including tokens like `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and `ANTHROPIC_*`, and
+settings like `APP_ENV`. Name the variables a command in the chest needs in `pass_env`:
+
+```toml
+pass_env = ["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]
+```
+
+luggage reads the values of all passed variables from your environment at each command and hands them to
+bwrap, nsenter or ssh in their environment, never on a command line or in a file; only the names are stored.
+They reach `exec`, `open`, `run` and the stand-ins, not the services.
+
 The chest protects against mistakes, install scripts and curious agents, but it is not a
 hard security boundary (same UID, no seccomp).
 
@@ -236,21 +251,6 @@ marks each changed file in the VM with a `chmod` to its own mode, which the watc
 `node_modules`. Changes made in the VM reach the watchers anyway; a bare `chmod` on the host is not passed on.
 If a watcher still misses changes, e.g. in a left-out directory, switch it to polling: `CHOKIDAR_USEPOLLING=1`
 (Vite, chokidar), `WATCHPACK_POLLING=true` (webpack), or the `usePolling`/`poll` option of the tool.
-
-Commands in the VM get the project's dev environment from the flake, not your shell. Of your shell's
-variables only harmless ones go along: `TERM`, `COLORTERM`, `TZ`, `EDITOR`, `VISUAL`, `PAGER`, `NO_COLOR`,
-`FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `VIRTUAL_ENV` and, with an open network, the proxy variables like
-`https_proxy`. The VM has its own locale (`en_US.UTF-8`), so `LANG` and `LC_*` stay on the host. Everything
-else stays there too, including tokens like `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and `ANTHROPIC_*`, and
-settings like `APP_ENV`. Name the variables a command in the VM needs in `pass_env`:
-
-```toml
-pass_env = ["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]
-```
-
-luggage reads the values of all passed variables from your environment at each command and hands them to ssh
-in its environment, never on a command line or in a file; only the names are stored. They reach `exec`, `open`, `run` and the
-stand-ins, not the services. `pass_env` needs `mode = "vm"`: the bubblewrap chest gets no host variables at all.
 
 The VM has open network access. To allow only some hosts, list them in `network`; an entry allows the host
 and all its subdomains (`github.com` also allows `api.github.com`) on ports 80 and 443, and `network = []`

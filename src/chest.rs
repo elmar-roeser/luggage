@@ -4,6 +4,7 @@
 //! generated files) in `$XDG_RUNTIME_DIR/luggage/<name>` — Unix socket paths must not exceed 108 characters.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::os::fd::OwnedFd;
@@ -51,7 +52,7 @@ pub struct Definition {
     pub mode: Mode,
     /// Fixed host ports per service, replacing its own; a taken one is not moved to a free port
     pub ports: BTreeMap<String, Vec<String>>,
-    /// Host variables that commands in the VM get besides the harmless defaults, e.g. tokens; read at each command
+    /// Host variables that commands in the chest get besides the harmless defaults, e.g. tokens; read at each command
     pub pass_env: Vec<String>,
     /// The only hosts the VM may reach, each with its subdomains and on 80 and 443 unless it names a port
     pub network: Option<Vec<String>>,
@@ -125,10 +126,6 @@ fn parse(text: &str) -> Result<Definition> {
     }
     if let Some(n) = def.pass_env.iter().find(|n| !vm::is_env_name(n)) {
         bail!("pass_env: {n:?} is not a variable name");
-    }
-    // the bubblewrap chest gets no host variables at all
-    if !def.pass_env.is_empty() && def.mode != Mode::Vm {
-        bail!("pass_env needs mode = \"vm\"");
     }
     if let Some(network) = &def.network {
         if let Some(h) = network.iter().find(|h| !crate::proxy::is_entry(h)) {
@@ -468,7 +465,8 @@ impl Chest {
              export SSL_CERT_FILE={ca} NIX_SSL_CERT_FILE={ca}\n\
              export PATH={pkgs}{pc}/bin:{bash}/bin:{core}/bin:\"$PATH\"\n\
              cd {project}\n\
-             PS1='[chest:{name_plain}] \\w\\$ '\n",
+             PS1='[chest:{name_plain}] \\w\\$ '\n\
+             eval \"${{{pass}-}}\"; unset {pass}\n",
             home = sh_quote(&home().to_string_lossy()),
             user = sh_quote(&user),
             name = sh_quote(&self.name),
@@ -479,6 +477,7 @@ impl Chest {
             pkgs = tools.packages.iter().fold(String::new(), |acc, p| acc + p + "/bin:"),
             project = sh_quote(&self.project.to_string_lossy()),
             name_plain = self.name,
+            pass = vm::PASS_ENV,
         )
     }
 
@@ -521,7 +520,7 @@ impl Chest {
         y
     }
 
-    /// Arguments for bwrap. Order matters: later mounts hide earlier ones.
+    /// Arguments for bwrap without the environment. Order matters: later mounts hide earlier ones.
     fn bwrap_args(&self, tools: &Tools, net: Net) -> Result<Vec<String>> {
         let meta = fs::metadata("/proc/self")?;
         let home = home().to_string_lossy().into_owned();
@@ -586,13 +585,6 @@ impl Chest {
                 "--symlink",
                 &tools.bash(),
                 "/bin/sh",
-                "--clearenv",
-                "--setenv",
-                "HOME",
-                &home,
-                "--setenv",
-                "TERM",
-                &std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
             ]
             .map(str::to_owned),
         );
@@ -656,14 +648,33 @@ impl Chest {
             return self.vm_enter(net, cmd, nixpkgs);
         }
         let tools = self.prepare(nixpkgs)?;
+        let mut c = self.run_command(&tools, net, cmd, &self.host_env(std::env::vars_os()))?;
+        pass_through(c.status().context("cannot start bwrap")?);
+        Ok(())
+    }
+
+    /// The bwrap command of `cmd_run`; the host variables in `pass` travel in its environment, never on its command line.
+    fn run_command(
+        &self,
+        tools: &Tools,
+        net: bool,
+        cmd: &[String],
+        pass: &OsStr,
+    ) -> Result<Command> {
         let mut c = Command::new(&tools.bwrap);
-        c.args(self.bwrap_args(&tools, if net { Net::Share } else { Net::Off })?)
+        clean_env(&mut c)
+            .env(vm::PASS_ENV, pass)
+            .args(self.bwrap_args(tools, if net { Net::Share } else { Net::Off })?)
             .arg("--die-with-parent")
             .arg(tools.bash())
             .arg("--noprofile");
         shell_args(&mut c, cmd);
-        pass_through(c.status().context("cannot start bwrap")?);
-        Ok(())
+        Ok(c)
+    }
+
+    /// The `host` variables for `exec`, `open` and `run` as shell lines: the harmless ones and `pass_env`, as in the VM.
+    fn host_env(&self, host: impl IntoIterator<Item = (OsString, OsString)>) -> OsString {
+        vm::env_script(&vm::passed_env(host, &self.def.pass_env, self.def.network.is_some()))
     }
 
     /// Brings the dev environment in the guest up to date with the project flake.
@@ -984,6 +995,7 @@ impl Chest {
             ))
             .args(["sh", &tools.bwrap])
             .args(self.bwrap_args(&tools, Net::Own)?)
+            .args(["--clearenv", "--setenv", "HOME", &home().to_string_lossy(), "--setenv", "TERM", &term()])
             .args(["--info-fd", "3"])
             .arg(tools.bash())
             .args(["--noprofile", "-c", &format!("source {RUN_INSIDE}/rc; {main}")])
@@ -1182,6 +1194,7 @@ impl Chest {
         })?;
         let tools = self.tools()?;
         let mut c = nsenter(pid, &tools);
+        c.env(vm::PASS_ENV, self.host_env(std::env::vars_os()));
         shell_args(&mut c, cmd);
         pass_through(c.status().context("cannot start nsenter")?);
         Ok(())
@@ -1356,11 +1369,19 @@ fn nsenter(pid: u32, tools: &Tools) -> Command {
     ])
     .arg(tools.bash())
     .arg("--noprofile")
-    .current_dir("/")
-    .env_clear()
-    .env("HOME", home())
-    .env("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm".into()));
+    .current_dir("/");
+    clean_env(&mut c);
     c
+}
+
+/// The terminal type of the host, `xterm` if it has none.
+fn term() -> String {
+    std::env::var("TERM").unwrap_or_else(|_| "xterm".into())
+}
+
+/// Clears the environment of `c` down to `HOME` and `TERM`.
+fn clean_env(c: &mut Command) -> &mut Command {
+    c.env_clear().env("HOME", home()).env("TERM", term())
 }
 
 /// `-c 'source rc; exec "$@"' bash CMD…` or an interactive shell with rc.
@@ -1497,7 +1518,7 @@ depends_on = ["db"]
         let vm = parse("mode = \"vm\"\npass_env = [\"ANTHROPIC_API_KEY\"]").unwrap();
         assert_eq!(vm.pass_env, ["ANTHROPIC_API_KEY"]);
         assert!(parse("mode = \"vm\"\npass_env = [\"A=B\"]").is_err());
-        assert!(parse("pass_env = [\"ANTHROPIC_API_KEY\"]").is_err());
+        assert_eq!(parse("pass_env = [\"GITHUB_TOKEN\"]").unwrap().pass_env, ["GITHUB_TOKEN"]);
         assert!(merged("[ports]\na = [\"8000\"]").is_err());
     }
 
@@ -1629,6 +1650,25 @@ depends_on = ["db"]
     #[test]
     fn sh_quote_handles_single_quotes() {
         assert_eq!(sh_quote("it's"), r#"'it'"'"'s'"#);
+    }
+
+    #[test]
+    fn host_values_reach_the_chest_only_in_the_environment() {
+        let t = chest(parse("pass_env = [\"GITHUB_TOKEN\"]").unwrap());
+        let host =
+            [("GITHUB_TOKEN".into(), "s3cret 'q' $(id)".into()), ("NPM_TOKEN".into(), "n".into())];
+        let script = t.host_env(host);
+        assert_eq!(script, "export GITHUB_TOKEN='s3cret '\"'\"'q'\"'\"' $(id)'\n");
+        let c = t.run_command(&tools(), false, &["env".to_owned()], &script).unwrap();
+        assert!(!c.get_args().any(|a| a.to_string_lossy().contains("s3cret")));
+        let envs: Vec<_> = c.get_envs().filter_map(|(k, v)| Some((k.to_str()?, v?))).collect();
+        assert!(envs.contains(&(vm::PASS_ENV, script.as_os_str())));
+        assert!(envs.iter().all(|(k, _)| ["HOME", "TERM", vm::PASS_ENV].contains(k)));
+        // the rc file reads them after the dev environment, so they win over it as in the VM
+        assert!(
+            t.render_rc(&tools())
+                .ends_with("eval \"${LUGGAGE_PASS_ENV-}\"; unset LUGGAGE_PASS_ENV\n")
+        );
     }
 
     #[test]

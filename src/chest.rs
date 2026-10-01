@@ -558,20 +558,19 @@ impl Chest {
     }
 
     /// Writes `env.sh` in the runtime dir with the dev environment of the project, if the flake changed since.
-    /// With `profile`, nix also keeps the environment there so garbage collection does not remove it.
-    fn dev_env(&self, profile: Option<&Path>) -> Result<PathBuf> {
+    /// nix also keeps the environment in the profile `<state>/dev-env`, a GC root for its store paths.
+    fn dev_env(&self) -> Result<PathBuf> {
         let env = self.run.join("env.sh");
+        let profile = self.state.join("dev-env");
         let flake_changed =
             ["flake.nix", "flake.lock"].iter().filter_map(|f| mtime(&self.project.join(f))).max();
         let stale = mtime(&env).is_none_or(|t| flake_changed.is_some_and(|f| f > t));
-        if stale || profile.is_some_and(|p| !p.exists()) {
+        if stale || !profile.exists() {
             info("building the environment (nix print-dev-env)");
-            let mut c = Command::new("nix");
-            c.arg("print-dev-env");
-            if let Some(p) = profile {
-                c.arg("--profile").arg(p);
-            }
-            let out = c
+            let out = Command::new("nix")
+                .arg("print-dev-env")
+                .arg("--profile")
+                .arg(&profile)
                 .current_dir(&self.project)
                 .stderr(Stdio::inherit())
                 .output()
@@ -591,7 +590,7 @@ impl Chest {
         }
         fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
         let tools = Tools::fetch(nixpkgs, &self.def.packages)?;
-        self.dev_env(None)?;
+        self.dev_env()?;
         fs::write(self.run.join("tools.json"), serde_json::to_string_pretty(&tools)?)?;
         fs::write(self.run.join("rc"), self.render_rc(&tools))?;
         fs::write(self.run.join("hosts"), self.render_hosts())?;
@@ -618,7 +617,7 @@ impl Chest {
 
     /// Brings the dev environment in the guest up to date with the project flake.
     fn vm_sync(&self) -> Result<()> {
-        let env = self.dev_env(Some(&self.state.join("vm/dev-env")))?;
+        let env = self.dev_env()?;
         let compose = self.run.join("process-compose.yaml");
         let yaml = self.render_compose();
         // only write on change: the copy into the guest follows the modification time

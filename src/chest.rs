@@ -746,6 +746,7 @@ impl Chest {
         if self.def.mode == Mode::Vm {
             return self.vm_enter(net, cmd, nixpkgs);
         }
+        crate::setup::require_userns()?;
         let tools = self.prepare(nixpkgs)?;
         let mut c = self.run_command(&tools, net, cmd, &self.host_env(std::env::vars_os()))?;
         // this chest is gone when the command ends, so luggage compares right after it
@@ -1333,6 +1334,7 @@ impl Chest {
 
     /// Starts the bubblewrap chest and waits until all services are ready.
     fn bwrap_up(&self, nixpkgs: &str) -> Result<()> {
+        crate::setup::require_userns()?;
         self.print_notes();
         let tools = self.prepare(nixpkgs)?;
         let info_json = self.run.join("info.json");

@@ -493,6 +493,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    setup::use_profiled_copy();
     match dispatch(Cli::parse().cmd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

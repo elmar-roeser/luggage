@@ -525,6 +525,7 @@ pub fn start(
     pid_file: &Path,
     network: Option<&[String]>,
 ) -> Result<u32> {
+    crate::setup::require_userns()?;
     fs::create_dir_all(run).with_context(|| format!("cannot create {}", run.display()))?;
     fs::set_permissions(run, fs::Permissions::from_mode(0o700))?;
     // the readiness probe would otherwise reach the other VM and report success
@@ -927,7 +928,7 @@ pub fn write_shims(run: &Path, inputs: &str) -> Result<()> {
     let fresh = run.join(format!("shims.{}", std::process::id()));
     let _ = fs::remove_dir_all(&fresh);
     fs::create_dir_all(&fresh)?;
-    let exe = std::env::current_exe().context("cannot find the luggage program")?;
+    let exe = crate::setup::own_program()?;
     for name in project_programs(inputs) {
         let file = fresh.join(&name);
         fs::write(

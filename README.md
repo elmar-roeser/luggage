@@ -32,8 +32,17 @@ After that, luggage only needs Nix, git and the direnv hook from your system. Ev
 comes from nixpkgs: the tools of the chest (bubblewrap, util-linux, iproute2, socat) and, when needed,
 `gh`/`glab` for `--github`/`--gitlab` (log in with `gh auth login` or `glab auth login`).
 
-**Ubuntu 24.04 and later** restricts user namespaces with AppArmor. `luggage doctor` shows
-whether the chest works there; its hint names the settings to change.
+### Ubuntu 24.04 and later
+
+Ubuntu lets only programs with an AppArmor profile use user namespaces, and the chest needs them
+(in both modes). On such a system `luggage setup` asks to do two things with `sudo`:
+
+- copy luggage to `/usr/local/lib/luggage/luggage`, owned by root, so no other program can change it,
+- install an AppArmor profile for this copy only (`/etc/apparmor.d/luggage`) and load it.
+
+After that, the `luggage` you call starts the copy by itself. When you update luggage, the copy is
+out of date: chest commands stop with a hint, and `luggage setup` updates it (with `sudo` again).
+Note that the programs in the chest may then use user namespaces too, as on other distributions.
 
 ## Usage
 

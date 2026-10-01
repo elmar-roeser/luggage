@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io::{BufRead, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -275,6 +276,116 @@ fn userns_restricted(sysctl: &Path) -> bool {
     fs::read_to_string(sysctl).is_ok_and(|v| v.trim() == "1")
 }
 
+/// Root-owned copy of luggage that the AppArmor profile allows user namespaces; only root can change it.
+const COPY: &str = "/usr/local/lib/luggage/luggage";
+/// The version of the copy, written by `setup` next to it.
+const COPY_VERSION: &str = "/usr/local/lib/luggage/version";
+/// Where `setup` puts the AppArmor profile.
+const PROFILE_FILE: &str = "/etc/apparmor.d/luggage";
+/// The profile: user namespaces for the copy and, by inheritance, for all programs it starts.
+const PROFILE: &str = "abi <abi/4.0>,\n\n# added by luggage setup: the chest needs user namespaces\n\
+                       profile luggage /usr/local/lib/luggage/luggage flags=(unconfined) {\n  userns,\n}\n";
+/// Set for the copy: the luggage program that started it, for the paths luggage writes into files.
+const CALLER: &str = "LUGGAGE_CALLER";
+
+/// Does AppArmor restrict user namespaces on this system?
+fn restricted() -> bool {
+    userns_restricted(Path::new(USERNS_RESTRICTION))
+}
+
+/// Does this process run under the AppArmor profile of luggage?
+fn in_profile() -> bool {
+    ["/proc/self/attr/apparmor/current", "/proc/self/attr/current"]
+        .iter()
+        .find_map(|p| fs::read_to_string(p).ok())
+        .is_some_and(|label| label.starts_with("luggage "))
+}
+
+/// Version of the copy, if there is one.
+fn copy_version() -> Option<String> {
+    fs::read_to_string(COPY_VERSION).ok().map(|v| v.trim().to_owned())
+}
+
+/// The luggage program the user runs: for the copy, the one that started it.
+pub fn own_program() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot find the luggage program")?;
+    Ok(match std::env::var_os(CALLER) {
+        Some(caller) if exe == Path::new(COPY) => PathBuf::from(caller),
+        _ => exe,
+    })
+}
+
+/// Runs the command as the copy of luggage; returns only if that fails.
+fn exec_copy(caller: &Path) -> std::io::Error {
+    Command::new(COPY).env(CALLER, caller).args(std::env::args_os().skip(1)).exec()
+}
+
+/// Where AppArmor restricts user namespaces, runs the command as the root-owned copy, which has a profile.
+/// Only a copy of the same version takes over; the copy itself never starts another program in its place.
+pub fn use_profiled_copy() {
+    if !restricted() || in_profile() || copy_version().as_deref() != Some(env!("CARGO_PKG_VERSION"))
+    {
+        return;
+    }
+    if let Some(exe) = std::env::current_exe().ok().filter(|e| e != Path::new(COPY)) {
+        info(&format!("cannot start {COPY}: {}", exec_copy(&exe)));
+    }
+}
+
+/// Why luggage may not create user namespaces here, with the way out.
+fn profile_problem() -> String {
+    let own = env!("CARGO_PKG_VERSION");
+    match copy_version() {
+        Some(v) if v != own => {
+            format!("{COPY} is luggage {v}, this is {own} — `luggage setup` updates it")
+        }
+        Some(_) => {
+            format!("the AppArmor profile for {COPY} is not loaded — `luggage setup` installs it")
+        }
+        None => format!(
+            "this system lets only programs with an AppArmor profile use user namespaces, which the chest \
+             needs — `luggage setup` installs a copy of luggage with such a profile in {COPY} (needs sudo once)"
+        ),
+    }
+}
+
+/// Fails with a hint to `luggage setup` where AppArmor would stop luggage from creating user namespaces.
+///
+/// # Errors
+/// If AppArmor restricts user namespaces and luggage does not run under its profile.
+pub fn require_userns() -> Result<()> {
+    if !restricted() || in_profile() {
+        return Ok(());
+    }
+    bail!("{}", profile_problem())
+}
+
+/// Checks that luggage runs as the root-owned copy with its AppArmor profile; only asked where AppArmor restricts.
+fn check_profile() -> Check {
+    if in_profile() {
+        return Check::ok("AppArmor", format!("luggage runs as {COPY} with a profile"));
+    }
+    let mut fix = Vec::new();
+    if let Some(own) = own_program().ok().filter(|p| p != Path::new(COPY)) {
+        let script = format!(
+            r#"install -D -o root -g root -m 0755 "$1" {COPY} && printf '%s\n' "$2" > {COPY_VERSION}"#
+        );
+        fix.push(Action::Run(vec![
+            "sudo".into(),
+            "sh".into(),
+            "-c".into(),
+            script,
+            "sh".into(),
+            own.to_string_lossy().into_owned(),
+            env!("CARGO_PKG_VERSION").into(),
+        ]));
+    }
+    let script =
+        format!(r#"printf '%s' "$1" > {PROFILE_FILE} && apparmor_parser -r {PROFILE_FILE}"#);
+    fix.push(Action::Run(["sudo", "sh", "-c", &script, "sh", PROFILE].map(str::to_owned).to_vec()));
+    Check::missing("AppArmor", profile_problem(), fix)
+}
+
 /// Addition to errors of a starting chest or VM when AppArmor restricts user namespaces; empty otherwise.
 pub fn userns_hint() -> &'static str {
     if userns_restricted(Path::new(USERNS_RESTRICTION)) {
@@ -315,12 +426,8 @@ fn check_userns(nixpkgs: &str) -> Check {
     } else {
         "unshare and bwrap"
     };
-    let detail = if userns_restricted(Path::new(USERNS_RESTRICTION)) {
-        format!(
-            "{failed} may not create user namespaces: AppArmor allows them only to programs with a profile \
-             (kernel.apparmor_restrict_unprivileged_userns = 1), so neither the chest nor the VM mode starts — \
-             until the next reboot, `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` lifts it for all programs"
-        )
+    let detail = if restricted() {
+        format!("{failed} may not create user namespaces — see AppArmor above")
     } else {
         format!(
             "{failed} may not create user namespaces — check the kernel settings user.max_user_namespaces \
@@ -411,7 +518,7 @@ fn print_vm_checks() {
 
 /// All checks, in the order in which `setup` fixes them.
 fn checks(yes: bool, nixpkgs: &str) -> Vec<Box<dyn Fn() -> Check + '_>> {
-    vec![
+    let mut all: Vec<Box<dyn Fn() -> Check + '_>> = vec![
         Box::new(move || check_nix(yes)),
         Box::new(|| match nix_bin() {
             Some(n) => check_flakes(&n),
@@ -435,7 +542,12 @@ fn checks(yes: bool, nixpkgs: &str) -> Vec<Box<dyn Fn() -> Check + '_>> {
         }),
         Box::new(|| check_forge("gh")),
         Box::new(|| check_forge("glab")),
-    ]
+    ];
+    // before the chest check, which needs it
+    if restricted() {
+        all.insert(6, Box::new(check_profile));
+    }
+    all
 }
 
 /// Only checks; fails if something required is missing.
@@ -496,6 +608,13 @@ pub fn setup(yes: bool) -> Result<()> {
             }
         }
         changed = true;
+        if c.name == "AppArmor" {
+            // the remaining checks need the profile, so they go on in the copy
+            match own_program() {
+                Ok(own) => info(&format!("cannot start {COPY}: {}", exec_copy(&own))),
+                Err(e) => info(&format!("{e:#}")),
+            }
+        }
         c = check();
         println!("{}", c.line());
         if matches!(c.state, State::Missing(_)) {

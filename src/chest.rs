@@ -48,6 +48,8 @@ pub struct Definition {
     pub mode: Mode,
     /// Fixed host ports per service, replacing its own; a taken one is not moved to a free port
     pub ports: BTreeMap<String, Vec<String>>,
+    /// Host variables that commands in the VM get, also `ANTHROPIC_*` and `CLAUDE_*`; read at each command
+    pub pass_env: Vec<String>,
 }
 
 /// How the chest isolates the project.
@@ -115,6 +117,13 @@ fn parse(text: &str) -> Result<Definition> {
         for p in specs {
             port_pair(p).with_context(|| format!("ports of {name}"))?;
         }
+    }
+    if let Some(n) = def.pass_env.iter().find(|n| !vm::is_env_name(n)) {
+        bail!("pass_env: {n:?} is not a variable name");
+    }
+    // the bubblewrap chest gets no host variables at all
+    if !def.pass_env.is_empty() && def.mode != Mode::Vm {
+        bail!("pass_env needs mode = \"vm\"");
     }
     Ok(def)
 }
@@ -1062,7 +1071,8 @@ impl Chest {
         // only the project is shared with the guest
         let cwd = std::env::current_dir()?;
         let cwd = if cwd.starts_with(&self.project) { cwd } else { self.project.clone() };
-        pass_through(vm::exec(&self.name, &self.state.join("vm"), &self.run, &cwd, net, cmd)?);
+        let dir = self.state.join("vm");
+        pass_through(vm::exec(&self.name, &dir, &self.run, &cwd, net, &self.def.pass_env, cmd)?);
         Ok(())
     }
 
@@ -1350,6 +1360,10 @@ depends_on = ["db"]
         assert!(parse("[services.a]\ncommand = \"x\"\nports = [\"80:0\"]").is_err());
         assert!(parse("[services.a]\ncommand = \"x\"\nports = [8000]").is_err());
         assert!(parse("[ports]\na = [\"80:0\"]").is_err());
+        let vm = parse("mode = \"vm\"\npass_env = [\"ANTHROPIC_API_KEY\"]").unwrap();
+        assert_eq!(vm.pass_env, ["ANTHROPIC_API_KEY"]);
+        assert!(parse("mode = \"vm\"\npass_env = [\"A=B\"]").is_err());
+        assert!(parse("pass_env = [\"ANTHROPIC_API_KEY\"]").is_err());
         assert!(merged("[ports]\na = [\"8000\"]").is_err());
     }
 

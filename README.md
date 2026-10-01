@@ -228,6 +228,18 @@ database = ["3307:3306"]    # MariaDB on 127.0.0.1:3307 instead of 3306
 
 In the bubblewrap chest, `ports` has no effect yet.
 
+Commands in the VM get your shell's variables, except those that describe the host session and
+API keys: `ANTHROPIC_*` and `CLAUDE_*` stay on the host. To let an agent in the VM use its key,
+name the variables in `pass_env`:
+
+```toml
+pass_env = ["ANTHROPIC_API_KEY"]
+```
+
+luggage reads their values from your environment at each command and hands them to ssh in its environment,
+never on a command line or in a file; only the names are stored. They reach `exec`, `open`, `run` and the
+stand-ins, not the services. `pass_env` needs `mode = "vm"`: the bubblewrap chest gets no host variables at all.
+
 ## Development
 
 `make ci` runs every check locally (format, clippy, tests, `cargo audit`, gitleaks).

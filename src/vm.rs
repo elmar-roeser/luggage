@@ -81,6 +81,8 @@ const FLAKE: &str = r#"{
           enable = true;
           openFirewall = false;
           hostKeys = [ { path = "/var/lib/ssh/ssh_host_ed25519_key"; type = "ed25519"; } ];
+          # pass_env from chest.toml: the values come with each command, never in this definition
+          settings.AcceptEnv = [ "LUGGAGE_PASS_*" ];
         };
         # Services run with process-compose as in the bubblewrap chest: same packages and host names,
         # /data on the VM disk (it survives a restart), sockets in /run/luggage, ports below 1024 allowed.
@@ -370,6 +372,13 @@ fn socket(name: &str, tag: &str) -> String {
 fn ssh(name: &str, dir: &Path, run: Option<&Path>) -> Command {
     let proxy = dir.join("runner/bin/chest-ssh-proxy");
     let mut c = Command::new("ssh");
+    // `exec` sets the pass_env values; the shared connection forwards only names that its own SendEnv allows
+    for (k, _) in std::env::vars_os() {
+        if k.to_str().is_some_and(|k| k.starts_with(PASS_PREFIX)) {
+            c.env_remove(k);
+        }
+    }
+    c.arg("-o").arg(format!("SendEnv={PASS_PREFIX}*"));
     if let Some(run) = run {
         c.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m", "-o"])
             .arg(format!("ControlPath={}", run.join("cm.sock").display()));
@@ -680,28 +689,46 @@ fn host_only(var: &str) -> bool {
     NAMES.contains(&var) || PREFIXES.iter().any(|p| var.starts_with(p))
 }
 
-/// Host variables that go along into the guest. Only names that the shell can `export`.
-fn passed_env() -> Vec<(String, String)> {
+/// Can the shell `export` a variable of this name?
+pub fn is_env_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Host variables that go along into the guest on the command line, except those of `pass_env`.
+fn passed_env(pass: &[String]) -> Vec<(String, String)> {
     std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .filter(|(k, _)| {
-            !host_only(k)
-                && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+        .filter(|(k, _)| !host_only(k) && is_env_name(k) && !pass.contains(k))
         .collect()
 }
+
+/// Prefix under which ssh sends a `pass_env` variable; the guest shell exports it under its own name.
+const PASS_PREFIX: &str = "LUGGAGE_PASS_";
 
 /// Runs the rest of the line without network: its own network namespace with only `lo`, as root to bring `lo` up,
 /// then a second user namespace maps the user back to its own uid.
 const OFFLINE: &str = r#" unshare --user --map-root-user --net sh -c 'ip link set lo up && u=$1 g=$2 && shift 2 && exec unshare --user --map-user="$u" --map-group="$g" -- "$@"' sh "$(id -u)" "$(id -g)""#;
 
-/// The shell command for the guest: dev environment, host variables, working directory, then the command.
-/// Without a command it opens an interactive shell.
-fn remote_command(cwd: &Path, env: &[(String, String)], net: bool, cmd: &[String]) -> String {
+/// The shell command for the guest: dev environment, host variables, `pass` variables sent by ssh,
+/// working directory, then the command. Without a command it opens an interactive shell.
+fn remote_command(
+    cwd: &Path,
+    env: &[(String, String)],
+    pass: &[String],
+    net: bool,
+    cmd: &[String],
+) -> String {
     let mut r = String::from("source ~/.luggage/rc >/dev/null");
     for (k, v) in env {
         let _ = write!(r, "; export {k}={}", sh_quote(v));
+    }
+    // only the name is in the command; the value stays in the environment of ssh and sshd
+    for k in pass {
+        let _ = write!(
+            r,
+            r#"; [ "${{{PASS_PREFIX}{k}+x}}" ] && export {k}="${PASS_PREFIX}{k}"; unset {PASS_PREFIX}{k}"#
+        );
     }
     let _ = write!(r, "; cd {} && exec", sh_quote(&cwd.to_string_lossy()));
     if !net {
@@ -806,7 +833,8 @@ pub fn script(name: &str, dir: &Path, run: &Path, script: &str) -> Command {
 }
 
 /// Runs `cmd` in the guest in `cwd` (a shell without a command) and returns its exit status.
-/// Without `net` the command gets no network, not even to the services in the guest.
+/// Without `net` the command gets no network, not even to the services in the guest; `pass` names host variables
+/// that go along even if they would stay on the host, with values only in the environment of ssh.
 ///
 /// # Errors
 /// If ssh cannot start.
@@ -816,14 +844,22 @@ pub fn exec(
     run: &Path,
     cwd: &Path,
     net: bool,
+    pass: &[String],
     cmd: &[String],
 ) -> Result<ExitStatus> {
     use std::io::IsTerminal;
     // a terminal only for a terminal: otherwise output that goes to a pipe would get \r\n
     let tty = cmd.is_empty() || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
-    ssh(name, dir, Some(run))
-        .arg(if tty { "-t" } else { "-T" })
-        .arg(remote_command(cwd, &passed_env(), net, cmd))
+    let mut c = ssh(name, dir, Some(run));
+    let mut sent = Vec::new();
+    for k in pass {
+        if let Some(v) = std::env::var_os(k) {
+            c.env(format!("{PASS_PREFIX}{k}"), v);
+            sent.push(k.clone());
+        }
+    }
+    c.arg(if tty { "-t" } else { "-T" })
+        .arg(remote_command(cwd, &passed_env(pass), &sent, net, cmd))
         .status()
         .context("cannot start ssh")
 }
@@ -954,23 +990,43 @@ mod tests {
         let env = [("APP_ENV".to_owned(), "test's".to_owned())];
         let cmd = ["php".to_owned(), "-r".to_owned(), "echo $x;".to_owned()];
         assert_eq!(
-            remote_command(Path::new("/p/my dir"), &env, true, &cmd),
+            remote_command(Path::new("/p/my dir"), &env, &[], true, &cmd),
             r#"source ~/.luggage/rc >/dev/null; export APP_ENV='test'"'"'s'; cd '/p/my dir' && exec 'php' '-r' 'echo $x;'"#
         );
         assert!(
-            remote_command(Path::new("/p"), &[], true, &[])
+            remote_command(Path::new("/p"), &[], &[], true, &[])
                 .ends_with("exec bash --rcfile ~/.luggage/rc -i")
         );
     }
 
     #[test]
+    fn remote_command_takes_pass_env_from_ssh() {
+        let pass = ["ANTHROPIC_API_KEY".to_owned()];
+        let r = remote_command(Path::new("/p"), &[], &pass, true, &["claude".to_owned()]);
+        assert_eq!(
+            r,
+            r#"source ~/.luggage/rc >/dev/null; [ "${LUGGAGE_PASS_ANTHROPIC_API_KEY+x}" ] && export ANTHROPIC_API_KEY="$LUGGAGE_PASS_ANTHROPIC_API_KEY"; unset LUGGAGE_PASS_ANTHROPIC_API_KEY; cd '/p' && exec 'claude'"#
+        );
+    }
+
+    #[test]
+    fn env_names() {
+        for n in ["ANTHROPIC_API_KEY", "_x", "a1"] {
+            assert!(is_env_name(n), "{n}");
+        }
+        for n in ["", "1A", "A-B", "A B", "A=B", "A;rm"] {
+            assert!(!is_env_name(n), "{n}");
+        }
+    }
+
+    #[test]
     fn remote_command_without_network() {
         let cmd = ["composer".to_owned(), "install".to_owned()];
-        let r = remote_command(Path::new("/p"), &[], false, &cmd);
+        let r = remote_command(Path::new("/p"), &[], &[], false, &cmd);
         assert!(r.starts_with("source ~/.luggage/rc >/dev/null; cd '/p' && exec unshare --user --map-root-user --net sh -c "));
         assert!(r.ends_with(r#" sh "$(id -u)" "$(id -g)" 'composer' 'install'"#));
         assert!(
-            remote_command(Path::new("/p"), &[], false, &[])
+            remote_command(Path::new("/p"), &[], &[], false, &[])
                 .ends_with(r#""$(id -g)" bash --rcfile ~/.luggage/rc -i"#)
         );
     }

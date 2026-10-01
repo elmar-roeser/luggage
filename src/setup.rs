@@ -421,12 +421,17 @@ fn checks(yes: bool, nixpkgs: &str) -> Vec<Box<dyn Fn() -> Check + '_>> {
         Box::new(|| check_program("direnv", nix_bin().as_deref(), nixpkgs)),
         Box::new(|| check_nix_direnv(nix_bin().as_deref(), nixpkgs)),
         Box::new(check_hook),
-        Box::new(|| {
-            if nix_bin().is_some() {
-                check_userns(nixpkgs)
-            } else {
-                Check::missing("chest", "Nix missing".into(), Vec::new())
-            }
+        Box::new(|| match (find_in_path("nix"), nix_bin()) {
+            (Some(_), _) => check_userns(nixpkgs),
+            // luggage runs `nix` from the PATH, which has it only in a new shell
+            (None, Some(_)) => Check {
+                name: "chest",
+                state: State::Optional(
+                    "not tested yet — run `luggage doctor` in a new shell".into(),
+                ),
+                fix: Vec::new(),
+            },
+            (None, None) => Check::missing("chest", "Nix missing".into(), Vec::new()),
         }),
         Box::new(|| check_forge("gh")),
         Box::new(|| check_forge("glab")),

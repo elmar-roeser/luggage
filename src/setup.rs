@@ -336,6 +336,57 @@ fn check_forge(name: &'static str) -> Check {
     }
 }
 
+/// Does `/etc/group` list `user` in the group `kvm`?
+fn kvm_member(group_file: &str, user: &str) -> bool {
+    group_file.lines().any(|l| {
+        let mut f = l.split(':');
+        f.next() == Some("kvm") && f.nth(2).is_some_and(|m| m.split(',').any(|u| u == user))
+    })
+}
+
+/// Checks a device of the VM mode by opening it for reading and writing; missing access is optional.
+fn check_device(name: &'static str, dev: &Path, member: bool) -> Check {
+    let detail = match fs::OpenOptions::new().read(true).write(true).open(dev) {
+        Ok(_) => return Check::ok(name, "accessible".into()),
+        Err(_) if !dev.exists() => {
+            "missing — load the kernel module (kvm-intel/kvm-amd, vhost_vsock) or enable virtualization"
+                .to_owned()
+        }
+        Err(_) if member => "no access — in group kvm, log in again".to_owned(),
+        Err(_) => "no access — `sudo usermod -aG kvm $USER`, then log in again".to_owned(),
+    };
+    Check { name, state: State::Optional(detail), fix: Vec::new() }
+}
+
+/// Checks a program of the VM mode; it comes from the system or `nix profile install nixpkgs#openssh`.
+fn check_ssh(name: &'static str) -> Check {
+    let state = find_tool(name).map_or_else(
+        || State::Optional("missing — install openssh".into()),
+        |p| State::Ok(p.display().to_string()),
+    );
+    Check { name, state, fix: Vec::new() }
+}
+
+/// Checks for the VM mode (`mode = "vm"`); it is opt-in, so they never fail.
+fn vm_checks() -> Vec<Check> {
+    let user = std::env::var("USER").unwrap_or_default();
+    let member = fs::read_to_string("/etc/group").is_ok_and(|g| kvm_member(&g, &user));
+    vec![
+        check_device("/dev/kvm", Path::new("/dev/kvm"), member),
+        check_device("/dev/vhost-vsock", Path::new("/dev/vhost-vsock"), member),
+        check_ssh("ssh"),
+        check_ssh("ssh-keygen"),
+    ]
+}
+
+/// Prints the checks for the VM mode under their own heading.
+fn print_vm_checks() {
+    println!("  VM mode (optional):");
+    for c in vm_checks() {
+        println!("{}", c.line());
+    }
+}
+
 /// All checks, in the order in which `setup` fixes them.
 fn checks(yes: bool, nixpkgs: &str) -> Vec<Box<dyn Fn() -> Check + '_>> {
     vec![
@@ -371,6 +422,7 @@ pub fn doctor() -> Result<()> {
             missing += 1;
         }
     }
+    print_vm_checks();
     if missing > 0 {
         bail!("{missing} item(s) missing — `luggage setup` fixes what can be fixed automatically");
     }
@@ -423,6 +475,7 @@ pub fn setup(yes: bool) -> Result<()> {
             open += 1;
         }
     }
+    print_vm_checks();
     if changed {
         info("changes take effect in a new shell (PATH, direnv hook)");
     }
@@ -435,6 +488,8 @@ pub fn setup(yes: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     #[test]
@@ -453,5 +508,33 @@ mod tests {
         assert_eq!(Check::ok("git", "2.47".into()).line(), "  ✓ git              2.47");
         let c = Check::missing("Nix", "missing".into(), Vec::new());
         assert_eq!(c.line(), "  ✗ Nix              missing");
+    }
+
+    #[test]
+    fn kvm_membership() {
+        let groups = "kvm:x:993:alice,bob\nkvmx:x:5:carol\nusers:x:100:carol\n";
+        assert!(kvm_member(groups, "bob"));
+        assert!(!kvm_member(groups, "carol"));
+        assert!(!kvm_member("kvm:x:993:\n", "alice"));
+    }
+
+    #[test]
+    fn device_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = dir.path().join("kvm");
+        let line = |c: Check| (matches!(c.state, State::Optional(_)), c.line());
+        let (optional, text) = line(check_device("/dev/kvm", &dev, false));
+        assert!(optional && text.contains("missing — load the kernel module"));
+        fs::write(&dev, "").unwrap();
+        let (optional, text) = line(check_device("/dev/kvm", &dev, false));
+        assert!(!optional && text.ends_with("accessible"));
+        // Without permissions; root opens it anyway
+        fs::set_permissions(&dev, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::OpenOptions::new().read(true).write(true).open(&dev).is_err() {
+            let (optional, text) = line(check_device("/dev/kvm", &dev, true));
+            assert!(optional && text.ends_with("in group kvm, log in again"));
+            let (_, text) = line(check_device("/dev/kvm", &dev, false));
+            assert!(text.contains("sudo usermod -aG kvm $USER"));
+        }
     }
 }

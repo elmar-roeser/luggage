@@ -193,7 +193,8 @@ starting the VM of another project stops the old one. `luggage run`, `up`, `exec
 `down` work as above; `run`, `exec` and `open` start the VM if needed. `run` uses the running VM, and without
 `--net` its command has no network, not even to the services.
 
-This needs `/dev/kvm` (your user in the group `kvm`) and ssh. `luggage up` adds the line
+This needs `/dev/kvm` and `/dev/vhost-vsock` (your user in the group `kvm`) and ssh; `luggage doctor`
+checks them in its optional VM section. `luggage up` adds the line
 `if has luggage; then eval "$(luggage hook)"; fi` to the `.envrc` if it is missing; then run `direnv allow` once.
 The services (from `compose.yaml` and `chest.toml`) run in the VM too, with their data on the VM disk.
 After changing services, packages or hosts, restart the VM with `luggage down` and `luggage up`.

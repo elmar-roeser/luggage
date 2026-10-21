@@ -1858,18 +1858,23 @@ fn check_run(before: &str, project: &Path) -> Result<()> {
 
 /// Stops the port bridges and the proxy of a bubblewrap chest, if they still run, and forgets their ports.
 fn stop_bridges(run: &Path) {
-    let pid_file = run.join("bridges.pid");
-    if let Some(pid) = fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
+    stop_group(&run.join("bridges.pid"), BRIDGES);
+    for f in [run.join("ports"), run.join("proxy.sock")] {
+        let _ = fs::remove_file(f);
+    }
+}
+
+/// Stops the process group of the process in `pid_file` if it still runs `marker`, and removes the file.
+pub fn stop_group(pid_file: &Path, marker: &str) {
+    if let Some(pid) = fs::read_to_string(pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
         // the id may belong to another process by now
         && fs::read(format!("/proc/{pid}/cmdline"))
-            .is_ok_and(|c| c.windows(BRIDGES.len()).any(|w| w == BRIDGES.as_bytes()))
+            .is_ok_and(|c| c.windows(marker.len()).any(|w| w == marker.as_bytes()))
     {
         kill_group(pid);
         wait_dead(pid, 20);
     }
-    for f in [pid_file, run.join("ports"), run.join("proxy.sock")] {
-        let _ = fs::remove_file(f);
-    }
+    let _ = fs::remove_file(pid_file);
 }
 
 /// The socat address of a port bridge: for each connection, nsenter and a socat to port `guest` in the network

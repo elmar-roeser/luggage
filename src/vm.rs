@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::chest::{alive, sh_quote, wait_dead};
+use crate::chest::{alive, sh_quote, stop_group, wait_dead};
 use crate::info;
 
 /// Longest wait until the guest answers on ssh.
@@ -535,7 +535,7 @@ pub fn start(
     stop_virtiofsd(name, run);
     stop_watch(run);
     // the guest has not seen the environment yet, so it must be sent again
-    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started", "network"] {
+    for f in RUN_FILES {
         let _ = fs::remove_file(run.join(f));
     }
     let netdev = match network {
@@ -642,19 +642,13 @@ fn forward_changes(name: &str, dir: &Path, run: &Path, project: &Path) -> Result
     Ok(())
 }
 
+/// Files in the runtime dir that belong to one run of the VM; a start and a stop remove them.
+const RUN_FILES: [&str; 6] =
+    ["control.socket", "cm.sock", "env.sent", "ports", "started", "network"];
+
 /// Stops the forwarding of changes, if it still runs.
 fn stop_watch(run: &Path) {
-    let pid_file = run.join("watch.pid");
-    if let Some(pid) = fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse::<u32>().ok())
-        // the id may belong to another process by now
-        && fs::read(format!("/proc/{pid}/cmdline"))
-            .is_ok_and(|c| c.windows(13).any(|w| w == b"watch-project"))
-    {
-        let _ =
-            Command::new("kill").args(["--", &format!("-{pid}")]).stderr(Stdio::null()).status();
-        wait_dead(pid, 20);
-    }
-    let _ = fs::remove_file(pid_file);
+    stop_group(&run.join("watch.pid"), "watch-project");
 }
 
 /// Waits until ssh into the guest works. Fails early if qemu stops.
@@ -763,7 +757,7 @@ pub fn stop(name: &str, run: &Path, pid: Option<u32>) {
     }
     stop_virtiofsd(name, run);
     stop_watch(run);
-    for f in ["control.socket", "cm.sock", "env.sent", "ports", "started", "network"] {
+    for f in RUN_FILES {
         let _ = fs::remove_file(run.join(f));
     }
 }

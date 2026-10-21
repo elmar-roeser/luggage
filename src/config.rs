@@ -1,7 +1,8 @@
 //! User config (`~/.config/luggage/config.toml`) with built-in defaults.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -35,6 +36,25 @@ pub struct Config {
     pub node: NodeConfig,
     /// Section `[python]`
     pub python: PythonConfig,
+    /// Sections `[skills.<name>]`: where skills for coding agents come from
+    pub skills: BTreeMap<String, SkillSource>,
+}
+
+/// A source of skills, `[skills.<name>]`: a git repo or a local directory.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillSource {
+    /// Git address, e.g. `git@gitlab.example.com:dev/skills.git`
+    pub git: Option<String>,
+    /// Branch or tag of `git` [default: the default branch]
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    /// Local directory; skills from it change at once, without a commit
+    pub path: Option<String>,
+    /// Folder in the source that holds the skills [default: its top]
+    pub dir: Option<String>,
+    /// Only these skills of the source [default: all]
+    pub only: Option<Vec<String>>,
 }
 
 /// Section `[nix]` of the config.
@@ -121,7 +141,30 @@ fn parse(text: &str) -> Result<Config> {
     for v in [&config.gitlab.visibility, &config.github.visibility].into_iter().flatten() {
         check_visibility(v)?;
     }
+    for (name, s) in &config.skills {
+        check_skill_source(name, s).with_context(|| format!("[skills.{name}] is invalid"))?;
+    }
     Ok(config)
+}
+
+/// Checks the name and that a skill source has either `git` or `path`.
+fn check_skill_source(name: &str, s: &SkillSource) -> Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        bail!("only letters, digits, - and _ may name a source");
+    }
+    match (&s.git, &s.path) {
+        (Some(_), Some(_)) | (None, None) => bail!("it needs either git or path"),
+        (None, Some(_)) if s.git_ref.is_some() => bail!("ref needs git"),
+        _ => {}
+    }
+    // the folder lies in the source, so it may not climb out of it
+    if s.dir
+        .as_deref()
+        .is_some_and(|d| Path::new(d).components().any(|c| !matches!(c, Component::Normal(_))))
+    {
+        bail!("dir must be a plain path inside the source");
+    }
+    Ok(())
 }
 
 /// Checks that `v` is private, internal or public.
@@ -196,6 +239,11 @@ impl Config {
             row("php.extensions", self.php.extensions.as_ref(), "[]"),
             row("node.default", self.node.default.as_ref(), "(default Node of the channel)"),
             row("python.default", self.python.default.as_ref(), "(default Python of the channel)"),
+            row(
+                "skills",
+                Some(&self.skills.keys().collect::<Vec<_>>()).filter(|k| !k.is_empty()),
+                "(none)",
+            ),
         ]
     }
 }
@@ -233,6 +281,15 @@ pub const TEMPLATE: &str = r#"# luggage — user config. Commented-out lines sho
 
 [python]
 # default = "3.13"              # if .python-version/pyproject.toml do not set one
+
+# Skills for coding agents; `luggage skills sync` links them into ~/.claude/skills and ~/.agents/skills
+# [skills.team]
+# git = "git@gitlab.example.com:dev/skills.git"
+# ref = "main"                  # if unset: the default branch
+# dir = "skills"                # folder with the skills; if unset: the top
+# only = ["glab"]               # if unset: all skills of the source
+# [skills.own]
+# path = "~/skills"             # a local directory instead of git
 "#;
 
 /// Writes the template; an existing file stays untouched.
@@ -267,5 +324,23 @@ mod tests {
         assert_eq!(c.github_visibility(), "public");
         assert!(parse("[php]\ndefualt = \"8.3\"\n").is_err());
         assert!(parse("[gitlab]\nvisibility = \"secret\"\n").is_err());
+    }
+
+    #[test]
+    fn checks_skill_sources() {
+        let c = parse("[skills.team]\ngit = \"git@h:a.git\"\nref = \"main\"\ndir = \"skills\"\n")
+            .unwrap();
+        assert_eq!(c.skills["team"].git_ref.as_deref(), Some("main"));
+        assert!(parse("[skills.own]\npath = \"~/s\"\nonly = [\"x\"]\n").is_ok());
+        for bad in [
+            "[skills.a]\n",
+            "[skills.a]\ngit = \"x\"\npath = \"y\"\n",
+            "[skills.a]\npath = \"y\"\nref = \"main\"\n",
+            "[skills.a]\ngit = \"x\"\ndir = \"../up\"\n",
+            "[skills.\"a b\"]\ngit = \"x\"\n",
+            "[skills.a]\ngit = \"x\"\nbranch = \"main\"\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 }

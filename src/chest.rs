@@ -313,7 +313,7 @@ pub struct Chest {
 }
 
 /// Path from the environment variable `var`. If it is empty or missing, `fallback` is used.
-fn xdg(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
+pub fn xdg(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
     std::env::var_os(var).filter(|v| !v.is_empty()).map_or_else(fallback, PathBuf::from)
 }
 

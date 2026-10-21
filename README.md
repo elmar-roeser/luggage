@@ -321,6 +321,33 @@ marks each changed file in the VM with a `chmod` to its own mode, which the watc
 If a watcher still misses changes, e.g. in a left-out directory, switch it to polling: `CHOKIDAR_USEPOLLING=1`
 (Vite, chokidar), `WATCHPACK_POLLING=true` (webpack), or the `usePolling`/`poll` option of the tool.
 
+## Skills for coding agents
+
+luggage hands skills to Claude Code and Codex from git repos or local directories that you list in the config:
+
+```toml
+[skills.team]
+git = "git@gitlab.example.com:dev/skills.git"
+dir = "skills"              # folder with one subfolder per skill; if unset: the top
+# ref = "main"              # branch or tag; if unset: the default branch
+# only = ["glab"]           # if unset: all skills of the source
+
+[skills.own]
+path = "~/skills"           # a local directory; changes show at once
+```
+
+```bash
+luggage skills sync         # fetch the sources and link their skills
+luggage skills update       # fetch the newest commit of each git source (or: update team)
+luggage skills              # sources, their commit and what is linked
+```
+
+A skill is a folder with a `SKILL.md`. `sync` links each one into `~/.claude/skills` and `~/.agents/skills`
+(the folder Codex reads), for each agent that has its `~/.claude` or `~/.codex`. Git sources stay at their
+commit until `update`; they live read-only in the Nix store, kept from the garbage collector. luggage only
+changes its own links: an entry it did not create stays as it is and `sync` names it. If a skill folder is
+itself a link, another tool manages it, and `sync` refuses until you move it away.
+
 ## Development
 
 `make ci` runs every check locally (format, clippy, tests, `cargo audit`, gitleaks).

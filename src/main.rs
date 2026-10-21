@@ -11,6 +11,7 @@ mod proxy;
 mod remote;
 mod remount;
 mod setup;
+mod skills;
 mod versions;
 mod vm;
 mod watch;
@@ -113,6 +114,12 @@ enum Cmd {
     Hook,
     /// Remove the service data of branches that no longer exist
     Prune,
+    /// Show the skills for coding agents from the config (see `luggage skills sync`)
+    Skills {
+        /// What to do with the skills
+        #[command(subcommand)]
+        cmd: Option<SkillsCmd>,
+    },
     /// Serve one connection of the chest to the proxy for `network` (qemu or socat starts it)
     #[command(hide = true)]
     NetworkProxy {
@@ -132,6 +139,18 @@ enum Cmd {
     WatchProject {
         /// Project directory
         dir: PathBuf,
+    },
+}
+
+/// Subcommands of `luggage skills`.
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// Fetch the sources and link their skills into ~/.claude/skills and ~/.agents/skills
+    Sync,
+    /// Fetch the newest commit of git sources (no names: all), then sync
+    Update {
+        /// Names of sources
+        sources: Vec<String>,
     },
 }
 
@@ -492,6 +511,14 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             chest::Chest::find(&nixpkgs, true)?.cmd_hook(&nixpkgs)
         }
         Cmd::Prune => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_prune(),
+        Cmd::Skills { cmd } => {
+            let sources = config::load()?.skills;
+            match cmd {
+                None => skills::status(&sources),
+                Some(SkillsCmd::Sync) => skills::sync(&sources, None),
+                Some(SkillsCmd::Update { sources: names }) => skills::sync(&sources, Some(&names)),
+            }
+        }
         Cmd::NetworkProxy { file } => proxy::serve(&file),
         Cmd::Rebind { pid, paths } => remount::rebind(pid, &paths),
         Cmd::WatchProject { dir } => watch::serve(&dir),

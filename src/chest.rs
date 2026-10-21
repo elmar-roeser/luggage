@@ -1185,17 +1185,19 @@ impl Chest {
             return Ok(false);
         };
         let started = std::time::Instant::now();
-        let pid = self.running();
         info(&format!("chest {}: branch {active} → {want}, switching its service data", self.name));
-        {
+        let pid = {
             // a VM start under way must not use the data while it moves
             let up = File::create(self.run.join("up.lock"))?;
             up.lock()?;
+            // read under the lock: a start that finished while this one waited must be stopped as well
+            let pid = self.running();
             if pid.is_some() {
                 self.stop()?;
             }
             self.swap_data(&active, &want)?;
-        }
+            pid
+        };
         if pid.is_some() {
             if self.def.mode == Mode::Vm {
                 self.vm_up(nixpkgs)?;

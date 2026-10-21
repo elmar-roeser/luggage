@@ -209,17 +209,19 @@ fn read_head(client: &mut UnixStream, within: Duration) -> Option<(String, Vec<u
 
 /// Locks one of `max` slot files in `dir`, or none if all are taken.
 /// The lock ends with the process, also when it crashes, so no slot is ever lost.
-fn take_slot(dir: &Path, max: usize) -> Option<File> {
-    fs::create_dir_all(dir).ok()?;
-    (0..max).find_map(|i| {
+fn take_slot(dir: &Path, max: usize) -> std::io::Result<Option<File>> {
+    fs::create_dir_all(dir)?;
+    for i in 0..max {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join(i.to_string()))
-            .ok()?;
-        file.try_lock().ok().map(|()| file)
-    })
+            .open(dir.join(i.to_string()))?;
+        if file.try_lock().is_ok() {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
 }
 
 /// Answers the guest with an error and a short text.
@@ -251,15 +253,26 @@ fn connect(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
 /// If stdin is not a socket.
 pub fn serve(file: &Path) -> Result<()> {
     let mut client = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
-    let Some(_slot) = take_slot(&file.with_file_name("proxy-slots"), SLOTS) else {
-        refuse(&mut client, "503 Service Unavailable", "too many connections at once");
-        return Ok(());
+    let slots = file.with_file_name("proxy-slots");
+    let _slot = match take_slot(&slots, SLOTS) {
+        Ok(Some(slot)) => slot,
+        Ok(None) => {
+            refuse(&mut client, "503 Service Unavailable", "too many connections at once");
+            return Ok(());
+        }
+        Err(e) => {
+            let text = format!("cannot use {}: {e}", slots.display());
+            refuse(&mut client, "500 Internal Server Error", &text);
+            return Ok(());
+        }
     };
     let Some((head, rest)) = read_head(&mut client, TIMEOUT) else {
         refuse(&mut client, "400 Bad Request", "cannot read the request");
         return Ok(());
     };
-    client.set_read_timeout(None)?;
+    if client.set_read_timeout(None).is_err() {
+        return Ok(());
+    }
     let Some(request) = parse(&head) else {
         refuse(&mut client, "400 Bad Request", "only http:// requests and CONNECT go through");
         return Ok(());
@@ -291,12 +304,17 @@ pub fn serve(file: &Path) -> Result<()> {
             return Ok(());
         }
     };
-    match &request {
-        Request::Tunnel(..) => client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?,
-        Request::Plain(_, _, head) => server.write_all(head)?,
+    // a connection that fails from here on just ends: an error text would land in the guest's stream
+    let opened = match &request {
+        Request::Tunnel(..) => client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        Request::Plain(_, _, head) => server.write_all(head),
+    };
+    if opened.and_then(|()| server.write_all(&rest)).is_err() {
+        return Ok(());
     }
-    server.write_all(&rest)?;
-    let (mut up_from, mut up_to) = (client.try_clone()?, server.try_clone()?);
+    let (Ok(mut up_from), Ok(mut up_to)) = (client.try_clone(), server.try_clone()) else {
+        return Ok(());
+    };
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut up_from, &mut up_to);
         let _ = up_to.shutdown(Shutdown::Write);
@@ -453,10 +471,13 @@ mod tests {
     fn slots_run_out_and_come_back() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().join("slots");
-        let mut taken: Vec<File> = (0..3).map(|_| take_slot(&dir, 3).unwrap()).collect();
-        assert!(take_slot(&dir, 3).is_none());
+        let mut taken: Vec<File> = (0..3).map(|_| take_slot(&dir, 3).unwrap().unwrap()).collect();
+        assert!(take_slot(&dir, 3).unwrap().is_none());
         taken.pop();
-        assert!(take_slot(&dir, 3).is_some());
+        assert!(take_slot(&dir, 3).unwrap().is_some());
+        // an unusable directory is an error, not a full house
+        fs::write(dir.join("x"), "").unwrap();
+        assert!(take_slot(&dir.join("x"), 3).is_err());
     }
 
     #[test]

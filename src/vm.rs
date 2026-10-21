@@ -258,7 +258,9 @@ fn home_fs(g: &Guest) -> String {
 /// tmpfiles rules that give the home and the directories down to the project to the user.
 /// systemd creates missing mount points as root, so `~/.cache` would not be writable otherwise.
 fn home_dirs(g: &Guest) -> Vec<String> {
-    let mut rules = vec![format!("d {} 0700 {} {} -", tmpfiles_path(g.home), g.uid, g.gid)];
+    // without the disk the home is the host's directory, whose mode stays as it is
+    let mode = if home_volume(g).is_empty() { "-" } else { "0700" };
+    let mut rules = vec![format!("d {} {mode} {} {} -", tmpfiles_path(g.home), g.uid, g.gid)];
     if let Ok(rest) = g.project.strip_prefix(g.home) {
         let mut dir = g.home.to_path_buf();
         // all but the last component: the project itself is the share
@@ -1100,6 +1102,8 @@ mod tests {
         let f = render(&Guest { project: Path::new("/home/u"), ..guest("demo", "u") });
         assert!(f.contains("size = 2048; }  ];"));
         assert!(!f.contains("fileSystems"));
+        // and the host's home keeps its mode
+        assert!(f.contains("\"d /home/u - 1000 1000 -\""));
     }
 
     #[test]

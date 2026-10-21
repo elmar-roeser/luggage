@@ -474,7 +474,7 @@ services:
         ));
         assert_eq!(d.services["database"].depends_on, ["database-init"]);
         assert!(d.notes.iter().any(|n| n.contains("root password")));
-        assert!(d.services["database-setup"].ports.is_empty());
+        assert_eq!(d.services["database-setup"].ports, Vec::<String>::new());
         assert_eq!(d.services["mailer"].ports, ["8025"]);
     }
 

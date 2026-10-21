@@ -406,7 +406,7 @@ mod tests {
         let ok =
             with(&[("Cargo.toml", "[package]\nname = \"x\"\nrust-version = \"1.89\"\n")], "", rust)
                 .unwrap();
-        assert!(ok.warnings.is_empty());
+        assert_eq!(ok.warnings, Vec::<String>::new());
         assert!(with(&[], "", rust).is_none());
     }
 }

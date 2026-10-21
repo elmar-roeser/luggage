@@ -2140,7 +2140,7 @@ depends_on = ["db"]
         assert_eq!(m.services["db"].ports, ["3307:3306"]);
         assert_eq!(m.services["db"].command, "mariadbd");
         let none = merge(parse("[ports]\ndb = []").unwrap(), Some(&detected)).unwrap();
-        assert!(none.services["db"].ports.is_empty());
+        assert_eq!(none.services["db"].ports, Vec::<String>::new());
         assert!(
             merge(parse("ignore = [\"db\"]\n[ports]\ndb = []").unwrap(), Some(&detected)).is_err()
         );

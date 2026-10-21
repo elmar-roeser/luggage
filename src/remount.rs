@@ -164,6 +164,6 @@ mod tests {
         // the bubblewrap chest sees it at its own path
         let mounts: Vec<PathBuf> =
             ["flake.nix", ".git/config", ".git/hooks"].map(|n| p.join(n)).into();
-        assert!(dropped(p, p, &mounts).is_empty());
+        assert_eq!(dropped(p, p, &mounts), Vec::<PathBuf>::new());
     }
 }

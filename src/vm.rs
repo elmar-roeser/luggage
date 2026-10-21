@@ -289,27 +289,28 @@ fn list(items: &[String]) -> String {
     items.iter().map(|i| nix_str(i)).collect::<Vec<_>>().join(" ")
 }
 
-/// Creates the ssh key for the chest once and returns the public key.
-fn ssh_key(dir: &Path) -> Result<String> {
+/// Creates the ssh key for the chest in `dir` once.
+fn create_ssh_key(dir: &Path) -> Result<()> {
     let key = dir.join("id_ed25519");
-    if !key.exists() {
-        let status = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-C", "luggage", "-f"])
-            .arg(&key)
-            .stdin(Stdio::null())
-            .status()
-            .context("cannot start ssh-keygen")?;
-        if !status.success() {
-            bail!("ssh-keygen failed");
-        }
+    if key.exists() {
+        return Ok(());
     }
-    Ok(fs::read_to_string(key.with_extension("pub"))?)
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "luggage", "-f"])
+        .arg(&key)
+        .stdin(Stdio::null())
+        .status()
+        .context("cannot start ssh-keygen")?;
+    if !status.success() {
+        bail!("ssh-keygen failed");
+    }
+    Ok(())
 }
 
-/// The guest flake for this user, with the ssh key in `dir` (created once).
+/// The guest flake for this user, with the public ssh key in `dir`. It only renders and reads files.
 ///
 /// # Errors
-/// If `USER` is not set or the key cannot be created.
+/// If `USER` is not set or the key is missing; `build` creates it.
 pub fn guest_flake(
     name: &str,
     project: &Path,
@@ -321,7 +322,8 @@ pub fn guest_flake(
     let meta = fs::metadata("/proc/self")?;
     let user = std::env::var("USER").context("USER is not set")?;
     let home = crate::home();
-    let ssh_key = ssh_key(dir)?;
+    let ssh_key = fs::read_to_string(dir.join("id_ed25519.pub"))
+        .with_context(|| format!("no ssh key in {}", dir.display()))?;
     let var_img = dir.join("var.img");
     let home_img = dir.join("home.img");
     Ok(render(&Guest {
@@ -354,6 +356,7 @@ pub fn build(
     hosts: &[String],
 ) -> Result<PathBuf> {
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    create_ssh_key(dir)?;
     let flake = guest_flake(name, project, nixpkgs, dir, packages, hosts)?;
     // Only flake.nix and flake.lock may be in here: nix copies the whole directory into the
     // world-readable store on every build, so the key and var.img stay one level up.
@@ -933,23 +936,37 @@ fn project_programs(inputs: &str) -> Vec<String> {
 }
 
 /// Writes one stand-in per program of `inputs` into `<run>/shims`; each runs the program in the guest.
-/// The new set is built next to the old one and then swapped in.
+/// The new set is built next to the old one and then swapped in, unless the old one is the same already.
 pub fn write_shims(run: &Path, inputs: &str) -> Result<()> {
     let shims = run.join("shims");
+    let exe = crate::setup::own_program()?;
+    let shim = |name: &str| {
+        format!(
+            "#!/bin/sh\nexec {} exec -- {} \"$@\"\n",
+            sh_quote(&exe.to_string_lossy()),
+            sh_quote(name)
+        )
+    };
+    let names = project_programs(inputs);
+    // the hook runs on every `cd`: the same names and the same program in the first one mean no change
+    let mut have: Vec<String> = fs::read_dir(&shims)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    have.sort();
+    if shims.is_dir()
+        && have == names
+        && names.first().is_none_or(|n| fs::read_to_string(shims.join(n)).ok() == Some(shim(n)))
+    {
+        return Ok(());
+    }
     let fresh = run.join(format!("shims.{}", std::process::id()));
     let _ = fs::remove_dir_all(&fresh);
     fs::create_dir_all(&fresh)?;
-    let exe = crate::setup::own_program()?;
-    for name in project_programs(inputs) {
-        let file = fresh.join(&name);
-        fs::write(
-            &file,
-            format!(
-                "#!/bin/sh\nexec {} exec -- {} \"$@\"\n",
-                sh_quote(&exe.to_string_lossy()),
-                sh_quote(&name)
-            ),
-        )?;
+    for name in &names {
+        let file = fresh.join(name);
+        fs::write(&file, shim(name))?;
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
     }
     let _ = fs::remove_dir_all(&shims);
@@ -1313,6 +1330,44 @@ mod tests {
         );
         assert_eq!(project_programs(&inputs_from_env_sh(&env)), ["php", "php-fpm"]);
         assert_eq!(inputs_from_env_sh("PATH='/x'"), "");
+    }
+
+    #[test]
+    fn stand_ins_are_written_only_when_they_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (run, store) = (tmp.path().join("run"), tmp.path().join("store"));
+        for prog in ["php", "node"] {
+            fs::create_dir_all(store.join(prog).join("bin")).unwrap();
+            fs::write(store.join(prog).join("bin").join(prog), "").unwrap();
+        }
+        fs::create_dir_all(&run).unwrap();
+        let inputs = store.join("php").to_string_lossy().into_owned();
+        let inode = || fs::metadata(run.join("shims")).unwrap().ino();
+        write_shims(&run, &inputs).unwrap();
+        let first = inode();
+        assert!(fs::read_to_string(run.join("shims/php")).unwrap().contains(" exec -- "));
+        write_shims(&run, &inputs).unwrap();
+        assert_eq!(inode(), first);
+        write_shims(&run, &format!("{inputs} {}", store.join("node").display())).unwrap();
+        assert_ne!(inode(), first);
+        assert!(run.join("shims/node").exists());
+        // the hook puts the directory on the PATH, so it exists even without programs
+        fs::remove_dir_all(run.join("shims")).unwrap();
+        write_shims(&run, "").unwrap();
+        assert!(run.join("shims").is_dir());
+    }
+
+    #[test]
+    fn the_guest_flake_needs_the_key_but_never_creates_it() {
+        let Ok(_user) = std::env::var("USER") else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let e = guest_flake("demo", Path::new("/p"), "nixpkgs", dir, &[], &[]).unwrap_err();
+        assert!(e.to_string().contains("no ssh key"), "{e}");
+        assert!(!dir.join("id_ed25519").exists());
+        fs::write(dir.join("id_ed25519.pub"), "ssh-ed25519 AAAA luggage\n").unwrap();
+        let flake = guest_flake("demo", Path::new("/p"), "nixpkgs", dir, &[], &[]).unwrap();
+        assert!(flake.contains("ssh-ed25519 AAAA luggage"));
     }
 
     #[test]

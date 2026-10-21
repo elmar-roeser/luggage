@@ -432,20 +432,35 @@ fn cid_error(name: &str) -> anyhow::Error {
     )
 }
 
+/// What a finished probe of the vsock address `cid` means: free ("No such device"), taken (a guest answered or
+/// refused) or an error of the host itself, like a missing vsock module.
+fn probe_result(cid: u32, success: bool, stderr: &str) -> Result<bool> {
+    if stderr.contains("No such device") {
+        return Ok(false);
+    }
+    if success || stderr.contains("Connection refused") || stderr.contains("Connection reset") {
+        return Ok(true);
+    }
+    bail!("cannot probe vsock address {cid}: {}", stderr.trim())
+}
+
 /// Does some VM already use the vsock address of this chest? A free address fails at once with "No such device".
 fn cid_taken(name: &str, dir: &Path) -> Result<bool> {
+    // the proxy hands a connected socket over on stdout, which must be a socket, and exits 0 then
+    let (_ours, theirs) = UnixStream::pair()?;
     let mut probe = Command::new(dir.join("runner/bin/chest-ssh-proxy"))
         .arg(format!("vsock/{}", cid(name)))
         .arg("22")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stderr(Stdio::piped())
         .spawn()
         .context("cannot start chest-ssh-proxy")?;
     for _ in 0..50 {
         if probe.try_wait()?.is_some() {
             let out = probe.wait_with_output()?;
-            return Ok(!String::from_utf8_lossy(&out.stderr).contains("No such device"));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return probe_result(cid(name), out.status.success(), &stderr);
         }
         sleep(Duration::from_millis(10));
     }
@@ -1129,6 +1144,16 @@ mod tests {
         for name in ["", "a", "sparencon", "x".repeat(200).as_str()] {
             assert!((3..0x7fff_0003).contains(&cid(name)));
         }
+    }
+
+    #[test]
+    fn only_an_answering_guest_takes_the_address() {
+        assert!(!probe_result(7, false, "connect: No such device\n").unwrap());
+        assert!(probe_result(7, true, "").unwrap());
+        assert!(probe_result(7, false, "connect: Connection refused\n").unwrap());
+        assert!(probe_result(7, false, "connect: Connection reset by peer\n").unwrap());
+        let e = probe_result(7, false, "Address family not supported by protocol\n").unwrap_err();
+        assert!(e.to_string().contains("address 7") && e.to_string().contains("Address family"));
     }
 
     #[test]

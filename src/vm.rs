@@ -133,6 +133,9 @@ const FLAKE: &str = r#"{
           "d /var/lib/luggage/data 0700 @UID@ @GID@ -"
           "L+ /data - - - - /var/lib/luggage/data"
           "d /run/luggage 0700 @UID@ @GID@ -"
+          # programs built for other distributions, like Claude Code, look for the glibc loader here
+          "d /lib64 0755 root root -"
+          "L+ /lib64/ld-linux-x86-64.so.2 - - - - ${pkgs.glibc}/lib/ld-linux-x86-64.so.2"
           @HOME_DIRS@
         ];
       }) ];
@@ -788,7 +791,7 @@ fn render_rc(name: &str, proxy: Option<&[String]>) -> String {
     let mut rc = format!(
         "source ~/.luggage/env.sh\n\
          unset NIX_BUILD_TOP TEMP TMP TEMPDIR SSL_CERT_FILE NIX_SSL_CERT_FILE\n\
-         export TMPDIR=/tmp LUGGAGE_CHEST={}\n\
+         export TMPDIR=/tmp LUGGAGE_CHEST={} PATH=\"$PATH:$HOME/.local/bin\"\n\
          PS1='[chest:{name}] \\w\\$ '\n",
         sh_quote(name)
     );

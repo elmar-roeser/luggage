@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::branch::{self, Head};
 use crate::compose::{self, Detected};
-use crate::{config, find_in_path, gitcheck, home, info, remount, skills, versions, vm};
+use crate::{agents, config, find_in_path, gitcheck, home, info, remount, skills, versions, vm};
 
 /// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
@@ -62,6 +62,8 @@ pub struct Definition {
     pub network: Option<Vec<String>>,
     /// Skills for coding agents from the sources in the config, as `<source>/<skill>` with `*`
     pub skills: Vec<String>,
+    /// Coding agents that `up` installs into the home of the chest: claude, codex
+    pub agents: Vec<String>,
 }
 
 /// How the chest isolates the project.
@@ -143,6 +145,9 @@ fn parse(text: &str) -> Result<Definition> {
     for p in &def.skills {
         skills::check_pattern(p)?;
     }
+    for a in &def.agents {
+        agents::check(a)?;
+    }
     Ok(def)
 }
 
@@ -176,6 +181,20 @@ fn merge(mut def: Definition, detected: Option<&Detected>) -> Result<Definition>
         def.packages.sort();
         def.packages.dedup();
     }
+    if !def.agents.is_empty() {
+        def.packages.extend(agents::PACKAGES.map(str::to_owned));
+        def.packages.sort();
+        def.packages.dedup();
+        // the bubblewrap chest has no network otherwise; a VM without a list stays open
+        if def.network.is_some() || def.mode == Mode::Bubblewrap {
+            let network = def.network.get_or_insert_default();
+            for h in agents::hosts(&def.agents) {
+                if !network.contains(&h) {
+                    network.push(h);
+                }
+            }
+        }
+    }
     for (name, specs) in &def.ports {
         let svc = def
             .services
@@ -192,6 +211,9 @@ fn merge(mut def: Definition, detected: Option<&Detected>) -> Result<Definition>
     }
     Ok(def)
 }
+
+/// Where programs built for other distributions look for the glibc loader.
+const LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
 
 /// Tools from nixpkgs that the chest needs, independent of the project flake.
 #[derive(Debug, Serialize, Deserialize)]
@@ -211,6 +233,9 @@ pub struct Tools {
     /// Store path of socat, which bridges the service ports to the host
     #[serde(default)]
     socat: String,
+    /// Store path of glibc, whose loader runs programs built for other distributions, like Claude Code
+    #[serde(default)]
+    glibc: String,
     /// The bwrap program: from the system if present, else from nixpkgs.
     /// Ubuntu uses AppArmor to allow user namespaces only for programs with a profile, like `/usr/bin/bwrap`.
     pub bwrap: String,
@@ -244,6 +269,7 @@ impl Tools {
             "iproute2^out",
             "cacert^out",
             "socat^out",
+            "glibc^out",
         ];
         if host_bwrap.is_none() {
             attrs.push("bubblewrap^out");
@@ -269,6 +295,7 @@ impl Tools {
             iproute2: find("iproute2")?,
             cacert: find("nss-cacert")?,
             socat: find("socat")?,
+            glibc: find("glibc")?,
             bwrap: match host_bwrap {
                 Some(p) => p.to_string_lossy().into_owned(),
                 None => format!("{}/bin/bwrap", find("bubblewrap")?),
@@ -538,7 +565,7 @@ impl Chest {
              export HOME={home} USER={user} TMPDIR=/tmp LUGGAGE_CHEST={name}\n\
              unset NIX_BUILD_TOP TEMP TMP TEMPDIR\n\
              export SSL_CERT_FILE={ca} NIX_SSL_CERT_FILE={ca}\n\
-             export PATH={pkgs}{pc}/bin:{bash}/bin:{core}/bin:\"$PATH\"\n\
+             export PATH={pkgs}{pc}/bin:{bash}/bin:{core}/bin:\"$PATH:$HOME/.local/bin\"\n\
              cd {project}\n\
              PS1='[chest:{name_plain}] \\w\\$ '\n",
             home = sh_quote(&home().to_string_lossy()),
@@ -672,6 +699,12 @@ impl Chest {
             ]
             .map(str::to_owned),
         );
+        if !tools.glibc.is_empty() {
+            a.extend(
+                ["--symlink", &format!("{}/lib/ld-linux-x86-64.so.2", tools.glibc), LOADER]
+                    .map(str::to_owned),
+            );
+        }
         for f in ["rc", "env.sh", "process-compose.yaml"] {
             a.extend(self.bind_inside(f));
         }
@@ -948,6 +981,11 @@ impl Chest {
         self.vm_skills(had_skills, &skills)?;
         fs::write(self.run.join("started"), self.vm_fingerprint(nixpkgs)?)?;
         self.vm_services(pid)?;
+        if !self.def.agents.is_empty() {
+            let install = agents::install_script(&self.def.agents);
+            let cmd = ["bash".to_owned(), "-c".to_owned(), install];
+            vm::exec(&self.name, &dir, &self.run, &self.project, true, &[], &cmd)?;
+        }
         Ok(pid)
     }
 
@@ -1374,7 +1412,20 @@ impl Chest {
             }
             return Ok(());
         }
-        self.bwrap_up(nixpkgs)
+        self.bwrap_up(nixpkgs)?;
+        self.install_agents()
+    }
+
+    /// Installs the missing agents in the running bubblewrap chest.
+    fn install_agents(&self) -> Result<()> {
+        let Some(pid) = self.running().filter(|_| !self.def.agents.is_empty()) else {
+            return Ok(());
+        };
+        let tools = self.tools()?;
+        let mut c = nsenter(pid, &tools);
+        shell_args(&mut c, &["bash".into(), "-c".into(), agents::install_script(&self.def.agents)]);
+        c.stdin(Stdio::null()).stdout(Stdio::null()).status().context("cannot start nsenter")?;
+        Ok(())
     }
 
     /// Starts the bubblewrap chest and waits until all services are ready.
@@ -2055,6 +2106,7 @@ depends_on = ["db"]
             iproute2: "/nix/store/i-iproute2".into(),
             cacert: "/nix/store/c-nss-cacert".into(),
             socat: "/nix/store/s-socat".into(),
+            glibc: "/nix/store/g-glibc".into(),
             bwrap: "/usr/bin/bwrap".into(),
             packages: vec!["/nix/store/m-mariadb".into()],
         }
@@ -2151,6 +2203,31 @@ depends_on = ["db"]
         assert_eq!(def.network.unwrap(), ["git.example.com:22", "[::1]:8080"]);
         assert!(parse("mode = \"vm\"\nnetwork = [\"github.com:ssh\"]").is_err());
         assert_eq!(parse("network = [\"github.com\"]").unwrap().network.unwrap(), ["github.com"]);
+    }
+
+    #[test]
+    fn agents_bring_their_tools_and_hosts() {
+        let merged = |t: &str| merge(parse(t).unwrap(), None).unwrap();
+        // bubblewrap has no network otherwise, so the agents get a list with their hosts
+        let bw = merged("agents = [\"claude\"]\npackages = [\"curl\"]");
+        assert_eq!(bw.packages, ["curl", "gnutar", "gzip"]);
+        let hosts = bw.network.unwrap();
+        assert!(
+            hosts.contains(&"claude.ai".to_owned()) && !hosts.contains(&"chatgpt.com".to_owned())
+        );
+        // an open VM stays open, a list gets the hosts added
+        assert_eq!(merged("mode = \"vm\"\nagents = [\"codex\"]").network, None);
+        let vm = merged(
+            "mode = \"vm\"\nagents = [\"codex\"]\nnetwork = [\"packagist.org\", \"github.com\"]",
+        );
+        let hosts = vm.network.unwrap();
+        assert_eq!(hosts.iter().filter(|h| *h == "github.com").count(), 1);
+        assert!(
+            hosts.contains(&"packagist.org".to_owned()) && hosts.contains(&"openai.com".to_owned())
+        );
+        // without agents nothing changes
+        assert_eq!(merged("").network, None);
+        assert!(parse("agents = [\"cursor\"]").is_err());
     }
 
     #[test]
@@ -2284,7 +2361,7 @@ depends_on = ["db"]
     fn rc_puts_packages_first_on_path() {
         let rc = chest(Definition::default()).render_rc(&tools());
         assert!(rc.contains(
-            "export PATH=/nix/store/m-mariadb/bin:/nix/store/p-pc/bin:/nix/store/b-bash/bin:/nix/store/c-coreutils/bin:\"$PATH\"\n"
+            "export PATH=/nix/store/m-mariadb/bin:/nix/store/p-pc/bin:/nix/store/b-bash/bin:/nix/store/c-coreutils/bin:\"$PATH:$HOME/.local/bin\"\n"
         ));
         assert!(rc.contains("cd '/home/u/projects/demo'\n"));
     }

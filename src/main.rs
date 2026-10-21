@@ -1,5 +1,6 @@
 //! luggage — create or clone a project and set up a Nix dev environment (flake + direnv).
 
+mod agents;
 mod branch;
 mod chest;
 mod compose;

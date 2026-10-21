@@ -359,6 +359,27 @@ them into `~/.claude/skills` and `~/.agents/skills` of the chest, in both modes.
 in the chest cannot change the skills that it runs. A changed list or source applies at the next start. If a source
 cannot be fetched, the chest does not start.
 
+### Agents in the chest
+
+```toml
+agents = ["claude", "codex"]
+```
+
+`luggage up` installs each missing agent with its own installer into `~/.local/bin` of the chest: Claude Code from
+claude.ai, Codex from its GitHub releases. They update themselves there like on the host. Each chest has its own
+home, so each keeps its own login: log in once per chest, e.g. with another account per project.
+
+```bash
+luggage exec claude                      # log in by pasting the code from the browser
+luggage exec codex login --device-auth   # log in with a code, without a browser in the chest
+```
+
+The agents need the network for their login and API. A bubblewrap chest, which has none otherwise, gets a
+`network` list with their hosts (`anthropic.com`, `claude.ai`, `claude.com`; `openai.com`, `chatgpt.com`,
+`github.com`, `githubusercontent.com`); a `network` list of your own gets them added; a VM without a list stays
+open. luggage also adds `curl`, `gnutar` and `gzip` for the installers and, in both modes, the glibc loader at
+`/lib64/ld-linux-x86-64.so.2` from nixpkgs, which Claude Code needs.
+
 ## Development
 
 `make ci` runs every check locally (format, clippy, tests, `cargo audit`, gitleaks).

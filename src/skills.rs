@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -359,6 +359,193 @@ pub fn status(sources: &BTreeMap<String, SkillSource>) -> Result<()> {
     Ok(())
 }
 
+/// Does `name` match `pattern`, in which `*` stands for any text?
+fn glob(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, rest)) => name
+            .strip_prefix(head)
+            .is_some_and(|n| (0..=n.len()).any(|i| n.is_char_boundary(i) && glob(rest, &n[i..]))),
+    }
+}
+
+/// Checks an entry of `skills` in `chest.toml`: `<source>/<skill>`, where the skill may contain `*`.
+///
+/// # Errors
+/// If the entry has no source or no skill.
+pub fn check_pattern(p: &str) -> Result<()> {
+    match p.split_once('/') {
+        Some((source, skill))
+            if !source.is_empty() && !skill.is_empty() && !skill.contains('/') =>
+        {
+            Ok(())
+        }
+        _ => bail!("skills: {p:?} is not like \"team/glab\" or \"team/*\""),
+    }
+}
+
+/// The skills that `patterns` pick, by name: each with the source it comes from.
+///
+/// # Errors
+/// If a pattern names a source that is not in the config.
+fn pick(
+    skills: &BTreeMap<String, (String, PathBuf)>,
+    sources: &BTreeMap<String, SkillSource>,
+    patterns: &[String],
+) -> Result<BTreeMap<String, PathBuf>> {
+    let mut picked = BTreeMap::new();
+    for p in patterns {
+        let (source, skill) = p.split_once('/').unwrap_or((p, "*"));
+        if !sources.contains_key(source) {
+            bail!("skills: there is no [skills.{source}] in {}", crate::config::path().display());
+        }
+        let matched: Vec<_> =
+            skills.iter().filter(|(name, (from, _))| from == source && glob(skill, name)).collect();
+        if matched.is_empty() {
+            info(&format!("warning: skills: {p} matches no skill"));
+        }
+        picked.extend(matched.into_iter().map(|(name, (_, dir))| (name.clone(), dir.clone())));
+    }
+    Ok(picked)
+}
+
+/// Copies the skills that `patterns` pick into one store path, points `root` to it and returns their names.
+/// Without patterns `root` goes away; in the store the skills are read-only for the chest in both modes.
+///
+/// # Errors
+/// If a source cannot be fetched or the copy fails.
+#[cfg(not(tarpaulin_include))]
+pub fn chest_set(
+    sources: &BTreeMap<String, SkillSource>,
+    patterns: &[String],
+    root: &Path,
+) -> Result<Vec<String>> {
+    if patterns.is_empty() {
+        let _ = fs::remove_file(root);
+        return Ok(Vec::new());
+    }
+    let dir = data_dir();
+    fetch_sources(&dir, sources, None)?;
+    let picked = pick(&find_skills(&dir.join("roots"), sources)?, sources, patterns)?;
+    let tmp = root.with_extension("tmp");
+    copy_skills(&picked, &tmp)?;
+    let out = Command::new("nix")
+        .args(["store", "add-path", "--name", "luggage-skills"])
+        .arg(&tmp)
+        .stderr(Stdio::inherit())
+        .output()
+        .context("cannot start nix")?;
+    clear(&tmp);
+    if !out.status.success() {
+        bail!("cannot copy the skills into the Nix store");
+    }
+    let store_path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if fs::read_link(root).ok().as_deref() != Some(Path::new(&store_path)) {
+        let _ = fs::remove_file(root);
+        add_root(root, &store_path)?;
+    }
+    Ok(picked.into_keys().collect())
+}
+
+/// Copies each picked skill into a fresh directory `to`.
+///
+/// # Errors
+/// If `cp` fails.
+fn copy_skills(picked: &BTreeMap<String, PathBuf>, to: &Path) -> Result<()> {
+    clear(to);
+    fs::create_dir_all(to).with_context(|| format!("cannot create {}", to.display()))?;
+    for (name, from) in picked {
+        // -L: a local skill may link to files outside, which the chest could not follow
+        if !Command::new("cp").arg("-RL").arg(from).arg(to.join(name)).status()?.success() {
+            bail!("cannot copy the skill {}", from.display());
+        }
+    }
+    // cp keeps the read-only mode of the store, which would keep the copy from being removed
+    make_writable(to);
+    Ok(())
+}
+
+/// Removes the directory `dir`, also if parts of it are read-only.
+fn clear(dir: &Path) {
+    make_writable(dir);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Gives the owner write access to each directory below `dir`; errors are left to the caller's next step.
+fn make_writable(dir: &Path) {
+    let Ok(meta) = fs::symlink_metadata(dir) else { return };
+    if !meta.is_dir() {
+        return;
+    }
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(meta.permissions().mode() | 0o200));
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        make_writable(&entry.path());
+    }
+}
+
+/// Where the skills of a chest appear in its home, and the agents' skill directories there.
+const CHEST_SKILLS: &str = ".luggage/skills";
+/// The skill directories of the agents in the home of a chest.
+const CHEST_AGENT_DIRS: [&str; 2] = [".claude/skills", ".agents/skills"];
+
+/// Links the skill set `root` into the home of a bubblewrap chest: `host_home` on the host, `home` in the chest.
+/// The links point to `~/.luggage/skills`, so luggage knows its own; other entries stay as they are.
+///
+/// # Errors
+/// If a link cannot be written or a skill directory is itself a link.
+pub fn link_home(host_home: &Path, home: &Path, root: &Path, names: &[String]) -> Result<()> {
+    let set = host_home.join(CHEST_SKILLS);
+    let _ = fs::remove_file(&set);
+    if let Ok(store_path) = fs::read_link(root) {
+        fs::create_dir_all(host_home.join(".luggage"))?;
+        symlink(store_path, &set)?;
+    }
+    let inside = home.join(CHEST_SKILLS);
+    let skills: BTreeMap<String, (String, PathBuf)> =
+        names.iter().map(|n| (n.clone(), (String::new(), inside.join(n)))).collect();
+    for dir in CHEST_AGENT_DIRS {
+        let target = host_home.join(dir);
+        if skills.is_empty() && !target.is_dir() {
+            continue;
+        }
+        let done = link_skills(&target, &inside, &skills)?;
+        for name in done.skipped {
+            info(&format!(
+                "warning: skipped ~/{dir}/{name} in the chest: it exists and luggage did not create it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The shell script that does what [`link_home`] does, in the guest of a VM chest.
+/// It knows its own links by their target in `~/.luggage/skills` and removes those whose skill is gone.
+pub fn guest_script(store_path: Option<&str>, names: &[String]) -> String {
+    let names: Vec<String> = names.iter().map(|n| crate::chest::sh_quote(n)).collect();
+    let names = names.join(" ");
+    let link = store_path
+        .map_or_else(String::new, |p| format!("ln -s {} \"$s\"", crate::chest::sh_quote(p)));
+    let dirs = CHEST_AGENT_DIRS.map(|d| format!("\"$HOME/{d}\"")).join(" ");
+    format!(
+        r#"s="$HOME/{CHEST_SKILLS}"; mkdir -p "$HOME/.luggage"; rm -f "$s"; {link}
+for d in {dirs}; do
+  if [ -L "$d" ]; then echo "luggage: warning: $d is a link, so another tool manages it" >&2; continue; fi
+  [ -d "$d" ] || [ -n "{has}" ] || continue
+  mkdir -p "$d"
+  for l in "$d"/*; do
+    [ -L "$l" ] && case "$(readlink "$l")" in "$s"/*) [ -e "$l" ] || rm -f "$l";; esac
+  done
+  for n in {names}; do
+    if [ ! -e "$d/$n" ] && [ ! -L "$d/$n" ]; then ln -s "$s/$n" "$d/$n"
+    elif [ "$(readlink "$d/$n")" != "$s/$n" ]; then echo "luggage: warning: skipped $d/$n in the chest: it exists and luggage did not create it" >&2
+    fi
+  done
+done
+"#,
+        has = if names.is_empty() { "" } else { "1" },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +649,108 @@ mod tests {
         let e =
             link_skills(&t, tmp.path(), &find_skills(tmp.path(), &sources).unwrap()).unwrap_err();
         assert!(e.to_string().contains("another tool manages it"), "{e}");
+    }
+
+    #[test]
+    fn patterns_pick_skills_of_one_source() {
+        assert!(glob("bmad-*", "bmad-dev") && glob("*", "x") && glob("a*c*e", "abcde"));
+        assert!(!glob("bmad-*", "gds-dev") && !glob("glab", "glab-stack") && !glob("a*c", "ab"));
+        for ok in ["team/glab", "team/*"] {
+            check_pattern(ok).unwrap();
+        }
+        for bad in ["team", "/glab", "team/", "team/a/b"] {
+            assert!(check_pattern(bad).is_err(), "{bad}");
+        }
+        let (tmp, sources) = roots();
+        let skills = find_skills(tmp.path(), &sources).unwrap();
+        let picked =
+            pick(&skills, &sources, &["a/x".into(), "b/*".into(), "b/nothing".into()]).unwrap();
+        assert_eq!(picked.keys().collect::<Vec<_>>(), ["x", "z"]);
+        assert_eq!(picked["z"], tmp.path().join("b/z"));
+        let e = pick(&skills, &sources, &["c/*".into()]).unwrap_err();
+        assert!(e.to_string().contains("no [skills.c]"), "{e}");
+    }
+
+    #[test]
+    fn copies_read_only_skills_again_and_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = tmp.path().join("src/x");
+        fs::create_dir_all(skill.join("scripts")).unwrap();
+        fs::write(skill.join("SKILL.md"), "x").unwrap();
+        // like the Nix store
+        for d in [skill.join("scripts"), skill.clone()] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let picked = BTreeMap::from([("x".to_owned(), skill)]);
+        let set = tmp.path().join("set");
+        copy_skills(&picked, &set).unwrap();
+        copy_skills(&picked, &set).unwrap();
+        assert!(set.join("x/SKILL.md").is_file() && !set.join("x/x").exists());
+        clear(&set);
+        assert!(!set.exists());
+    }
+
+    #[test]
+    fn links_the_set_into_the_home_of_a_chest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (host_home, root) = (tmp.path().join("state/home"), tmp.path().join("state/skills"));
+        fs::create_dir_all(&host_home).unwrap();
+        symlink("/nix/store/abc-luggage-skills", &root).unwrap();
+        let home = Path::new("/home/u");
+        link_home(&host_home, home, &root, &["x".into(), "y".into()]).unwrap();
+        assert_eq!(
+            fs::read_link(host_home.join(".luggage/skills")).unwrap(),
+            Path::new("/nix/store/abc-luggage-skills")
+        );
+        for dir in CHEST_AGENT_DIRS {
+            assert_eq!(
+                fs::read_link(host_home.join(dir).join("x")).unwrap(),
+                home.join(".luggage/skills/x")
+            );
+        }
+        // without skills the set and the links go, the directories stay
+        fs::remove_file(&root).unwrap();
+        link_home(&host_home, home, &root, &[]).unwrap();
+        assert!(host_home.join(".luggage/skills").symlink_metadata().is_err());
+        assert_eq!(fs::read_dir(host_home.join(".claude/skills")).unwrap().count(), 0);
+        // a chest that never had skills gets no directories
+        let fresh = tmp.path().join("fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        link_home(&fresh, home, &root, &[]).unwrap();
+        assert!(!fresh.join(".claude").exists());
+    }
+
+    #[test]
+    fn the_guest_script_links_the_set_like_on_the_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, store) = (tmp.path().join("home"), tmp.path().join("store"));
+        for n in ["x", "y"] {
+            fs::create_dir_all(store.join(n)).unwrap();
+        }
+        fs::create_dir_all(home.join(".claude/skills/own")).unwrap();
+        symlink("/elsewhere", home.join(".claude/skills/y")).unwrap();
+        let run = |script: &str| {
+            let out = Command::new("sh").arg("-c").arg(script).env("HOME", &home).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let store_path = store.to_string_lossy();
+        let err = run(&guest_script(Some(&store_path), &["x".into(), "y".into()]));
+        assert!(err.contains(".claude/skills/y in the chest"), "{err}");
+        let set = home.join(".luggage/skills");
+        assert_eq!(fs::read_link(&set).unwrap(), store);
+        assert_eq!(fs::read_link(home.join(".agents/skills/y")).unwrap(), set.join("y"));
+        assert_eq!(fs::read_link(home.join(".claude/skills/x")).unwrap(), set.join("x"));
+        // x leaves the set: its links go, foreign entries stay
+        fs::remove_dir(store.join("x")).unwrap();
+        run(&guest_script(Some(&store_path), &["y".into()]));
+        assert!(home.join(".claude/skills/x").symlink_metadata().is_err());
+        assert!(home.join(".claude/skills/own").is_dir());
+        assert_eq!(fs::read_link(home.join(".claude/skills/y")).unwrap(), Path::new("/elsewhere"));
+        // no skills: the set goes and its links dangle away
+        run(&guest_script(None, &[]));
+        assert!(set.symlink_metadata().is_err());
+        assert_eq!(fs::read_dir(home.join(".agents/skills")).unwrap().count(), 0);
     }
 
     #[test]

@@ -348,6 +348,17 @@ commit until `update`; they live read-only in the Nix store, kept from the garba
 changes its own links: an entry it did not create stays as it is and `sync` names it. If a skill folder is
 itself a link, another tool manages it, and `sync` refuses until you move it away.
 
+A chest gets only the skills that its `chest.toml` names, as `<source>/<skill>`, where `*` stands for any text:
+
+```toml
+skills = ["team/*", "own/review-*"]
+```
+
+At each start (`up`, `run`, and a VM start) luggage copies these skills into one path in the Nix store and links
+them into `~/.claude/skills` and `~/.agents/skills` of the chest, in both modes. There they are read-only: an agent
+in the chest cannot change the skills that it runs. A changed list or source applies at the next start. If a source
+cannot be fetched, the chest does not start.
+
 ## Development
 
 `make ci` runs every check locally (format, clippy, tests, `cargo audit`, gitleaks).

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::branch::{self, Head};
 use crate::compose::{self, Detected};
-use crate::{config, find_in_path, gitcheck, home, info, remount, versions, vm};
+use crate::{config, find_in_path, gitcheck, home, info, remount, skills, versions, vm};
 
 /// Default wait time in seconds for `ready` when `ready_timeout` is missing.
 const DEFAULT_READY_TIMEOUT: u32 = 60;
@@ -60,6 +60,8 @@ pub struct Definition {
     pub pass_env: Vec<String>,
     /// The only hosts the chest may reach, each with its subdomains and on 80 and 443 unless it names a port
     pub network: Option<Vec<String>>,
+    /// Skills for coding agents from the sources in the config, as `<source>/<skill>` with `*`
+    pub skills: Vec<String>,
 }
 
 /// How the chest isolates the project.
@@ -137,6 +139,9 @@ fn parse(text: &str) -> Result<Definition> {
         bail!(
             "network: {h:?} is not a host like \"github.com\", \"git.example.com:22\" or \"[::1]:8080\""
         );
+    }
+    for p in &def.skills {
+        skills::check_pattern(p)?;
     }
     Ok(def)
 }
@@ -715,6 +720,8 @@ impl Chest {
         }
         create_protected_dirs(&self.project)?;
         fs::set_permissions(&self.run, fs::Permissions::from_mode(0o700))?;
+        let names = self.skill_set()?;
+        skills::link_home(&self.state.join("home"), &home(), &self.state.join("skills"), &names)?;
         let tools = Tools::fetch(nixpkgs, &self.def.packages)?;
         self.dev_env()?;
         fs::write(self.run.join("tools.json"), serde_json::to_string_pretty(&tools)?)?;
@@ -845,6 +852,29 @@ impl Chest {
         vm::sync_env(&self.name, &self.state.join("vm"), &self.run, &env, &compose, &self.def.hosts)
     }
 
+    /// Builds the skill set of the chest in `<state>/skills` and returns the names of its skills.
+    /// A chest without `skills` reads no config, unless it had a set before that must go.
+    fn skill_set(&self) -> Result<Vec<String>> {
+        let root = self.state.join("skills");
+        if self.def.skills.is_empty() && root.symlink_metadata().is_err() {
+            return Ok(Vec::new());
+        }
+        skills::chest_set(&config::load()?.skills, &self.def.skills, &root)
+    }
+
+    /// Links the skill set with `names` into the home in the guest; `had` says the chest had a set before.
+    fn vm_skills(&self, had: bool, names: &[String]) -> Result<()> {
+        if names.is_empty() && !had {
+            return Ok(());
+        }
+        let store_path = fs::read_link(self.state.join("skills")).ok();
+        let script = skills::guest_script(store_path.as_deref().and_then(Path::to_str), names);
+        if !vm::script(&self.name, &self.state.join("vm"), &self.run, &script).status()?.success() {
+            bail!("cannot link the skills in the VM");
+        }
+        Ok(())
+    }
+
     /// A process-compose command in the guest, e.g. `process list -o json`.
     fn vm_pc(&self, args: &str) -> Command {
         vm::script(
@@ -901,6 +931,9 @@ impl Chest {
         self.ensure_envrc_hook()?;
         let dir = self.state.join("vm");
         vm::build(&self.name, &self.project, nixpkgs, &dir, &self.def.packages, &self.def.hosts)?;
+        // before the start: a source that cannot be fetched stops it, not a running VM
+        let had_skills = self.state.join("skills").symlink_metadata().is_ok();
+        let skills = self.skill_set()?;
         self.note_git_files()?;
         let pid = vm::start(
             &self.name,
@@ -912,6 +945,7 @@ impl Chest {
         )?;
         self.forward_ports(|host, guest| vm::forward_port(&self.run, host, guest))?;
         self.vm_sync()?;
+        self.vm_skills(had_skills, &skills)?;
         fs::write(self.run.join("started"), self.vm_fingerprint(nixpkgs)?)?;
         self.vm_services(pid)?;
         Ok(pid)
@@ -2131,6 +2165,8 @@ depends_on = ["db"]
         assert!(parse("[services.a]\ncommand = \"x\"\nports = [\"80:0\"]").is_err());
         assert!(parse("[services.a]\ncommand = \"x\"\nports = [8000]").is_err());
         assert!(parse("[ports]\na = [\"80:0\"]").is_err());
+        assert_eq!(parse("skills = [\"team/*\"]").unwrap().skills, ["team/*"]);
+        assert!(parse("skills = [\"glab\"]").is_err());
         let vm = parse("mode = \"vm\"\npass_env = [\"ANTHROPIC_API_KEY\"]").unwrap();
         assert_eq!(vm.pass_env, ["ANTHROPIC_API_KEY"]);
         assert!(parse("mode = \"vm\"\npass_env = [\"A=B\"]").is_err());

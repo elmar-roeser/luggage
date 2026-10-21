@@ -4,6 +4,7 @@
 //! luggage looks for that at each command and binds the new file read-only in the namespace again.
 
 use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -42,6 +43,39 @@ fn mount_points(mountinfo: &str) -> Vec<PathBuf> {
         .filter_map(|l| l.split(' ').nth(4))
         .map(|m| PathBuf::from(unescape(m)))
         .collect()
+}
+
+/// The flags of the newest mount on `point` in a mountinfo text, from its per-mount options.
+/// A remount in a user namespace must repeat these: the kernel locks them, also the atime mode and noexec.
+fn mount_flags(mountinfo: &str, point: &Path) -> Option<MountFlags> {
+    let options = mountinfo
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(' ');
+            if Path::new(&unescape(f.nth(4)?)) != point {
+                return None;
+            }
+            f.next()
+        })
+        .next_back()?;
+    let mut flags = MountFlags::STRICTATIME;
+    for o in options.split(',') {
+        flags |= match o {
+            "ro" => MountFlags::RDONLY,
+            "nosuid" => MountFlags::NOSUID,
+            "nodev" => MountFlags::NODEV,
+            "noexec" => MountFlags::NOEXEC,
+            "nodiratime" => MountFlags::NODIRATIME,
+            "noatime" => MountFlags::NOATIME,
+            "relatime" => MountFlags::RELATIME,
+            _ => continue,
+        };
+    }
+    // the kernel refuses strictatime together with another atime mode
+    if flags.intersects(MountFlags::NOATIME | MountFlags::RELATIME) {
+        flags.remove(MountFlags::STRICTATIME);
+    }
+    Some(flags)
 }
 
 /// The protected paths that exist on the host but are no mount point in the namespace, where the project is at `root`.
@@ -112,6 +146,8 @@ pub fn rebind(pid: u32, paths: &[PathBuf]) -> Result<()> {
     let root = open(format!("/proc/{pid}/root"))?;
     let user = open(format!("/proc/{}/ns/user", outermost(pid)))?;
     let mnt = open(format!("/proc/{pid}/ns/mnt"))?;
+    // opened here: the namespace may have no /proc; it shows the mounts as `pid` sees them
+    let mut mountinfo = open(format!("/proc/{pid}/mountinfo"))?;
     move_into_link_name_space(user.as_fd(), Some(LinkNameSpaceType::User))
         .context("cannot enter the user namespace")?;
     move_into_link_name_space(mnt.as_fd(), Some(LinkNameSpaceType::Mount))
@@ -120,9 +156,12 @@ pub fn rebind(pid: u32, paths: &[PathBuf]) -> Result<()> {
     chroot(".")?;
     for p in paths {
         mount_bind(p, p).with_context(|| format!("cannot bind {}", p.display()))?;
-        // nosuid and nodev come from the bind of the project and must stay
-        let flags = MountFlags::BIND | MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV;
-        mount_remount(p, flags, "")
+        let mut info = String::new();
+        mountinfo.seek(SeekFrom::Start(0))?;
+        mountinfo.read_to_string(&mut info)?;
+        let flags = mount_flags(&info, p)
+            .with_context(|| format!("cannot find the mount of {}", p.display()))?;
+        mount_remount(p, flags | MountFlags::BIND | MountFlags::RDONLY, "")
             .with_context(|| format!("cannot make {} read-only", p.display()))?;
     }
     Ok(())
@@ -145,6 +184,24 @@ mod tests {
                     2202 2183 0:28 /@rootfs/p/my\\040dir /my\\040dir ro,nosuid - btrfs /dev/x rw\n";
         assert_eq!(mount_points(info), [PathBuf::from("/"), PathBuf::from("/my dir")]);
         assert_eq!(unescape(r"a\134b\0"), r"a\b\0");
+    }
+
+    #[test]
+    fn repeats_the_locked_flags_of_the_mount() {
+        let info = "2183 1785 0:28 /p / rw,nosuid,nodev,noatime - btrfs /dev/x rw\n\
+                    2202 2183 0:28 /p/a /a rw,relatime - btrfs /dev/x rw\n\
+                    2203 2183 0:28 /p/a /a rw,nosuid,nodev,noexec,nodiratime - btrfs /dev/x rw\n";
+        assert_eq!(
+            mount_flags(info, Path::new("/")),
+            Some(MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOATIME)
+        );
+        // the newest mount on a path is the one that counts, and no atime option means strictatime
+        let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+        assert_eq!(
+            mount_flags(info, Path::new("/a")),
+            Some(flags | MountFlags::NODIRATIME | MountFlags::STRICTATIME)
+        );
+        assert_eq!(mount_flags(info, Path::new("/b")), None);
     }
 
     #[test]

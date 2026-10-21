@@ -2,6 +2,7 @@
 //!
 //! luggage notes them when the chest starts and compares before each command; their config could make git on
 //! the host run programs (`core.fsmonitor`). It is a check, not a lock: it cannot stop the user's own `git`.
+//! What is read-only in the chest, like `.git/modules`, is left out: the host changes it, the chest cannot.
 
 use std::fs::{self, Metadata};
 use std::os::unix::ffi::OsStrExt;
@@ -43,16 +44,17 @@ fn is_git_dir(dir: &Path) -> bool {
 }
 
 /// Lines for the git dir `dir`: the files that point git to another config, and for all but the top one also
-/// its config and hooks. The top `.git/config` and `.git/hooks` are read-only in the chest.
+/// its config, hooks, worktrees and modules. In the top `.git` those are read-only in the chest.
 fn git_dir(out: &mut Vec<String>, dir: &Path, rel: &str, top: bool) {
     let own: &[&str] = if top { &[] } else { &["config", "hooks"] };
     for name in ["commondir", "config.worktree"].iter().chain(own) {
         entry(out, dir, rel, name);
     }
-    if !top {
-        for hook in names(&dir.join("hooks")) {
-            entry(out, &dir.join("hooks"), &format!("{rel}/hooks"), &hook);
-        }
+    if top {
+        return;
+    }
+    for hook in names(&dir.join("hooks")) {
+        entry(out, &dir.join("hooks"), &format!("{rel}/hooks"), &hook);
     }
     for wt in names(&dir.join("worktrees")) {
         let (d, r) = (dir.join("worktrees").join(&wt), format!("{rel}/worktrees/{wt}"));
@@ -147,13 +149,17 @@ pub fn nested_repos(snapshot: &str) -> String {
     part(snapshot, false)
 }
 
-/// The lines of the top `.git` if `top`, else the others.
+/// The lines of the top `.git` if `top`, else the others. Lines for the read-only `.git/modules` and
+/// `.git/worktrees` are dropped: an older luggage noted them, and they would count as gone.
 fn part(snapshot: &str, top: bool) -> String {
     let path = |l: &str| l.splitn(4, ' ').nth(3).unwrap_or_default().to_owned();
     snapshot
         .lines()
         .filter(|l| {
             let p = path(l);
+            if p.starts_with(".git/modules") || p.starts_with(".git/worktrees") {
+                return false;
+            }
             (p == ".git" || p.starts_with(".git/")) == top
         })
         .collect::<Vec<_>>()
@@ -201,21 +207,39 @@ mod tests {
         fs::remove_file(p.join(".git/commondir")).unwrap();
         assert_eq!(changed(&before, &snapshot(p, true)), None);
 
+        fs::write(p.join(".git/config.worktree"), "").unwrap();
+        assert_eq!(changed(&before, &snapshot(p, false)).as_deref(), Some(".git/config.worktree"));
+        fs::remove_file(p.join(".git/config.worktree")).unwrap();
+        // `git worktree add` and `git submodule update --init` on the host: the chest cannot write there
+        fs::create_dir_all(p.join(".git/worktrees/x")).unwrap();
+        fs::write(p.join(".git/modules/lib/a/hooks/post-checkout"), "").unwrap();
+        fs::create_dir_all(p.join(".git/modules/b/objects")).unwrap();
+        assert_eq!(changed(&before, &snapshot(p, false)), None);
+
+        // in a nested repo the chest can write all of them
+        let git = p.join("vendor/x/.git");
+        for d in ["objects", "hooks", "modules/lib/a/objects", "modules/lib/a/hooks"] {
+            fs::create_dir_all(git.join(d)).unwrap();
+        }
+        for f in ["HEAD", "config", "modules/lib/a/HEAD", "modules/lib/a/config"] {
+            fs::write(git.join(f), "").unwrap();
+        }
         let cases: [(&str, &dyn Fn()); 5] = [
-            (".git/config.worktree", &|| fs::write(p.join(".git/config.worktree"), "").unwrap()),
-            (".git/worktrees/x", &|| fs::create_dir_all(p.join(".git/worktrees/x")).unwrap()),
-            (".git/modules/lib/a/config", &|| {
-                fs::write(p.join(".git/modules/lib/a/config"), "[core]").unwrap();
+            ("config.worktree", &|| fs::write(git.join("config.worktree"), "").unwrap()),
+            ("worktrees/x", &|| fs::create_dir_all(git.join("worktrees/x")).unwrap()),
+            ("modules/lib/a/config", &|| {
+                fs::write(git.join("modules/lib/a/config"), "[core]").unwrap();
             }),
-            (".git/modules/lib/a/hooks/post-checkout", &|| {
-                fs::write(p.join(".git/modules/lib/a/hooks/post-checkout"), "").unwrap();
+            ("modules/lib/a/hooks/post-checkout", &|| {
+                fs::write(git.join("modules/lib/a/hooks/post-checkout"), "").unwrap();
             }),
-            (".git/modules/b", &|| fs::create_dir_all(p.join(".git/modules/b/objects")).unwrap()),
+            ("modules/b", &|| fs::create_dir_all(git.join("modules/b/objects")).unwrap()),
         ];
         for (path, change) in cases {
-            let before = snapshot(p, false);
+            let before = snapshot(p, true);
             change();
-            assert_eq!(changed(&before, &snapshot(p, false)).as_deref(), Some(path));
+            let path = format!("vendor/x/.git/{path}");
+            assert_eq!(changed(&before, &snapshot(p, true)).as_deref(), Some(path.as_str()));
         }
     }
 
@@ -241,16 +265,26 @@ mod tests {
     }
 
     #[test]
+    fn notes_of_an_older_luggage_about_read_only_dirs_are_dropped() {
+        let tmp = repo();
+        let p = tmp.path();
+        let old = format!(
+            "{}\nd 7  .git/modules/lib/a\nf 8 1.0 .git/modules/lib/a/config\nd 9  .git/worktrees/x",
+            snapshot(p, true)
+        );
+        assert_eq!(changed(&shallow(&old), &snapshot(p, false)), None);
+        assert_eq!(changed(&nested_repos(&old), &nested_repos(&snapshot(p, true))), None);
+    }
+
+    #[test]
     fn a_replaced_file_counts_as_changed() {
         let tmp = repo();
         let p = tmp.path();
-        let config = p.join(".git/modules/lib/a/config");
+        let config = p.join(".git/config.worktree");
+        fs::write(&config, "").unwrap();
         let before = snapshot(p, false);
         fs::write(p.join("new"), "").unwrap();
         fs::rename(p.join("new"), &config).unwrap();
-        assert_eq!(
-            changed(&before, &snapshot(p, false)).as_deref(),
-            Some(".git/modules/lib/a/config")
-        );
+        assert_eq!(changed(&before, &snapshot(p, false)).as_deref(), Some(".git/config.worktree"));
     }
 }

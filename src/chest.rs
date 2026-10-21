@@ -373,8 +373,17 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 
 /// Paths in the project that luggage, direnv or git read or run on the host. The chest may only read them,
 /// else it could add host variables to `pass_env` or run its code on the host.
-pub const PROTECTED: [&str; 7] =
-    [".luggage", ".direnv", ".envrc", "flake.nix", "flake.lock", ".git/config", ".git/hooks"];
+pub const PROTECTED: [&str; 9] = [
+    ".luggage",
+    ".direnv",
+    ".envrc",
+    "flake.nix",
+    "flake.lock",
+    ".git/config",
+    ".git/hooks",
+    ".git/modules",
+    ".git/worktrees",
+];
 
 /// Creates the missing directories of `PROTECTED`, so the chest cannot create them with its own content.
 ///
@@ -383,7 +392,7 @@ pub const PROTECTED: [&str; 7] =
 pub fn create_protected_dirs(project: &Path) -> Result<()> {
     let mut dirs = vec![".luggage", ".direnv"];
     if project.join(".git").is_dir() {
-        dirs.push(".git/hooks");
+        dirs.extend([".git/hooks", ".git/modules", ".git/worktrees"]);
     }
     for d in dirs.into_iter().map(|d| project.join(d)) {
         if d.symlink_metadata().is_err() {
@@ -2336,7 +2345,7 @@ depends_on = ["db"]
             fs::write(p.join(f), "").unwrap();
         }
         create_protected_dirs(p).unwrap();
-        for d in [".luggage", ".direnv", ".git/hooks"] {
+        for d in [".luggage", ".direnv", ".git/hooks", ".git/modules", ".git/worktrees"] {
             assert!(p.join(d).is_dir(), "{d}");
         }
         let t = Chest { project: p.to_path_buf(), ..chest(Definition::default()) };
@@ -2350,7 +2359,7 @@ depends_on = ["db"]
         // .git is a mount point before its parts are protected, so it cannot be renamed away
         let git = bind("--bind", ".git").unwrap();
         assert!(project < git && git < bind("--ro-bind", ".git/config").unwrap());
-        for f in [".luggage", ".direnv", ".envrc", "flake.nix", ".git/hooks"] {
+        for f in [".luggage", ".direnv", ".envrc", "flake.nix", ".git/hooks", ".git/modules"] {
             assert!(bind("--ro-bind", f).is_some_and(|i| i > project), "{f}");
         }
         // missing files are left out: bwrap would fail on them

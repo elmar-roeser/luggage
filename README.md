@@ -248,19 +248,20 @@ Some files in the project are read-only in the chest, because programs on the ho
 - `.luggage/`: luggage reads `chest.toml` at each command, so the chest could add `pass_env` or `network`.
 - `flake.nix`, `flake.lock`, `.envrc` and `.direnv/`: direnv on the host loads them when you `cd` into the project.
 - `.git/config` and `.git/hooks/`: git on the host runs hooks, and the config can name programs to run.
+- `.git/modules/` and `.git/worktrees/`: they hold the config and hooks of submodules and worktrees. So git
+  inside a submodule works read-only in the chest; `git submodule update` and `git worktree add` run on the host.
 
 Everything else, including the rest of `.git`, stays writable, so `git commit` works in the chest. luggage creates
-an empty `.luggage/`, `.direnv/` and `.git/hooks/` if they are missing. If a program on the host replaces one of
+an empty `.luggage/`, `.direnv/`, `.git/hooks/`, `.git/modules/` and `.git/worktrees/` if they are missing. If a program on the host replaces one of
 the files instead of writing into it (`git config` does, some editors do), the kernel drops its read-only mount in
 the chest. luggage notices this at the next luggage command or direnv hook and makes the new file read-only again;
 the same happens to a file that was missing at the start, like a new `flake.lock`. Until then the file is
 writable in the chest, and a program that opened it before stays able to write it.
 
-The rest of `.git` can still lead git on the host to another config, for example `.git/commondir`, worktrees,
-submodules in `.git/modules` or a repo nested in the project. So luggage notes these files when the chest starts
+The rest of `.git` can still lead git on the host to another config, for example `.git/commondir`,
+`.git/config.worktree` or a repo nested in the project. So luggage notes these files when the chest starts
 and checks the ones in `.git` again at each command. If one changed, luggage stops the chest and refuses to go on
-until you checked the file and ran `luggage down`; this also happens when you run `git worktree add` or
-`git submodule update` on the host. Nested repos are checked only at `up` and `down`, and only with a warning,
+until you checked the file and ran `luggage down`. Nested repos are checked only at `up` and `down`, and only with a warning,
 because tools in the chest create them on purpose (`composer` from source). It is a check, not a lock: a `git`
 command that you run on the host before the next luggage command still reads the changed file.
 

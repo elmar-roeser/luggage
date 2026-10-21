@@ -608,8 +608,9 @@ pub fn setup(yes: bool) -> Result<()> {
             }
         }
         changed = true;
-        if c.name == "AppArmor" {
-            // the remaining checks need the profile, so they go on in the copy
+        // the remaining checks need the profile, so they go on in the copy; the copy itself goes on here,
+        // else a profile that does not attach would start it again without end
+        if c.name == "AppArmor" && std::env::current_exe().is_ok_and(|e| e != Path::new(COPY)) {
             match own_program() {
                 Ok(own) => info(&format!("cannot start {COPY}: {}", exec_copy(&own))),
                 Err(e) => info(&format!("{e:#}")),

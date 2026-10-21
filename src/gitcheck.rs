@@ -83,7 +83,7 @@ fn modules(out: &mut Vec<String>, dir: &Path, rel: &str) {
 }
 
 /// Lines for the repos nested in the project below `dir`: `.git` files and dirs, and bare repos.
-/// It reads only directory entries and their types, so it stays fast in large trees.
+/// It reads only directory entries and their types and leaves out `node_modules`, so it stays fast in large trees.
 fn nested(out: &mut Vec<String>, dir: &Path, rel: &str) {
     let (mut head, mut objects, mut git, mut dirs) = (false, false, false, Vec::new());
     for e in fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -92,6 +92,8 @@ fn nested(out: &mut Vec<String>, dir: &Path, rel: &str) {
             b"HEAD" => head = true,
             b"objects" => objects = true,
             b".git" => git = true,
+            // the largest tree by far; packages from git in it are rare, and only a warning anyway
+            b"node_modules" => {}
             _ => {
                 if e.file_type().is_ok_and(|t| t.is_dir()) {
                     dirs.push(name);
@@ -249,6 +251,7 @@ mod tests {
         let p = tmp.path();
         let before = snapshot(p, true);
         fs::create_dir_all(p.join("src/deep/.git")).unwrap();
+        fs::create_dir_all(p.join("src/node_modules/pkg/.git")).unwrap();
         assert_eq!(changed(&shallow(&before), &snapshot(p, false)), None);
         let now = snapshot(p, true);
         assert_eq!(changed(&shallow(&before), &shallow(&now)), None);

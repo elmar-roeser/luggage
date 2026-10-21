@@ -112,7 +112,13 @@ pub fn serve(project: &Path) -> Result<()> {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let mut changed = Vec::new();
+        let mut overflow = false;
         for e in tree.inotify.read_events_blocking(&mut buf)? {
+            // the kernel dropped events: every path counts as changed then
+            if e.mask.contains(EventMask::Q_OVERFLOW) {
+                overflow = true;
+                continue;
+            }
             if e.mask.contains(EventMask::IGNORED) {
                 tree.dirs.remove(&e.wd);
                 continue;
@@ -127,6 +133,9 @@ pub fn serve(project: &Path) -> Result<()> {
             changed.push((path, new_dir));
         }
         let mut sent = Ok(());
+        if overflow {
+            sent = tree.add(project.to_path_buf(), &mut Some(&mut out));
+        }
         for (path, new_dir) in changed {
             sent = sent.and_then(|()| print_path(&mut out, &path));
             // what landed in it before the watch existed is new too

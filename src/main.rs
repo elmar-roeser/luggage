@@ -480,9 +480,15 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let nixpkgs = config::load()?.nixpkgs();
             chest::Chest::find(&nixpkgs, false)?.cmd_status(&nixpkgs)
         }
-        // lenient: a broken chest.toml must not break loading the .envrc
+        // lenient: a broken chest.toml or config.toml must not break loading the .envrc
         Cmd::Hook => {
-            let nixpkgs = config::load()?.nixpkgs();
+            let nixpkgs = config::load().map_or_else(
+                |e| {
+                    info(&format!("warning: {e:#}"));
+                    config::DEFAULT_NIXPKGS.to_owned()
+                },
+                |c| c.nixpkgs(),
+            );
             chest::Chest::find(&nixpkgs, true)?.cmd_hook(&nixpkgs)
         }
         Cmd::Prune => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_prune(),

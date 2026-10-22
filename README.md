@@ -149,6 +149,7 @@ luggage exec php bin/console about   # command in the running chest
 luggage open                         # shell in the running chest
 luggage down
 luggage list                         # all chests: running or not, and their project
+luggage tui                          # the chests in a terminal UI: up, down and open with one key
 ```
 
 `luggage status --json` and `luggage list --json` print the same for programs.

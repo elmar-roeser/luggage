@@ -13,6 +13,7 @@ mod remote;
 mod remount;
 mod setup;
 mod skills;
+mod tui;
 mod versions;
 mod vm;
 mod watch;
@@ -121,6 +122,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show the chests in a terminal UI and start, stop or open them
+    Tui,
     /// Print shell code for direnv; the .envrc runs it
     Hook,
     /// Remove the service data of branches that no longer exist
@@ -511,6 +514,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             chest::Chest::find(&nixpkgs, false)?.cmd_status(&nixpkgs, json)
         }
         Cmd::List { json } => chest::cmd_list(json),
+        Cmd::Tui => tui::run(),
         // lenient: a broken chest.toml or config.toml must not break loading the .envrc
         Cmd::Hook => {
             let nixpkgs = config::load().map_or_else(

@@ -358,6 +358,10 @@ commit until `update`; they live read-only in the Nix store, kept from the garba
 changes its own links: an entry it did not create stays as it is and `sync` names it. If a skill folder is
 itself a link, another tool manages it, and `sync` refuses until you move it away.
 
+luggage brings one skill of its own, `luggage`: it tells an agent how to use luggage on the host, and inside a
+chest what is blocked there and why. `sync` links it even without sources, and every chest with `agents` gets it.
+A skill named `luggage` from a source takes its place.
+
 A chest gets only the skills that its `chest.toml` names, as `<source>/<skill>`, where `*` stands for any text:
 
 ```toml

@@ -20,6 +20,11 @@ use crate::{expand_tilde, home, info};
 const AGENTS: [(&str, &str, &str); 2] =
     [("claude", ".claude", ".claude/skills"), ("codex", ".codex", ".agents/skills")];
 
+/// The skill that luggage brings along: how to work with luggage on the host and in a chest.
+const OWN_SKILL: &str = include_str!("skill.md");
+/// The name of [`OWN_SKILL`]; a skill of this name from a source takes its place.
+const OWN_NAME: &str = "luggage";
+
 /// A git source as it was fetched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Locked {
@@ -45,6 +50,21 @@ struct Linked {
 /// Where luggage keeps the lock and the roots.
 fn data_dir() -> PathBuf {
     crate::chest::xdg("XDG_DATA_HOME", || home().join(".local/share")).join("luggage/skills")
+}
+
+/// Writes [`OWN_SKILL`] below `dir` and returns its folder.
+///
+/// # Errors
+/// If the file cannot be written.
+fn own_skill(dir: &Path) -> Result<PathBuf> {
+    let folder = dir.join("own").join(OWN_NAME);
+    let file = folder.join("SKILL.md");
+    if fs::read_to_string(&file).ok().as_deref() != Some(OWN_SKILL) {
+        fs::create_dir_all(&folder)
+            .with_context(|| format!("cannot create {}", folder.display()))?;
+        fs::write(&file, OWN_SKILL).with_context(|| format!("cannot write {}", file.display()))?;
+    }
+    Ok(folder)
 }
 
 /// The Nix URL of a git address: `git@host:path` and `https://` become `git+ssh://` and `git+https://`.
@@ -221,10 +241,10 @@ fn find_skills(
 }
 
 /// Links each skill into `target` and removes luggage's links to skills that are gone.
-/// A link is luggage's if it points below `roots`; everything else in `target` stays as it is.
+/// A link is luggage's if it points below `own`; everything else in `target` stays as it is.
 fn link_skills(
     target: &Path,
-    roots: &Path,
+    own: &Path,
     skills: &BTreeMap<String, (String, PathBuf)>,
 ) -> Result<Linked> {
     if target.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
@@ -241,7 +261,7 @@ fn link_skills(
         let entry = entry?;
         let Ok(to) = fs::read_link(entry.path()) else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if to.starts_with(roots) && !skills.contains_key(&name) {
+        if to.starts_with(own) && !skills.contains_key(&name) {
             fs::remove_file(entry.path())?;
             done.removed += 1;
         }
@@ -250,7 +270,7 @@ fn link_skills(
         let link = target.join(name);
         match fs::read_link(&link) {
             Ok(to) if to == *dir => {}
-            Ok(to) if to.starts_with(roots) => {
+            Ok(to) if to.starts_with(own) => {
                 fs::remove_file(&link)?;
                 symlink(dir, &link)?;
                 done.changed += 1;
@@ -285,14 +305,14 @@ pub fn sync(sources: &BTreeMap<String, SkillSource>, update: Option<&[String]>) 
     }
     let dir = data_dir();
     fetch_sources(&dir, sources, update)?;
-    let roots = dir.join("roots");
-    let skills = find_skills(&roots, sources)?;
+    let mut skills = find_skills(&dir.join("roots"), sources)?;
+    skills.entry(OWN_NAME.to_owned()).or_insert((String::new(), own_skill(&dir)?));
     let agents = agent_dirs(&home());
     if agents.is_empty() {
         info("no agent found (neither ~/.claude nor ~/.codex)");
     }
     for (agent, target) in agents {
-        let done = link_skills(&target, &roots, &skills)?;
+        let done = link_skills(&target, &dir, &skills)?;
         info(&format!(
             "{agent}: {} skills in {}, {} linked, {} removed",
             skills.len(),
@@ -341,7 +361,10 @@ pub fn status(sources: &BTreeMap<String, SkillSource>) -> Result<()> {
         return Ok(());
     }
     match find_skills(&roots, sources) {
-        Ok(skills) => {
+        Ok(mut skills) => {
+            skills
+                .entry(OWN_NAME.to_owned())
+                .or_insert((String::new(), dir.join("own").join(OWN_NAME)));
             for (agent, target) in agent_dirs(&home()) {
                 let linked = skills
                     .iter()
@@ -409,8 +432,9 @@ fn pick(
     Ok(picked)
 }
 
-/// Copies the skills that `patterns` pick into one store path, points `root` to it and returns their names.
-/// Without patterns `root` goes away; in the store the skills are read-only for the chest in both modes.
+/// Copies the skills that `patterns` pick, and luggage's own skill if `own` is set, into one store path.
+/// It points `root` to it and returns their names; without skills `root` goes away.
+/// In the store the skills are read-only for the chest in both modes.
 ///
 /// # Errors
 /// If a source cannot be fetched or the copy fails.
@@ -418,15 +442,22 @@ fn pick(
 pub fn chest_set(
     sources: &BTreeMap<String, SkillSource>,
     patterns: &[String],
+    own: bool,
     root: &Path,
 ) -> Result<Vec<String>> {
-    if patterns.is_empty() {
+    if patterns.is_empty() && !own {
         let _ = fs::remove_file(root);
         return Ok(Vec::new());
     }
     let dir = data_dir();
-    fetch_sources(&dir, sources, None)?;
-    let picked = pick(&find_skills(&dir.join("roots"), sources)?, sources, patterns)?;
+    let mut picked = BTreeMap::new();
+    if !patterns.is_empty() {
+        fetch_sources(&dir, sources, None)?;
+        picked = pick(&find_skills(&dir.join("roots"), sources)?, sources, patterns)?;
+    }
+    if own {
+        picked.entry(OWN_NAME.to_owned()).or_insert(own_skill(&dir)?);
+    }
     let tmp = root.with_extension("tmp");
     copy_skills(&picked, &tmp)?;
     let out = Command::new("nix")
@@ -638,6 +669,19 @@ mod tests {
         assert!(t.join("own").is_dir());
         assert_eq!(fs::read_link(t.join("other")).unwrap(), Path::new("/elsewhere"));
         assert_eq!(fs::read_link(t.join("z")).unwrap(), Path::new("/elsewhere"));
+    }
+
+    #[test]
+    fn the_own_skill_is_written_once_and_named_luggage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = own_skill(tmp.path()).unwrap();
+        assert_eq!(folder, tmp.path().join("own/luggage"));
+        let text = fs::read_to_string(folder.join("SKILL.md")).unwrap();
+        assert!(text.starts_with("---\nname: luggage\ndescription: "), "{text}");
+        let modified = || fs::metadata(folder.join("SKILL.md")).unwrap().modified().unwrap();
+        let first = modified();
+        own_skill(tmp.path()).unwrap();
+        assert_eq!(modified(), first);
     }
 
     #[test]

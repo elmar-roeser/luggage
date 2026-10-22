@@ -1095,13 +1095,17 @@ impl Chest {
     }
 
     /// Builds the skill set of the chest in `<state>/skills` and returns the names of its skills.
-    /// A chest without `skills` reads no config, unless it had a set before that must go.
+    /// With agents it has luggage's own skill; a chest without agents and `skills` reads no config,
+    /// unless it had a set before that must go.
     fn skill_set(&self) -> Result<Vec<String>> {
         let root = self.state.join("skills");
-        if self.def.skills.is_empty() && root.symlink_metadata().is_err() {
+        let own = !self.def.agents.is_empty();
+        if self.def.skills.is_empty() && !own && root.symlink_metadata().is_err() {
             return Ok(Vec::new());
         }
-        skills::chest_set(&config::load()?.skills, &self.def.skills, &root)
+        let sources =
+            if self.def.skills.is_empty() { BTreeMap::new() } else { config::load()?.skills };
+        skills::chest_set(&sources, &self.def.skills, own, &root)
     }
 
     /// Links the skill set with `names` into the home in the guest; `had` says the chest had a set before.

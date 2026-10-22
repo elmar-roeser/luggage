@@ -22,6 +22,8 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde::Deserialize;
 
+use crate::form::{Action, CHEST_FIELDS, CONFIG_FIELDS, Field, Form};
+
 /// How often the TUI reads the list and the selected chest again.
 const REFRESH: Duration = Duration::from_secs(3);
 /// The keys at the bottom of the screen, with what they do.
@@ -34,6 +36,15 @@ const HELP: [(&str, &str); 8] = [
     ("c", "config"),
     ("r", "refresh"),
     ("q", "quit"),
+];
+/// The keys at the bottom of the screen while a form is open.
+const FORM_HELP: [(&str, &str); 6] = [
+    ("↑↓", "select"),
+    ("Enter", "change"),
+    ("Del", "default"),
+    ("s", "save"),
+    ("E", "editor"),
+    ("Esc", "back"),
 ];
 
 /// One chest from `luggage list --json`.
@@ -164,6 +175,8 @@ struct App {
     tx: Sender<Done>,
     /// Receiver for the background jobs
     rx: Receiver<Done>,
+    /// The open form, with the file it edits
+    form: Option<(Form, Edit)>,
 }
 
 impl App {
@@ -181,7 +194,86 @@ impl App {
             refreshed: Instant::now(),
             tx,
             rx,
+            form: None,
         }
+    }
+
+    /// Opens the form with `fields` for the file of `edit`; a file that is not valid TOML goes to the editor.
+    fn open_form(&mut self, edit: Edit, fields: &'static [Field]) -> Step {
+        match Form::open(&edit.file, edit.template, fields) {
+            Ok(form) => {
+                self.form = Some((form, edit));
+                Step::Stay
+            }
+            Err(e) => {
+                self.message = format!("{}: {e} — fix it in the editor", edit.file.display());
+                Step::Edit(edit)
+            }
+        }
+    }
+
+    /// Handles a key in the open form.
+    fn form_key(&mut self, code: KeyCode) -> Step {
+        let Some((form, _)) = &mut self.form else {
+            return Step::Stay;
+        };
+        match form.key(code) {
+            Action::Stay => Step::Stay,
+            Action::Close => {
+                if let Some((form, edit)) = self.form.take() {
+                    let name =
+                        edit.file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    self.message =
+                        if form.dirty { format!("{name}: not saved") } else { String::new() };
+                }
+                Step::Stay
+            }
+            Action::Editor => self.form.take().map_or(Step::Stay, |(_, edit)| Step::Edit(edit)),
+            Action::Save => {
+                self.save_form();
+                Step::Stay
+            }
+        }
+    }
+
+    /// Writes the file of the form and checks it with luggage; on a problem the old file comes back and the form stays.
+    fn save_form(&mut self) {
+        let Some((form, edit)) = &mut self.form else {
+            return;
+        };
+        let name = edit.file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if !form.dirty {
+            self.message = format!("{name}: unchanged");
+            self.form = None;
+            return;
+        }
+        let written = edit
+            .file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&edit.file, form.doc.to_string()));
+        let (args, dir) = &edit.check;
+        let checked = written
+            .map_err(|e| e.to_string())
+            .and_then(|()| luggage(args, dir.as_deref()).map(|_| ()));
+        if let Err(e) = checked {
+            let restored = match &form.before {
+                Some(text) => std::fs::write(&edit.file, text),
+                None => std::fs::remove_file(&edit.file),
+            };
+            form.error = Some(match restored {
+                Ok(()) => format!("not saved: {e}"),
+                Err(r) => format!("not saved: {e}; restoring the old file failed: {r}"),
+            });
+            return;
+        }
+        self.message = if edit.running {
+            format!("{name}: saved — d and u apply it to the running chest")
+        } else {
+            format!("{name}: saved")
+        };
+        self.form = None;
+        self.refresh();
     }
 
     /// The selected chest.
@@ -283,6 +375,9 @@ impl App {
 
     /// Handles a key.
     fn key(&mut self, code: KeyCode) -> Step {
+        if self.form.is_some() {
+            return self.form_key(code);
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Step::Quit,
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
@@ -291,21 +386,23 @@ impl App {
             KeyCode::Char('u') => self.act("up"),
             KeyCode::Char('d') => self.act("down"),
             KeyCode::Char('c') => {
-                return Step::Edit(Edit {
+                let edit = Edit {
                     file: crate::config::path(),
                     template: crate::config::TEMPLATE,
                     check: (&["config"], None),
                     running: false,
-                });
+                };
+                return self.open_form(edit, CONFIG_FIELDS);
             }
             KeyCode::Char('e') => match self.selected() {
                 Some(Entry { project: Some(p), running, .. }) => {
-                    return Step::Edit(Edit {
+                    let edit = Edit {
                         file: crate::chest::definition_file(p),
                         template: crate::chest::TEMPLATE,
                         check: (&["status", "--json"], Some(p.clone())),
                         running: *running,
-                    });
+                    };
+                    return self.open_form(edit, CHEST_FIELDS);
                 }
                 Some(e) => self.message = format!("{}: project unknown", e.name),
                 None => {}
@@ -337,6 +434,12 @@ impl App {
     fn draw(&mut self, f: &mut Frame<'_>) {
         let [main, bottom] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+        if let Some((form, edit)) = &self.form {
+            let title = format!(" {} ", tilde(&edit.file, &crate::home()));
+            form.draw(f, main, &title);
+            f.render_widget(bottom_line("", &FORM_HELP), bottom);
+            return;
+        }
         let [left, right] =
             Layout::horizontal([Constraint::Length(28), Constraint::Min(1)]).areas(main);
         let items: Vec<ListItem<'_>> = self
@@ -373,19 +476,19 @@ impl App {
             Paragraph::new(lines).block(Block::bordered().title(title)).wrap(Wrap { trim: false }),
             right,
         );
-        f.render_widget(bottom_line(&self.message), bottom);
+        f.render_widget(bottom_line(&self.message, &HELP), bottom);
     }
 }
 
 /// The bottom line: the last `message`, then the keys.
 /// The keys stand out in bold cyan and the words keep the terminal's own color, so both read on dark and light themes.
-fn bottom_line(message: &str) -> Line<'static> {
+fn bottom_line(message: &str, keys: &[(&'static str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
     if !message.is_empty() {
         spans
             .push(Span::styled(format!("{message}   "), Style::new().add_modifier(Modifier::BOLD)));
     }
-    for (key, what) in HELP {
+    for &(key, what) in keys {
         spans.push(Span::styled(key, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
         spans.push(Span::raw(format!(" {what}  ")));
     }
@@ -650,8 +753,12 @@ mod tests {
 
     #[test]
     fn the_bottom_line_shows_the_message_before_the_keys() {
-        assert!(bottom_line("").to_string().starts_with("↑↓ select  u up"));
-        assert!(bottom_line("up demo: done").to_string().starts_with("up demo: done   ↑↓ select"));
+        assert!(bottom_line("", &HELP).to_string().starts_with("↑↓ select  u up"));
+        assert!(
+            bottom_line("up demo: done", &HELP)
+                .to_string()
+                .starts_with("up demo: done   ↑↓ select")
+        );
     }
 
     #[test]
@@ -718,18 +825,21 @@ mod tests {
         app.key(KeyCode::Char('j'));
         assert_eq!(app.list.selected(), Some(1));
         assert_eq!(app.key(KeyCode::Char('o')), Step::Open("/p/b".into()));
-        let e = app.key(KeyCode::Char('e'));
+        // e opens the form for the chest.toml in the project, and E in it goes on to the editor
+        assert_eq!(app.key(KeyCode::Char('e')), Step::Stay);
+        let file = app.form.as_ref().map(|(_, e)| e.file.clone());
+        assert_eq!(file.as_deref(), Some(Path::new("/p/b/.luggage/chest.toml")));
+        let e = app.key(KeyCode::Char('E'));
         assert!(
-            matches!(&e, Step::Edit(Edit { file, check: (_, Some(dir)), .. })
-                if file == Path::new("/p/b/.luggage/chest.toml") && dir == Path::new("/p/b")),
+            matches!(&e, Step::Edit(Edit { check: (_, Some(dir)), .. }) if dir == Path::new("/p/b")),
             "{e:?}"
         );
-        let c = app.key(KeyCode::Char('c'));
-        assert!(
-            matches!(&c, Step::Edit(Edit { file, check: (_, None), .. })
-                if file.ends_with("luggage/config.toml")),
-            "{c:?}"
-        );
+        assert!(app.form.is_none());
+        // in the form, q closes it instead of the TUI
+        app.key(KeyCode::Char('c'));
+        assert!(app.form.as_ref().is_some_and(|(_, e)| e.file.ends_with("luggage/config.toml")));
+        assert_eq!(app.key(KeyCode::Char('q')), Step::Stay);
+        assert!(app.form.is_none());
         assert_eq!(app.key(KeyCode::Char('q')), Step::Quit);
     }
 

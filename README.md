@@ -152,8 +152,10 @@ luggage list                         # all chests and known projects without one
 luggage tui                          # the chests in a terminal UI: up, down and open with one key
 ```
 
-In the TUI, `c` edits `~/.config/luggage/config.toml` and `e` the `chest.toml` of the selected project in `$VISUAL`
-or `$EDITOR`. A missing file starts from a commented template, and luggage checks the file after saving.
+In the TUI, `c` opens a form for `~/.config/luggage/config.toml` and `e` one for the `chest.toml` of the selected project.
+A missing file starts from a commented template; a value you set takes the place of its commented-out line, and
+luggage checks the file before it keeps it. `E` in the form opens the file in `$VISUAL` or `$EDITOR`, for services
+and skill sources.
 
 `luggage status --json` and `luggage list --json` print the same for programs.
 

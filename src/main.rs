@@ -7,6 +7,7 @@ mod compose;
 mod config;
 mod detect;
 mod flake;
+mod form;
 mod gitcheck;
 mod proxy;
 mod remote;

@@ -1386,6 +1386,13 @@ mod tests {
     #[test]
     fn marks_keep_content_and_mode() {
         let tmp = tempfile::tempdir().unwrap();
+        // MARK runs with GNU coreutils in the guest; the uutils stat of Ubuntu 26.04 lacks --cached
+        let probe =
+            Command::new("stat").args(["--cached=never", "-c", "%a"]).arg(tmp.path()).output();
+        if !probe.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: stat does not know --cached=never");
+            return;
+        }
         let (a, x, gone) = (tmp.path().join("a b"), tmp.path().join("x"), tmp.path().join("gone"));
         fs::write(&a, "1").unwrap();
         fs::write(&x, "2").unwrap();

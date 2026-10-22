@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
@@ -349,6 +350,16 @@ pub fn xdg(var: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
     std::env::var_os(var).filter(|v| !v.is_empty()).map_or_else(fallback, PathBuf::from)
 }
 
+/// The directory with the state directories of all chests.
+fn state_root() -> PathBuf {
+    xdg("XDG_DATA_HOME", || home().join(".local/share")).join("luggage/chests")
+}
+
+/// The directory with the runtime dirs of all chests.
+fn run_root() -> PathBuf {
+    xdg("XDG_RUNTIME_DIR", std::env::temp_dir).join("luggage")
+}
+
 /// Replaces everything except ASCII letters, digits, `-` and `_` with `-`.
 fn safe_name(s: &str) -> String {
     s.chars()
@@ -396,6 +407,110 @@ struct ProcState {
     exit_code: i32,
     /// Is the service running right now?
     is_running: bool,
+}
+
+/// The chest for `luggage status --json`; fields of a running chest are empty or null when it is not running.
+#[derive(Serialize)]
+struct StatusReport {
+    /// Name of the chest
+    name: String,
+    /// Project directory
+    project: PathBuf,
+    /// "vm" or "bubblewrap"
+    mode: &'static str,
+    /// The `chest.toml`, if there is one
+    definition: Option<PathBuf>,
+    /// State directory (home, data)
+    state: PathBuf,
+    /// Branch whose service data the chest uses
+    branch: Option<String>,
+    /// Branch checked out in the project; it differs from `branch` until the next command switches
+    checked_out: Option<String>,
+    /// Is the chest running?
+    running: bool,
+    /// PID of the running chest
+    pid: Option<u32>,
+    /// Forwarded ports as `<service> <host>:<guest>` lines from `<run>/ports`
+    ports: Vec<String>,
+    /// "open", "closed" or "only <hosts>"
+    network: Option<String>,
+    /// Services with their state from process-compose
+    services: Vec<ServiceReport>,
+    /// Skills linked into the home of the chest
+    skills: Vec<String>,
+    /// Coding agents from `chest.toml`
+    agents: Vec<String>,
+    /// Notes from service detection
+    notes: Vec<String>,
+}
+
+/// One service in [`StatusReport`]; the state is null when the chest is not running.
+#[derive(Serialize)]
+struct ServiceReport {
+    /// Name of the service
+    name: String,
+    /// Status from process-compose, e.g. "Running" or "Completed"
+    status: Option<String>,
+    /// Has the `ready` check succeeded? Null for a service without one
+    ready: Option<bool>,
+    /// Exit code of the service
+    exit_code: Option<i32>,
+}
+
+/// One chest in `luggage list`.
+#[derive(Serialize)]
+struct ListEntry {
+    /// Name of the chest
+    name: String,
+    /// Project directory; null for a chest that has not started since luggage records it
+    project: Option<PathBuf>,
+    /// Is the chest running?
+    running: bool,
+    /// PID of the running chest
+    pid: Option<u32>,
+}
+
+/// The chests with a state directory, sorted by name.
+fn list_entries(state_root: &Path, run_root: &Path) -> Vec<ListEntry> {
+    let mut entries: Vec<ListEntry> = fs::read_dir(state_root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            if !e.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let project = fs::read(e.path().join("project"))
+                .ok()
+                .map(|b| PathBuf::from(OsString::from_vec(b)));
+            let pid = fs::read_to_string(run_root.join(&name).join("chest.pid"))
+                .ok()
+                .and_then(|p| p.trim().parse().ok())
+                .filter(|&p| alive(p));
+            Some(ListEntry { name, project, running: pid.is_some(), pid })
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+/// Lists all chests of the user; `json` prints them for programs.
+pub fn cmd_list(json: bool) -> Result<()> {
+    let entries = list_entries(&state_root(), &run_root());
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+    if entries.is_empty() {
+        info("no chests yet — `luggage up` in a project starts one");
+    }
+    for e in &entries {
+        let status = e.pid.map_or_else(|| "stopped".to_owned(), |p| format!("running (pid {p})"));
+        let project = e.project.as_ref().map_or_else(|| "?".into(), |p| p.display().to_string());
+        println!("{:<20} {status:<20} {project}", e.name);
+    }
+    Ok(())
 }
 
 /// Modification time of the file, if it can be read.
@@ -506,9 +621,8 @@ impl Chest {
             Err(e) => return Err(e),
         };
         let name = def.name.as_deref().map_or(base, safe_name);
-        let state =
-            xdg("XDG_DATA_HOME", || home().join(".local/share")).join("luggage/chests").join(&name);
-        let run = xdg("XDG_RUNTIME_DIR", std::env::temp_dir).join("luggage").join(&name);
+        let state = state_root().join(&name);
+        let run = run_root().join(&name);
         Ok(Self { name, project, def_dir, detected, def, state, run })
     }
 
@@ -1790,6 +1904,8 @@ impl Chest {
         self.warn_nested_repos();
         fs::create_dir_all(&self.state)?;
         fs::write(self.git_files(), gitcheck::snapshot(&self.project, true))?;
+        // `luggage list` finds the project of a chest here
+        fs::write(self.state.join("project"), self.project.as_os_str().as_encoded_bytes())?;
         Ok(())
     }
 
@@ -1858,9 +1974,99 @@ impl Chest {
         Ok(())
     }
 
-    /// Shows the definition, services and state of the chest.
-    pub fn cmd_status(&self, nixpkgs: &str) -> Result<()> {
+    /// The network of the running chest: "open", "closed" or "only <hosts>".
+    fn network_summary(&self) -> String {
+        // without the proxy, the VM is open and the bubblewrap chest has no network
+        let vm = self.def.mode == Mode::Vm;
+        let proxied = if vm { self.network_file() } else { self.run.join("proxy.sock") }.exists();
+        let hosts = fs::read_to_string(self.network_file()).unwrap_or_default();
+        if vm && !proxied {
+            "open".into()
+        } else if !proxied || hosts.trim().is_empty() {
+            "closed".into()
+        } else {
+            format!("only {}", hosts.lines().collect::<Vec<_>>().join(", "))
+        }
+    }
+
+    /// The states of the services from process-compose in the running chest with `pid`; empty if it cannot tell.
+    fn service_states(&self, pid: u32) -> Vec<ProcState> {
+        let out = if self.def.mode == Mode::Vm {
+            self.vm_pc("process list -o json").stderr(Stdio::null()).output()
+        } else if self.socket().exists() {
+            let Ok(tools) = self.tools() else {
+                return Vec::new();
+            };
+            Self::pc(&tools, pid, &["process", "list", "-o", "json"]).stderr(Stdio::null()).output()
+        } else {
+            return Vec::new();
+        };
+        out.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or_default()
+    }
+
+    /// What `luggage status --json` prints.
+    fn report(&self) -> StatusReport {
+        let pid = self.running();
+        let states = match pid {
+            Some(pid) if !self.def.services.is_empty() => self.service_states(pid),
+            _ => Vec::new(),
+        };
+        let services = self
+            .def
+            .services
+            .iter()
+            .map(|(name, svc)| {
+                let state = states.iter().find(|s| &s.name == name);
+                ServiceReport {
+                    name: name.clone(),
+                    status: state.map(|s| s.status.clone()),
+                    ready: state.filter(|_| svc.ready.is_some()).map(|s| s.is_ready == "Ready"),
+                    exit_code: state.map(|s| s.exit_code),
+                }
+            })
+            .collect();
+        let lines = |f: &str| -> Vec<String> {
+            fs::read_to_string(self.run.join(f))
+                .unwrap_or_default()
+                .lines()
+                .map(Into::into)
+                .collect()
+        };
+        let mut skills: Vec<String> = fs::read_dir(self.state.join("skills"))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        skills.sort();
+        StatusReport {
+            name: self.name.clone(),
+            project: self.project.clone(),
+            mode: if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" },
+            definition: self.def_dir.as_ref().map(|d| d.join("chest.toml")),
+            state: self.state.clone(),
+            branch: self.active_branch(),
+            checked_out: match branch::head(&self.project) {
+                Head::Branch(b) => Some(b),
+                _ => None,
+            },
+            running: pid.is_some(),
+            pid,
+            ports: if pid.is_some() { lines("ports") } else { Vec::new() },
+            network: pid.map(|_| self.network_summary()),
+            services,
+            skills,
+            agents: self.def.agents.clone(),
+            notes: self.detected.iter().flat_map(|d| d.notes.clone()).collect(),
+        }
+    }
+
+    /// Shows the definition, services and state of the chest; `json` prints them for programs.
+    pub fn cmd_status(&self, nixpkgs: &str, json: bool) -> Result<()> {
         self.guard()?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&self.report())?);
+            return Ok(());
+        }
         println!("Chest:       {}", self.name);
         println!("Project:     {}", self.project.display());
         println!("Mode:        {}", if self.def.mode == Mode::Vm { "vm" } else { "bubblewrap" });
@@ -1900,18 +2106,8 @@ impl Chest {
             "Ports:       {}",
             if ports.is_empty() { "none".into() } else { ports.join(", ") }
         );
-        // without the proxy, the VM is open and the bubblewrap chest has no network
+        println!("Network:     {}", self.network_summary());
         let vm = self.def.mode == Mode::Vm;
-        let proxied = if vm { self.network_file() } else { self.run.join("proxy.sock") }.exists();
-        let hosts = fs::read_to_string(self.network_file()).unwrap_or_default();
-        let network = if vm && !proxied {
-            "open".into()
-        } else if !proxied || hosts.trim().is_empty() {
-            "closed".into()
-        } else {
-            format!("only {}", hosts.lines().collect::<Vec<_>>().join(", "))
-        };
-        println!("Network:     {network}");
         if vm {
             self.vm_warn_outdated(nixpkgs);
         }
@@ -2540,5 +2736,52 @@ depends_on = ["db"]
         let own = t.bwrap_args(&tools(), Net::Own).unwrap();
         assert!(!own.contains(&"--unshare-all".to_owned()));
         assert_eq!(own[0], "--unshare-user");
+    }
+
+    #[test]
+    fn list_finds_the_project_and_whether_the_chest_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("demo");
+        fs::create_dir_all(&p).unwrap();
+        let (states, runs) = (tmp.path().join("chests"), tmp.path().join("run"));
+        let t = Chest {
+            project: p.clone(),
+            state: states.join("demo"),
+            run: runs.join("demo"),
+            ..chest(Definition::default())
+        };
+        t.note_git_files().unwrap();
+        fs::create_dir_all(&t.run).unwrap();
+        fs::write(t.pid_file(), std::process::id().to_string()).unwrap();
+        // a chest from before luggage recorded the project, and a stray file
+        fs::create_dir_all(states.join("old")).unwrap();
+        fs::write(states.join("stray"), "").unwrap();
+        let e = list_entries(&states, &runs);
+        assert_eq!(e.len(), 2);
+        assert_eq!(
+            (e[0].name.as_str(), e[0].project.as_deref(), e[0].running),
+            ("demo", Some(p.as_path()), true)
+        );
+        assert_eq!((e[1].name.as_str(), e[1].project.as_deref(), e[1].pid), ("old", None, None));
+    }
+
+    #[test]
+    fn report_of_a_stopped_chest_has_no_running_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut def = parse("[services.db]\ncommand = \"mariadbd\"\n").unwrap();
+        def.agents = vec!["claude".into()];
+        let t = Chest {
+            project: tmp.path().into(),
+            state: tmp.path().join("state"),
+            run: tmp.path().join("run"),
+            ..chest(def)
+        };
+        let json = serde_json::to_value(t.report()).unwrap();
+        assert_eq!(json["running"], false);
+        assert_eq!(json["mode"], "bubblewrap");
+        assert!(json["pid"].is_null() && json["network"].is_null());
+        assert_eq!(json["services"][0]["name"], "db");
+        assert!(json["services"][0]["status"].is_null());
+        assert_eq!(json["agents"][0], "claude");
     }
 }

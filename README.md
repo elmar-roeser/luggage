@@ -148,7 +148,10 @@ luggage status                       # is it running? how are the services doing
 luggage exec php bin/console about   # command in the running chest
 luggage open                         # shell in the running chest
 luggage down
+luggage list                         # all chests: running or not, and their project
 ```
+
+`luggage status --json` and `luggage list --json` print the same for programs.
 
 luggage reads which services are needed from the project's `compose.yaml` (or
 `docker-compose.yml`). It takes over MariaDB, PostgreSQL, Redis/Valkey

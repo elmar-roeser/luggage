@@ -110,7 +110,17 @@ enum Cmd {
     /// Stop the running chest
     Down,
     /// Show whether the chest is running and how its services are doing
-    Status,
+    Status {
+        /// Print JSON for programs
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the chests and whether they are running
+    List {
+        /// Print JSON for programs
+        #[arg(long)]
+        json: bool,
+    },
     /// Print shell code for direnv; the .envrc runs it
     Hook,
     /// Remove the service data of branches that no longer exist
@@ -496,10 +506,11 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             chest::Chest::find(&nixpkgs, false)?.cmd_open(&nixpkgs)
         }
         Cmd::Down => chest::Chest::find(&config::load()?.nixpkgs(), true)?.cmd_down(),
-        Cmd::Status => {
+        Cmd::Status { json } => {
             let nixpkgs = config::load()?.nixpkgs();
-            chest::Chest::find(&nixpkgs, false)?.cmd_status(&nixpkgs)
+            chest::Chest::find(&nixpkgs, false)?.cmd_status(&nixpkgs, json)
         }
+        Cmd::List { json } => chest::cmd_list(json),
         // lenient: a broken chest.toml or config.toml must not break loading the .envrc
         Cmd::Hook => {
             let nixpkgs = config::load().map_or_else(

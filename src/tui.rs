@@ -24,8 +24,17 @@ use serde::Deserialize;
 
 /// How often the TUI reads the list and the selected chest again.
 const REFRESH: Duration = Duration::from_secs(3);
-/// The keys at the bottom of the screen.
-const HELP: &str = "↑↓ select  u up  d down  o open  e chest.toml  c config  r refresh  q quit";
+/// The keys at the bottom of the screen, with what they do.
+const HELP: [(&str, &str); 8] = [
+    ("↑↓", "select"),
+    ("u", "up"),
+    ("d", "down"),
+    ("o", "open"),
+    ("e", "chest.toml"),
+    ("c", "config"),
+    ("r", "refresh"),
+    ("q", "quit"),
+];
 
 /// One chest from `luggage list --json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -364,16 +373,23 @@ impl App {
             Paragraph::new(lines).block(Block::bordered().title(title)).wrap(Wrap { trim: false }),
             right,
         );
-        let bottom_line = if self.message.is_empty() {
-            Line::styled(HELP, Style::new().fg(Color::DarkGray))
-        } else {
-            Line::from(vec![
-                Span::raw(self.message.clone()),
-                Span::styled(format!("   {HELP}"), Style::new().fg(Color::DarkGray)),
-            ])
-        };
-        f.render_widget(bottom_line, bottom);
+        f.render_widget(bottom_line(&self.message), bottom);
     }
+}
+
+/// The bottom line: the last `message`, then the keys.
+/// The keys stand out in bold cyan and the words keep the terminal's own color, so both read on dark and light themes.
+fn bottom_line(message: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    if !message.is_empty() {
+        spans
+            .push(Span::styled(format!("{message}   "), Style::new().add_modifier(Modifier::BOLD)));
+    }
+    for (key, what) in HELP {
+        spans.push(Span::styled(key, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw(format!(" {what}  ")));
+    }
+    Line::from(spans)
 }
 
 /// `path` with the home directory `home` shortened to `~`.
@@ -630,6 +646,12 @@ mod tests {
         let home = Path::new("/home/u");
         assert_eq!(tilde(Path::new("/home/u/projects/demo"), home), "~/projects/demo");
         assert_eq!(tilde(Path::new("/home/user2/x"), home), "/home/user2/x");
+    }
+
+    #[test]
+    fn the_bottom_line_shows_the_message_before_the_keys() {
+        assert!(bottom_line("").to_string().starts_with("↑↓ select  u up"));
+        assert!(bottom_line("up demo: done").to_string().starts_with("up demo: done   ↑↓ select"));
     }
 
     #[test]

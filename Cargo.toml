@@ -1,6 +1,6 @@
 [package]
 name = "luggage-env"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Per-project Nix dev environments (flake + direnv) for PHP, Node, Python and Rust, detected from project files"

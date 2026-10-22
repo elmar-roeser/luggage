@@ -117,6 +117,38 @@ fn next_free_port(host: u16, reserved: &BTreeSet<u16>, free: impl Fn(u16) -> boo
     (1..=PORT_TRIES).filter_map(|i| host.checked_add(i)).find(|p| !reserved.contains(p) && free(*p))
 }
 
+/// Where luggage looks for `chest.toml` of `project`, in this order: in the project, else in the config dir.
+fn definition_dirs(project: &Path) -> [PathBuf; 2] {
+    let base = safe_name(
+        &project.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+    );
+    [project.join(".luggage"), config::path().with_file_name("chests").join(base)]
+}
+
+/// The `chest.toml` of `project`: the one that exists, else the place in the project for a new one.
+pub fn definition_file(project: &Path) -> PathBuf {
+    let dirs = definition_dirs(project);
+    let found = dirs.iter().find(|d| d.join("chest.toml").exists());
+    found.unwrap_or(&dirs[0]).join("chest.toml")
+}
+
+/// A new `chest.toml`: every line is a comment, so it changes nothing until one is uncommented.
+pub const TEMPLATE: &str = r#"# luggage — chest of this project. It adds to the services detected in compose.yaml.
+# mode = "bubblewrap"          # or "vm": a small virtual machine with its own kernel
+# hosts = ["api.local"]        # point to 127.0.0.1 in the chest
+# packages = ["curl"]          # extra nixpkgs packages for the services
+# ignore = ["mailer"]          # skip these detected Compose services
+# network = ["github.com"]     # the only hosts the chest may reach
+# pass_env = ["GITHUB_TOKEN"]  # host variables that commands in the chest get
+# skills = ["own/*"]           # skills from the sources in the config, as <source>/<skill>
+# agents = ["claude", "codex"] # coding agents that `up` installs
+#
+# [services.web]
+# command = "exec php -S 127.0.0.1:80 -t public"
+# ports = ["8000:80"]          # http://127.0.0.1:8000 on the host
+# ready = "curl -sf http://127.0.0.1/"
+"#;
+
 /// Reads `chest.toml`. `once` and `ready` cannot be used together.
 fn parse(text: &str) -> Result<Definition> {
     let def: Definition = toml::from_str(text)?;
@@ -660,10 +692,7 @@ impl Chest {
         let base = safe_name(
             &project.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
         );
-        let def_dir =
-            [project.join(".luggage"), config::path().with_file_name("chests").join(&base)]
-                .into_iter()
-                .find(|d| d.join("chest.toml").exists());
+        let def_dir = definition_dirs(&project).into_iter().find(|d| d.join("chest.toml").exists());
         let load = || -> Result<(Option<Detected>, Definition)> {
             let def = match &def_dir {
                 Some(d) => {
@@ -2851,6 +2880,22 @@ depends_on = ["db"]
         assert_eq!(json["services"][0]["name"], "db");
         assert!(json["services"][0]["status"].is_null());
         assert_eq!(json["agents"][0], "claude");
+    }
+
+    #[test]
+    fn the_template_is_a_valid_empty_definition() {
+        let def = parse(TEMPLATE).unwrap();
+        assert!(def.services.is_empty() && def.mode == Mode::Bubblewrap);
+    }
+
+    #[test]
+    fn a_new_definition_goes_into_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("demo");
+        assert_eq!(definition_file(&p), p.join(".luggage/chest.toml"));
+        fs::create_dir_all(p.join(".luggage")).unwrap();
+        fs::write(p.join(".luggage/chest.toml"), "").unwrap();
+        assert_eq!(definition_file(&p), p.join(".luggage/chest.toml"));
     }
 
     #[test]

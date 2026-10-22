@@ -152,6 +152,9 @@ luggage list                         # all chests and known projects without one
 luggage tui                          # the chests in a terminal UI: up, down and open with one key
 ```
 
+In the TUI, `c` edits `~/.config/luggage/config.toml` and `e` the `chest.toml` of the selected project in `$VISUAL`
+or `$EDITOR`. A missing file starts from a commented template, and luggage checks the file after saving.
+
 `luggage status --json` and `luggage list --json` print the same for programs.
 
 luggage reads which services are needed from the project's `compose.yaml` (or

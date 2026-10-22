@@ -25,7 +25,7 @@ use serde::Deserialize;
 /// How often the TUI reads the list and the selected chest again.
 const REFRESH: Duration = Duration::from_secs(3);
 /// The keys at the bottom of the screen.
-const HELP: &str = "↑↓ select  u up  d down  o open  r refresh  q quit";
+const HELP: &str = "↑↓ select  u up  d down  o open  e chest.toml  c config  r refresh  q quit";
 
 /// One chest from `luggage list --json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +97,21 @@ enum Step {
     Quit,
     /// Open a shell in the chest of this project
     Open(PathBuf),
+    /// Edit a config file in the editor
+    Edit(Edit),
+}
+
+/// A config file to edit, and how luggage checks it afterwards.
+#[derive(Debug, PartialEq, Eq)]
+struct Edit {
+    /// The file
+    file: PathBuf,
+    /// Text for a file that does not exist yet
+    template: &'static str,
+    /// `luggage <args>` in `dir` fails if the file is invalid
+    check: (&'static [&'static str], Option<PathBuf>),
+    /// Is the chest running? Then a change applies after down and up
+    running: bool,
 }
 
 /// Runs luggage with `args` in `dir` and returns its stdout, or the last line of its stderr on failure.
@@ -266,6 +281,26 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('u') => self.act("up"),
             KeyCode::Char('d') => self.act("down"),
+            KeyCode::Char('c') => {
+                return Step::Edit(Edit {
+                    file: crate::config::path(),
+                    template: crate::config::TEMPLATE,
+                    check: (&["config"], None),
+                    running: false,
+                });
+            }
+            KeyCode::Char('e') => match self.selected() {
+                Some(Entry { project: Some(p), running, .. }) => {
+                    return Step::Edit(Edit {
+                        file: crate::chest::definition_file(p),
+                        template: crate::chest::TEMPLATE,
+                        check: (&["status", "--json"], Some(p.clone())),
+                        running: *running,
+                    });
+                }
+                Some(e) => self.message = format!("{}: project unknown", e.name),
+                None => {}
+            },
             KeyCode::Char('o') => match self.selected() {
                 Some(Entry { project: Some(p), .. }) => return Step::Open(p.clone()),
                 Some(e) => self.message = format!("{}: project unknown", e.name),
@@ -429,14 +464,87 @@ fn open(terminal: &mut DefaultTerminal, project: &Path) -> Result<String> {
         Ok(s) if s.success() => String::new(),
         Ok(_) | Err(_) => {
             // the error is on the normal screen, which the TUI hides again
-            eprintln!("luggage: press Enter to go back to the TUI");
-            let _ = io::stdin().lock().read_line(&mut String::new());
+            ask("press Enter to go back to the TUI");
             "open failed".to_owned()
         }
     };
+    back(terminal)?;
+    Ok(message)
+}
+
+/// Prints `question` on the normal screen and returns the answer.
+fn ask(question: &str) -> String {
+    eprint!("luggage: {question} ");
+    let mut answer = String::new();
+    let _ = io::stdin().lock().read_line(&mut answer);
+    answer.trim().to_owned()
+}
+
+/// Returns to the TUI screen after a program ran on the normal screen.
+fn back(terminal: &mut DefaultTerminal) -> Result<()> {
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
     terminal.clear()?;
+    Ok(())
+}
+
+/// The editor from `VISUAL` or `EDITOR`, else vi.
+fn editor() -> String {
+    ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
+        .unwrap_or_else(|| "vi".into())
+}
+
+/// Leaves the TUI, opens the file of `edit` in the editor until it is valid or the user gives up, and comes back.
+/// A missing file starts from the template; reverting brings back what was there before.
+fn edit(terminal: &mut DefaultTerminal, edit: &Edit) -> Result<String> {
+    ratatui::restore();
+    let before = std::fs::read_to_string(&edit.file).ok();
+    if before.is_none() {
+        if let Some(dir) = edit.file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&edit.file, edit.template)?;
+    }
+    let name = edit.file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let message = loop {
+        // the editor may hold arguments, like "code -w"
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} \"$1\"", editor()))
+            .arg("sh")
+            .arg(&edit.file)
+            .status();
+        take_terminal()?;
+        if !ran.is_ok_and(|s| s.success()) {
+            ask("the editor failed — press Enter to go back to the TUI");
+        }
+        let (args, dir) = &edit.check;
+        let Err(e) = luggage(args, dir.as_deref()) else {
+            let now = std::fs::read_to_string(&edit.file).ok();
+            break if now == before {
+                format!("{name}: unchanged")
+            } else if edit.running {
+                format!("{name}: saved — d and u apply it to the running chest")
+            } else {
+                format!("{name}: saved")
+            };
+        };
+        eprintln!("luggage: {name} is invalid: {e}");
+        match ask("[e]dit again, [r]evert or [k]eep it?").as_str() {
+            "r" | "R" => {
+                match &before {
+                    Some(text) => std::fs::write(&edit.file, text)?,
+                    None => std::fs::remove_file(&edit.file)?,
+                }
+                break format!("{name}: reverted");
+            }
+            "k" | "K" => break format!("{name}: kept, but invalid: {e}"),
+            _ => {}
+        }
+    };
+    back(terminal)?;
     Ok(message)
 }
 
@@ -490,6 +598,10 @@ fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
             Step::Quit => return Ok(()),
             Step::Open(project) => {
                 app.message = open(terminal, &project)?;
+                app.refresh();
+            }
+            Step::Edit(e) => {
+                app.message = edit(terminal, &e)?;
                 app.refresh();
             }
         }
@@ -584,6 +696,18 @@ mod tests {
         app.key(KeyCode::Char('j'));
         assert_eq!(app.list.selected(), Some(1));
         assert_eq!(app.key(KeyCode::Char('o')), Step::Open("/p/b".into()));
+        let e = app.key(KeyCode::Char('e'));
+        assert!(
+            matches!(&e, Step::Edit(Edit { file, check: (_, Some(dir)), .. })
+                if file == Path::new("/p/b/.luggage/chest.toml") && dir == Path::new("/p/b")),
+            "{e:?}"
+        );
+        let c = app.key(KeyCode::Char('c'));
+        assert!(
+            matches!(&c, Step::Edit(Edit { file, check: (_, None), .. })
+                if file.ends_with("luggage/config.toml")),
+            "{c:?}"
+        );
         assert_eq!(app.key(KeyCode::Char('q')), Step::Quit);
     }
 

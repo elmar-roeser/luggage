@@ -10,7 +10,7 @@ use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 /// What kind of value a field holds.
@@ -425,27 +425,24 @@ pub fn set(doc: &mut DocumentMut, field: &Field, input: &str) -> Result<()> {
     Ok(())
 }
 
-/// The next value of a choice or a set of names after `now`: unset, then each option or combination in turn.
-pub fn next(kind: Kind, now: Option<&str>) -> String {
-    let steps: Vec<String> = match kind {
-        Kind::Choice(options) => {
-            std::iter::once(String::new()).chain(options.iter().map(|&o| o.to_owned())).collect()
-        }
-        Kind::Names(names) => (0..1u32 << names.len())
-            .map(|bits| {
-                let picked: Vec<_> = names
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| bits & (1 << i) != 0)
-                    .map(|(_, &n)| n)
-                    .collect();
-                picked.join(", ")
-            })
-            .collect(),
-        Kind::Text | Kind::Number | Kind::List => return now.unwrap_or_default().to_owned(),
+/// The open dropdown of a choice or a set of names.
+#[derive(Debug)]
+pub struct Pick {
+    /// The highlighted row; row 0 is the default
+    pub at: usize,
+    /// For names: which ones have a tick
+    pub ticked: Vec<bool>,
+}
+
+/// The rows of the dropdown for `field`: the default first, then the options.
+fn options(field: &Field) -> Vec<String> {
+    let rest = match field.kind {
+        Kind::Choice(o) | Kind::Names(o) => o,
+        Kind::Text | Kind::Number | Kind::List => &[],
     };
-    let at = steps.iter().position(|s| Some(s.as_str()) == now.or(Some(""))).unwrap_or(0);
-    steps[(at + 1) % steps.len()].clone()
+    std::iter::once(format!("default: {}", field.default))
+        .chain(rest.iter().map(|&o| o.to_owned()))
+        .collect()
 }
 
 /// The form for one file.
@@ -461,6 +458,8 @@ pub struct Form {
     pub selected: usize,
     /// The text being typed into the selected field
     pub input: Option<String>,
+    /// The open dropdown of the selected field
+    pub pick: Option<Pick>,
     /// Has the form changed the file?
     pub dirty: bool,
     /// The last problem, shown above the keys
@@ -496,6 +495,7 @@ impl Form {
             doc,
             selected: 0,
             input: None,
+            pick: None,
             dirty: false,
             error: None,
             leaving: false,
@@ -519,8 +519,65 @@ impl Form {
         }
     }
 
+    /// Opens the dropdown of the selected field at its value.
+    fn open_pick(&mut self) {
+        let field = self.field();
+        let now = get(&self.doc, field).unwrap_or_default();
+        let picked: Vec<&str> = now.split(',').map(str::trim).collect();
+        let options = options(field);
+        let ticked = match field.kind {
+            Kind::Names(_) => options.iter().map(|o| picked.contains(&o.as_str())).collect(),
+            _ => Vec::new(),
+        };
+        let at = options.iter().position(|o| *o == now).unwrap_or(0);
+        self.pick = Some(Pick { at, ticked });
+    }
+
+    /// Handles a key in the open dropdown.
+    fn pick_key(&mut self, code: KeyCode) {
+        let field = self.field();
+        let options = options(field);
+        let Some(pick) = &mut self.pick else {
+            return;
+        };
+        let names = matches!(field.kind, Kind::Names(_));
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => pick.at = (pick.at + 1).min(options.len() - 1),
+            KeyCode::Up | KeyCode::Char('k') => pick.at = pick.at.saturating_sub(1),
+            KeyCode::Char(' ') if names => {
+                if pick.at == 0 {
+                    pick.ticked.fill(false);
+                } else if let Some(t) = pick.ticked.get_mut(pick.at) {
+                    *t = !*t;
+                }
+            }
+            KeyCode::Enter => {
+                // a name without any tick takes the highlighted one, so Enter alone works too
+                if names && pick.at > 0 && !pick.ticked.contains(&true) {
+                    pick.ticked[pick.at] = true;
+                }
+                let value = if names {
+                    let on = options.iter().zip(&pick.ticked).filter(|(_, t)| **t);
+                    on.map(|(o, _)| o.as_str()).collect::<Vec<_>>().join(", ")
+                } else if pick.at == 0 {
+                    String::new()
+                } else {
+                    options[pick.at].clone()
+                };
+                self.pick = None;
+                self.apply(&value);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.pick = None,
+            _ => {}
+        }
+    }
+
     /// Handles a key.
     pub fn key(&mut self, code: KeyCode) -> Action {
+        if self.pick.is_some() {
+            self.pick_key(code);
+            return Action::Stay;
+        }
         if let Some(input) = &mut self.input {
             match code {
                 KeyCode::Enter => {
@@ -554,10 +611,7 @@ impl Form {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => {
                 let field = self.field();
                 match field.kind {
-                    Kind::Choice(_) | Kind::Names(_) => {
-                        let now = get(&self.doc, field);
-                        self.apply(&next(field.kind, now.as_deref()));
-                    }
+                    Kind::Choice(_) | Kind::Names(_) => self.open_pick(),
                     Kind::Text | Kind::Number | Kind::List => {
                         self.input = Some(get(&self.doc, field).unwrap_or_default());
                     }
@@ -602,7 +656,11 @@ impl Form {
                         ),
                     }
                 };
-                let line = Line::from(vec![name, shown]);
+                let mut spans = vec![name, shown];
+                if matches!(field.kind, Kind::Choice(_) | Kind::Names(_)) {
+                    spans.push(Span::raw(" ▾"));
+                }
+                let line = Line::from(spans);
                 if i == self.selected {
                     line.style(Style::new().add_modifier(Modifier::REVERSED))
                 } else {
@@ -615,16 +673,66 @@ impl Form {
             rows,
         );
         let mut about = vec![Line::raw(self.field().help)];
-        match (&self.error, self.input.is_some()) {
-            (Some(e), _) => about.push(Line::styled(e.clone(), Style::new().fg(Color::Red))),
-            (None, true) => about.push(Line::raw(
-                "Enter keeps it, Esc cancels; lists take commas, empty means default",
-            )),
-            (None, false) => {}
+        let hint = match (self.input.is_some(), self.pick.is_some(), self.field().kind) {
+            (true, ..) => "Enter keeps it, Esc cancels; lists take commas, empty means default",
+            (_, true, Kind::Names(_)) => "Space ticks, Enter takes the ticked ones, Esc cancels",
+            (_, true, _) => "Enter takes it, Esc cancels",
+            _ => "",
+        };
+        match &self.error {
+            Some(e) => about.push(Line::styled(e.clone(), Style::new().fg(Color::Red))),
+            None if !hint.is_empty() => about.push(Line::raw(hint)),
+            None => {}
         }
         f.render_widget(
             Paragraph::new(about).block(Block::bordered()).wrap(Wrap { trim: false }),
             help,
+        );
+        if let Some(pick) = &self.pick {
+            self.draw_pick(f, rows, width, pick);
+        }
+    }
+
+    /// Draws the open dropdown below the selected row of `rows`.
+    fn draw_pick(&self, f: &mut Frame<'_>, rows: Rect, width: usize, pick: &Pick) {
+        let names = matches!(self.field().kind, Kind::Names(_));
+        let lines: Vec<Line<'_>> = options(self.field())
+            .into_iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let tick = match pick.ticked.get(i) {
+                    Some(true) => "[x] ",
+                    Some(false) => "[ ] ",
+                    None => "",
+                };
+                let text =
+                    if names && i == 0 { format!("{o} (clears)") } else { format!("{tick}{o}") };
+                let line = Line::raw(format!(" {text} "));
+                if i == pick.at {
+                    line.style(Style::new().add_modifier(Modifier::REVERSED))
+                } else {
+                    line
+                }
+            })
+            .collect();
+        let wide = lines.iter().map(Line::width).max().unwrap_or(0) + 2;
+        let left = rows.x + u16::try_from(width + 2).unwrap_or(0);
+        let below = rows.y + 2 + u16::try_from(self.selected).unwrap_or(0);
+        let mut area = Rect {
+            x: left,
+            y: below,
+            width: u16::try_from(wide).unwrap_or(u16::MAX).min(rows.right().saturating_sub(left)),
+            height: u16::try_from(lines.len() + 2).unwrap_or(u16::MAX).min(rows.height),
+        };
+        // above the row when there is no room below it
+        if area.bottom() > rows.bottom() {
+            area.y = below.saturating_sub(area.height + 1).max(rows.y);
+        }
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(Block::bordered().border_style(Style::new().fg(Color::Cyan))),
+            area,
         );
     }
 }
@@ -738,17 +846,60 @@ mod tests {
         assert_eq!(def.network, Some(vec!["github.com".into()]));
     }
 
+    /// Selects the field at `path` in `form`.
+    fn select(form: &mut Form, path: &str) {
+        form.selected = form.fields.iter().position(|f| f.path.join(".") == path).unwrap();
+    }
+
     #[test]
-    fn choices_go_round_through_unset() {
-        let kind = Kind::Choice(&["private", "internal", "public"]);
-        assert_eq!(next(kind, None), "private");
-        assert_eq!(next(kind, Some("private")), "internal");
-        assert_eq!(next(kind, Some("public")), "");
-        let some = Kind::Names(&["claude", "codex"]);
-        assert_eq!(next(some, None), "claude");
-        assert_eq!(next(some, Some("claude")), "codex");
-        assert_eq!(next(some, Some("codex")), "claude, codex");
-        assert_eq!(next(some, Some("claude, codex")), "");
+    fn a_dropdown_picks_one_choice_or_the_default() {
+        let mut form =
+            Form::open(Path::new("/x/config.toml"), crate::config::TEMPLATE, CONFIG_FIELDS)
+                .unwrap();
+        select(&mut form, "gitlab.visibility");
+        form.key(KeyCode::Enter);
+        assert_eq!(form.pick.as_ref().map(|p| p.at), Some(0));
+        form.key(KeyCode::Down);
+        form.key(KeyCode::Down);
+        form.key(KeyCode::Enter);
+        assert!(form.pick.is_none());
+        assert_eq!(get(&form.doc, field("gitlab.visibility")).as_deref(), Some("internal"));
+        // it opens at the value; Esc leaves it as it is
+        form.key(KeyCode::Enter);
+        assert_eq!(form.pick.as_ref().map(|p| p.at), Some(2));
+        form.key(KeyCode::Down);
+        form.key(KeyCode::Esc);
+        assert_eq!(get(&form.doc, field("gitlab.visibility")).as_deref(), Some("internal"));
+        form.key(KeyCode::Enter);
+        form.key(KeyCode::Up);
+        form.key(KeyCode::Up);
+        form.key(KeyCode::Enter);
+        assert_eq!(get(&form.doc, field("gitlab.visibility")), None);
+    }
+
+    #[test]
+    fn a_dropdown_of_names_takes_the_ticked_ones() {
+        let mut form =
+            Form::open(Path::new("/x/chest.toml"), crate::chest::TEMPLATE, CHEST_FIELDS).unwrap();
+        select(&mut form, "agents");
+        form.key(KeyCode::Enter);
+        form.key(KeyCode::Down);
+        form.key(KeyCode::Enter);
+        let first = crate::agents::NAMES[0];
+        assert_eq!(get(&form.doc, field("agents")).as_deref(), Some(first));
+        form.key(KeyCode::Enter);
+        assert_eq!(form.pick.as_ref().map(|p| p.ticked[1]), Some(true));
+        form.key(KeyCode::Down);
+        form.key(KeyCode::Char(' '));
+        form.key(KeyCode::Enter);
+        let both = crate::agents::NAMES[..2].join(", ");
+        assert_eq!(get(&form.doc, field("agents")), Some(both));
+        form.key(KeyCode::Enter);
+        form.key(KeyCode::Up);
+        form.key(KeyCode::Up);
+        form.key(KeyCode::Char(' '));
+        form.key(KeyCode::Enter);
+        assert_eq!(get(&form.doc, field("agents")), None);
     }
 
     #[test]

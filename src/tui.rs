@@ -47,6 +47,13 @@ const FORM_HELP: [(&str, &str); 6] = [
     ("Esc", "back"),
 ];
 
+/// The keys in an open dropdown with one choice.
+const CHOICE_HELP: [(&str, &str); 3] = [("↑↓", "select"), ("Enter", "take"), ("Esc", "cancel")];
+
+/// The keys in an open dropdown of names.
+const PICK_HELP: [(&str, &str); 4] =
+    [("↑↓", "select"), ("Space", "tick"), ("Enter", "take"), ("Esc", "cancel")];
+
 /// One chest from `luggage list --json`.
 #[derive(Debug, Clone, Deserialize)]
 struct Entry {
@@ -437,7 +444,12 @@ impl App {
         if let Some((form, edit)) = &self.form {
             let title = format!(" {} ", tilde(&edit.file, &crate::home()));
             form.draw(f, main, &title);
-            f.render_widget(bottom_line("", &FORM_HELP), bottom);
+            let keys: &[(&str, &str)] = match &form.pick {
+                Some(pick) if pick.ticked.is_empty() => &CHOICE_HELP,
+                Some(_) => &PICK_HELP,
+                None => &FORM_HELP,
+            };
+            f.render_widget(bottom_line("", keys), bottom);
             return;
         }
         let [left, right] =

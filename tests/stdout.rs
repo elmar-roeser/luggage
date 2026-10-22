@@ -16,6 +16,7 @@ fn hook_reports_on_stderr_only() -> Result<(), Box<dyn std::error::Error>> {
         .arg("hook")
         .current_dir(&project)
         .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env("XDG_DATA_HOME", tmp.path().join("data"))
         .env("XDG_RUNTIME_DIR", tmp.path().join("run"))
         .env("HOME", tmp.path())
         .output()?;

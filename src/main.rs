@@ -116,7 +116,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List the chests and whether they are running
+    /// List the chests and whether they are running, and the projects without a chest
     List {
         /// Print JSON for programs
         #[arg(long)]
@@ -389,6 +389,8 @@ fn setup_env(root: &Path, opts: &EnvOpts, config: &Config) -> Result<()> {
         run_ok(root, "direnv", &["exec", &root_str, "sh", "-c", &found.checks()])?;
     }
 
+    // only for `luggage list`, so a failure must not fail the setup
+    let _ = fs::canonicalize(root).map(|r| chest::remember_project(&r));
     info(&format!("done: {}", root.display()));
     info("staged: flake.nix flake.lock .envrc .gitignore — committing is up to you");
     Ok(())
@@ -513,7 +515,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let nixpkgs = config::load()?.nixpkgs();
             chest::Chest::find(&nixpkgs, false)?.cmd_status(&nixpkgs, json)
         }
-        Cmd::List { json } => chest::cmd_list(json),
+        Cmd::List { json } => chest::cmd_list(json, &expand_tilde(&config::load()?.projects_dir())),
         Cmd::Tui => tui::run(),
         // lenient: a broken chest.toml or config.toml must not break loading the .envrc
         Cmd::Hook => {

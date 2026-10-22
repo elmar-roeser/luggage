@@ -148,7 +148,7 @@ luggage status                       # is it running? how are the services doing
 luggage exec php bin/console about   # command in the running chest
 luggage open                         # shell in the running chest
 luggage down
-luggage list                         # all chests: running or not, and their project
+luggage list                         # all chests and known projects without one
 luggage tui                          # the chests in a terminal UI: up, down and open with one key
 ```
 

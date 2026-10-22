@@ -34,6 +34,8 @@ struct Entry {
     name: String,
     /// Project directory; unknown for a chest that has not started since luggage records it
     project: Option<PathBuf>,
+    /// Has the project a chest yet?
+    chest: bool,
     /// Is the chest running?
     running: bool,
 }
@@ -297,8 +299,11 @@ impl App {
             .entries
             .iter()
             .map(|e| {
-                let (mark, color) =
-                    if e.running { ("● ", Color::Green) } else { ("○ ", Color::DarkGray) };
+                let (mark, color) = match (e.chest, e.running) {
+                    (_, true) => ("● ", Color::Green),
+                    (true, false) => ("○ ", Color::DarkGray),
+                    (false, false) => ("· ", Color::DarkGray),
+                };
                 let busy = if self.busy.contains(&e.name) { " …" } else { "" };
                 ListItem::new(Line::from(vec![
                     Span::styled(mark, Style::new().fg(color)),
@@ -307,7 +312,7 @@ impl App {
             })
             .collect();
         let list = List::new(items)
-            .block(Block::bordered().title(" chests "))
+            .block(Block::bordered().title(" projects "))
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, left, &mut self.list);
         let (title, lines) = match self.selected() {
@@ -317,7 +322,7 @@ impl App {
             }
             None => (
                 String::new(),
-                vec![Line::raw("no chests yet — `luggage up` in a project starts one")],
+                vec![Line::raw("no chests or projects yet — `luggage init` in a repo sets one up")],
             ),
         };
         f.render_widget(
@@ -382,7 +387,11 @@ fn detail_lines(e: &Entry, status: Option<&Result<Status, String>>) -> Vec<Line<
     }
     lines.push(row(
         "Status",
-        s.pid.map_or_else(|| "stopped".into(), |p| format!("running (pid {p})")),
+        match s.pid {
+            Some(p) => format!("running (pid {p})"),
+            None if e.chest => "stopped".into(),
+            None => "no chest yet — u starts one".into(),
+        },
     ));
     if s.pid.is_some() {
         lines.push(row("Ports", list(&s.ports)));
@@ -492,7 +501,12 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, project: Option<&str>) -> Entry {
-        Entry { name: name.into(), project: project.map(PathBuf::from), running: false }
+        Entry {
+            name: name.into(),
+            project: project.map(PathBuf::from),
+            chest: true,
+            running: false,
+        }
     }
 
     fn text(lines: &[Line<'_>]) -> String {
@@ -534,6 +548,17 @@ mod tests {
         ] {
             assert!(t.contains(want), "{want} missing in:\n{t}");
         }
+    }
+
+    #[test]
+    fn a_project_without_a_chest_offers_to_start_one() {
+        let status: Status = serde_json::from_str(
+            r#"{"mode":"bubblewrap","definition":null,"branch":null,"checked_out":"main","pid":null,
+                "ports":[],"network":null,"services":[],"skills":[],"agents":[]}"#,
+        )
+        .unwrap();
+        let e = Entry { chest: false, ..entry("film", Some("/p/film")) };
+        assert!(text(&detail_lines(&e, Some(&Ok(status)))).contains("no chest yet — u starts one"));
     }
 
     #[test]

@@ -457,21 +457,65 @@ struct ServiceReport {
     exit_code: Option<i32>,
 }
 
-/// One chest in `luggage list`.
+/// One chest or project in `luggage list`.
 #[derive(Serialize)]
 struct ListEntry {
     /// Name of the chest
     name: String,
     /// Project directory; null for a chest that has not started since luggage records it
     project: Option<PathBuf>,
+    /// Has the project a chest yet? A project without one is known from luggage or the projects directory
+    chest: bool,
     /// Is the chest running?
     running: bool,
     /// PID of the running chest
     pid: Option<u32>,
 }
 
-/// The chests with a state directory, sorted by name.
-fn list_entries(state_root: &Path, run_root: &Path) -> Vec<ListEntry> {
+/// The file with the projects that luggage knows, one path per line.
+fn projects_file() -> PathBuf {
+    state_root().with_file_name("projects")
+}
+
+/// Notes `project` in the projects file, so `luggage list` shows it before it has a chest.
+///
+/// # Errors
+/// If the file cannot be written.
+pub fn remember_project(project: &Path) -> Result<()> {
+    remember_in(&projects_file(), project)
+}
+
+/// Appends `project` to `file` unless it is there already; a path with a line break is skipped.
+fn remember_in(file: &Path, project: &Path) -> Result<()> {
+    let line = project.to_string_lossy();
+    let known = fs::read_to_string(file).unwrap_or_default();
+    if line.contains('\n') || known.lines().any(|l| l == line) {
+        return Ok(());
+    }
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(file)?;
+    std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes())?;
+    Ok(())
+}
+
+/// The projects in `known` and the directories with a `flake.nix` right in `projects_dir`.
+fn known_projects(known: &str, projects_dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = known.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+    v.extend(
+        fs::read_dir(projects_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| Some(e.ok()?.path()))
+            .filter(|p| p.join("flake.nix").is_file()),
+    );
+    v
+}
+
+/// The chests with a state directory and the `projects` without a chest, sorted by name.
+/// A project that no longer has a `flake.nix` is left out.
+fn list_entries(state_root: &Path, run_root: &Path, projects: &[PathBuf]) -> Vec<ListEntry> {
     let mut entries: Vec<ListEntry> = fs::read_dir(state_root)
         .into_iter()
         .flatten()
@@ -488,25 +532,47 @@ fn list_entries(state_root: &Path, run_root: &Path) -> Vec<ListEntry> {
                 .ok()
                 .and_then(|p| p.trim().parse().ok())
                 .filter(|&p| alive(p));
-            Some(ListEntry { name, project, running: pid.is_some(), pid })
+            Some(ListEntry { name, project, chest: true, running: pid.is_some(), pid })
         })
         .collect();
+    for p in projects {
+        // a project with a chest, or one known twice, is in the list already
+        let listed = entries.iter().any(|e| e.project.as_deref() == Some(p.as_path()));
+        if listed || !p.join("flake.nix").is_file() {
+            continue;
+        }
+        let name = safe_name(
+            &p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        );
+        entries.push(ListEntry {
+            name,
+            project: Some(p.clone()),
+            chest: false,
+            running: false,
+            pid: None,
+        });
+    }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
 
-/// Lists all chests of the user; `json` prints them for programs.
-pub fn cmd_list(json: bool) -> Result<()> {
-    let entries = list_entries(&state_root(), &run_root());
+/// Lists all chests of the user and the projects without one in `projects_dir`; `json` prints them for programs.
+pub fn cmd_list(json: bool, projects_dir: &Path) -> Result<()> {
+    let known = fs::read_to_string(projects_file()).unwrap_or_default();
+    let entries = list_entries(&state_root(), &run_root(), &known_projects(&known, projects_dir));
     if json {
         println!("{}", serde_json::to_string_pretty(&entries)?);
         return Ok(());
     }
     if entries.is_empty() {
-        info("no chests yet — `luggage up` in a project starts one");
+        info("no chests or projects yet — `luggage up` in a project starts one");
     }
     for e in &entries {
-        let status = e.pid.map_or_else(|| "stopped".to_owned(), |p| format!("running (pid {p})"));
+        let status = match e.pid {
+            Some(p) => format!("running (pid {p})"),
+            None if e.chest => "stopped".to_owned(),
+            None => "no chest".to_owned(),
+        };
         let project = e.project.as_ref().map_or_else(|| "?".into(), |p| p.display().to_string());
         println!("{:<20} {status:<20} {project}", e.name);
     }
@@ -1237,6 +1303,8 @@ impl Chest {
     /// Shell code for direnv: in VM mode the stand-ins come first on the `PATH` and the VM starts in the background.
     /// Must be fast, it runs on every `cd` into the project.
     pub fn cmd_hook(&self, nixpkgs: &str) -> Result<()> {
+        // only for `luggage list`, so a failure must not break loading the .envrc
+        let _ = remember_project(&self.project);
         self.guard()?;
         if self.def.mode != Mode::Vm {
             // a running bubblewrap chest follows a newly checked-out branch in the background
@@ -2756,7 +2824,7 @@ depends_on = ["db"]
         // a chest from before luggage recorded the project, and a stray file
         fs::create_dir_all(states.join("old")).unwrap();
         fs::write(states.join("stray"), "").unwrap();
-        let e = list_entries(&states, &runs);
+        let e = list_entries(&states, &runs, &[]);
         assert_eq!(e.len(), 2);
         assert_eq!(
             (e[0].name.as_str(), e[0].project.as_deref(), e[0].running),
@@ -2783,5 +2851,45 @@ depends_on = ["db"]
         assert_eq!(json["services"][0]["name"], "db");
         assert!(json["services"][0]["status"].is_null());
         assert_eq!(json["agents"][0], "claude");
+    }
+
+    #[test]
+    fn list_adds_known_projects_without_a_chest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects");
+        for p in ["app", "plain", "gone"] {
+            fs::create_dir_all(dir.join(p)).unwrap();
+        }
+        fs::write(dir.join("app/flake.nix"), "").unwrap();
+        let other = tmp.path().join("elsewhere/film");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("flake.nix"), "").unwrap();
+        let states = tmp.path().join("chests");
+        fs::create_dir_all(states.join("app")).unwrap();
+        fs::write(states.join("app/project"), dir.join("app").as_os_str().as_encoded_bytes())
+            .unwrap();
+        // known twice (from luggage and the projects dir), and one without a flake.nix any more
+        let known = format!(
+            "{}\n{}\n{}\n",
+            other.display(),
+            dir.join("app").display(),
+            dir.join("gone").display()
+        );
+        let projects = known_projects(&known, &dir);
+        let e = list_entries(&states, &tmp.path().join("run"), &projects);
+        let rows: Vec<_> = e.iter().map(|e| (e.name.as_str(), e.chest)).collect();
+        assert_eq!(rows, [("app", true), ("film", false)]);
+        assert_eq!(e[1].project.as_deref(), Some(other.as_path()));
+    }
+
+    #[test]
+    fn remembered_projects_are_noted_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("luggage/projects");
+        remember_in(&file, Path::new("/p/a")).unwrap();
+        remember_in(&file, Path::new("/p/b")).unwrap();
+        remember_in(&file, Path::new("/p/a")).unwrap();
+        remember_in(&file, Path::new("/p/x\ny")).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "/p/a\n/p/b\n");
     }
 }
